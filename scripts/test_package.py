@@ -142,7 +142,7 @@ class DictionaryResolutionTests(unittest.TestCase):
             metadata = {
                 "packages": [
                     {"id": "flower", "name": "flower", "manifest_path": str(manifest)},
-                    {"id": "dictionary", "name": "flower-dictionary", "version": "0.1.0",
+                    {"id": "dictionary", "name": "flower-dict", "version": "0.2.0",
                      "manifest_path": str(manifest)},
                 ],
                 "resolve": {"root": "flower", "nodes": [
@@ -158,7 +158,7 @@ class DictionaryResolutionTests(unittest.TestCase):
                 lambda m: m["resolve"]["nodes"][0].update(deps=[]),
                 lambda m: m["resolve"]["nodes"][0]["deps"].append(
                     {"name": "second", "pkg": "dictionary"}),
-                lambda m: m["packages"][1].update(version="0.2.0"),
+                lambda m: m["packages"][1].update(version="0.1.0"),
                 lambda m: m["packages"][1].update(manifest_path="relative/Cargo.toml"),
                 lambda m: m["packages"][1].update(manifest_path=str(root / "missing/Cargo.toml")),
                 lambda m: m["packages"][0].update(manifest_path="Cargo.toml"),
@@ -201,7 +201,7 @@ class DictionaryLicenseTests(unittest.TestCase):
     def test_exact_full_bodies_and_dependency_collection(self):
         root = dictionary_root()
         package = {
-            "name": "flower-dictionary", "version": "0.1.0",
+            "name": "flower-dict", "version": "0.2.0",
             "license": "MIT AND Unicode-3.0 AND CC-BY-SA-4.0",
             "manifest_path": str(root / "Cargo.toml"),
         }
@@ -212,7 +212,7 @@ class DictionaryLicenseTests(unittest.TestCase):
             data = (root / "licenses" / name).read_bytes()
             self.assertIn(term, flower_package._classify_license_text(
                 name, data.decode("utf-8"), raw=data))
-            self.assertEqual(payload[f"licenses/flower-dictionary-0.1.0/licenses/{name}"], data)
+            self.assertEqual(payload[f"licenses/flower-dict-0.2.0/licenses/{name}"], data)
 
     def test_placeholders_truncation_and_changed_terms_rejected(self):
         for name, term in (("UNICODE-3.0.txt", "Unicode-3.0"),
@@ -441,7 +441,7 @@ class PackageFixture:
             ),
         ]
         dictionary = self._dependency(
-            "flower-dictionary", "0.1.0", "MIT AND Unicode-3.0 AND CC-BY-SA-4.0",
+            "flower-dict", "0.2.0", "MIT AND Unicode-3.0 AND CC-BY-SA-4.0",
         )
         dictionary_dir = Path(dictionary["manifest_path"]).parent
         # Synthetic dependency manifest lives at the fixture data root.

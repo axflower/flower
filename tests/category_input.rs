@@ -19,14 +19,13 @@ const TABLES: [&str; 13] = [
 
 #[test]
 fn every_generated_category_pair_is_reachable_in_default_exact_lookup() {
-    let manifest: serde_json::Value = serde_json::from_slice(
-        flower_dictionary::asset("data/pinyin/categories/manifest.json").unwrap(),
-    )
-    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(flower_dict::asset("data/pinyin/categories/manifest.json").unwrap())
+            .unwrap();
     let lexicon = Lexicon::builtin().unwrap();
     let mut unique = HashSet::new();
     for name in TABLES {
-        let table = flower_dictionary::table(name).unwrap().tsv;
+        let table = flower_dict::table(name).unwrap().tsv;
         for line in table
             .lines()
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -89,6 +88,20 @@ fn brands_full_initial_and_mixed_inputs_commit_complete_words() {
         ("wx", "微信"),
         ("weix", "微信"),
     ] {
+        choose_and_commit(raw, text);
+    }
+}
+
+#[test]
+fn expanded_dictionary_word_is_available_to_exact_initial_and_mixed_consumers() {
+    let text = "人工智能与大数据";
+    let reading = "ren'gong'zhi'neng'yu'da'shu'ju";
+    assert!(Lexicon::builtin()
+        .unwrap()
+        .lookup("rengongzhinengyudashuju")
+        .iter()
+        .any(|candidate| candidate.text == text && candidate.comment == reading));
+    for raw in ["rengongzhinengyudashuju", "rgznydsj", "rengongznydsj"] {
         choose_and_commit(raw, text);
     }
 }

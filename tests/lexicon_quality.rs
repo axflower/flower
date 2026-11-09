@@ -3,7 +3,7 @@ use flower::engine::{Key, KeyEvent, LearningEvent, Lexicon, PinyinSession};
 #[test]
 fn actual_embedded_lexicon_keeps_all_fixed_phrase_cases_at_top_one() {
     let cases: Vec<serde_json::Value> = serde_json::from_slice(
-        flower_dictionary::asset("data/pinyin/phrases/quality-cases.json").unwrap(),
+        flower_dict::asset("data/pinyin/phrases/quality-cases.json").unwrap(),
     )
     .unwrap();
     let lexicon = Lexicon::builtin().unwrap();

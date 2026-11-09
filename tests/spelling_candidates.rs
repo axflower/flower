@@ -29,7 +29,7 @@ fn guided_builtin_user_examples_and_old_positives() {
             "学鄂如逆水行舟",
             "xue'e'ru'ni'shui'xing'zhou",
             "学如逆水行舟",
-            7,
+            6, // The expanded 0.2.0 dictionary changes the bounded candidate order.
         ),
         ("xuexo", "学校哦", "xue'xiao'o", "学习", 1),
         (

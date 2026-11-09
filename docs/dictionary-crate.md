@@ -1,47 +1,41 @@
-# 发布与消费者接入
+# GitHub词库接入
 
 ## 当前接入状态
 
-`flower-dictionary 0.1.0`已由维护者发布到crates.io，Flower使用纯registry精确依赖
-`flower-dictionary = "=0.1.0"`，不再指定本地path。
-`Cargo.lock`绑定crates.io来源与校验值
-`2b7e0eed72e32737ed72ddc83d57b69128f141d71d932edd210d4d9e6b9fc634`。
-发布包的源码、词表和许可内容已与本地审定候选逐文件核对；
-发布归档与候选归档的整体摘要不同，不将本地候选摘要冒充registry校验值。
-
-## 当前拆分边界
-
-`flower-dictionary`独立维护公开拼音词表、来源许可、覆盖报告和离线生成工具，接口与Windows/TSF/Flower引擎无关。
-Flower负责索引、解码、候选布局、排序、用户词和隐私门禁。默认数据没有改变：18张公开表中使用16张，默认并集201109个词对，保留803条人工表达及可选专名边界。
-
-## 发布前检查
-
-在词库仓库执行：
-
-```powershell
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo package --locked --allow-dirty
-cargo publish --dry-run --locked --allow-dirty
-```
-
-还须在完整源码仓库执行三种离线生成器的`--check`及对应Python测试，检查归档中的完整许可、词表和include目标，确认未带入用户数据或凭据。`--allow-dirty`仅用于显式检查当前工作树；正常发行建议由维护者先审核并提交最终版本，不自动Git写入。
-
-发布账号通过本机终端`cargo login`配置，勿把令牌写入源码、脚本、日志或聊天。登录之后再运行`cargo publish --locked --allow-dirty`；拒绝、超时和未知上传结果须先核对原结果与registry，不能盲目重试。`--dry-run`成功不表示上传或名称归属已验证。
-
-## Flower接入与状态
-
-开发联调阶段可同时带精确版本和本地path；认证或registry发布未完成前，不能删path并声称普通在线构建可用。
-成功发布并从registry验证同一版本后，正式依赖为：
+词库已更名为`flower-dict 0.2.0`，仓库为`https://github.com/axflower/flower-dict.git`。Flower已通过正常Cargo解析更新锁文件，固定实际Git提交`d01e9ac5f6309e05344017ebce4680cf537854a9`。保留完整词库，不拆分多个crate，不再要求先发布到crates.io。
 
 ```toml
-flower-dictionary = "=0.1.0"
+flower-dict = { git = "https://github.com/axflower/flower-dict.git", branch = "main", version = "=0.2.0" }
 ```
 
-更新`Cargo.lock`并用Cargo metadata确认解析来源是crates.io，而不是patch、path或邻居checkout。测试真实crate依赖的查词、普通选择和打包器；更换数据版本须同步可信摘要及许可检查，不仅更新版本号。
+Rust引用使用`flower_dict`。Cargo.toml限定包版本和分支，Cargo.lock绑定实际提交；正常构建没有本地path或patch覆盖。已核对下载源的83个文件：77个逐字节一致，6个仅有文本换行差异；全部词表与许可正文逐字节一致。后续更换提交时也须验证真实来源，不能用本地验证副本代替Git联调。
 
-Python打包器从Flower根包的直接依赖package ID定位词库manifest目录，不猜测本机兄弟目录、不扫描Cargo缓存。发行ZIP保留原词库布局和完整许可，用户无须安装Rust。原公开`data/pinyin`和生成器已迁至独立仓库，Flower内不保留第二份可编辑词库。
+真实Git依赖下已通过`cargo check --locked --offline --all-targets`和新增词条消费测试：“人工智能与大数据”可通过全拼、首字母简拼和混拼选词提交。Python资产解析器也已使用实际Cargo metadata验证来源。此前完整本地预检在相同源码/数据下有效，来源切换后补上述集成检查，不重复执行无关模型或桌面验收。
 
-## 许可
+## 完整数据与消费者边界
 
-词库Rust代码MIT；数据按来源分别适用Unicode-3.0、MIT和CC BY-SA 4.0。不得把crate整体描述为纯MIT，也不能通过Flower程序许可证覆盖数据义务。新crate的NOTICE及来源完整许可必须在分发中保留。
+独立词库维护数据、来源通知、覆盖报告及离线生成器，保持零第三方Rust运行依赖。0.2.0共有19张公开拼音表、17张默认表、2,088,650个默认拼音词对和2,168,043个不同词目。自动读音与既有读音、非拼音文本及待补项分别标记；消费者不应把完整词目收录当作全部可靠拼音标注。
+
+Flower读取`DEFAULT_TSV`等静态接口，负责索引、全拼/简拼/混拼解码、候选排序、学习及TSF。Python验包器通过Cargo metadata中Flower根manifest与直接依赖package ID定位`flower-dict 0.2.0`，支持依赖别名，拒绝缺失、歧义、错误版本或错误根身份。它不猜兄弟目录、不扫描Cargo缓存、不读取真实用户词典。
+
+## 远端同步及验证
+
+1. 在GitHub将原词库仓库更名为`flower-dict`，并同步更改后的包名、示例和测试。不得仅修改仓库URL而保留旧Cargo包名。
+2. 在Flower根目录正常运行Cargo解析，更新Cargo.lock；确认元数据中的包名为`flower-dict`、版本为`0.2.0`，source来自目标GitHub仓库并包含实际提交。
+3. 运行受影响的构建、词典/引擎测试和Python消费者检查，确认没有本地覆盖。依赖已经获取后再用`--locked --offline`复验。
+4. 只有实际远端内容与lock来源验证后，才报告GitHub接入完成。提交与推送由维护者核对最终差异后执行，不自动改用户Git索引或读取凭据。
+
+```powershell
+cargo metadata --format-version 1
+cargo check --locked --all-targets
+cargo test --locked --lib
+python -m unittest scripts.test_package.DictionaryResolutionTests
+```
+
+GitHub依赖不经过crates.io的10MiB单包上传通道；完整数据的下载量、编译产物和索引内存仍需按实际规模评估。无需额外运行时下载数据。
+
+## 历史接入与分发
+
+0.1.0以旧名`flower-dictionary`发布于crates.io；当时registry校验值为`2b7e0eed72e32737ed72ddc83d57b69128f141d71d932edd210d4d9e6b9fc634`，默认词对201,109。该历史证据不证明本轮Git迁移已经完成，也不作为当前包名或来源要求。
+
+数据和代码仍遵守各自现有通知，具体许可状态见词库NOTICE及完整正文。改名和使用Git不会改变数据权利或原有分发门禁。Windows发行ZIP及安装器需要独立验收，本次源码接入不隐含已交付新的安装包。

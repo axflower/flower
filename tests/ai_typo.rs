@@ -15,13 +15,13 @@ fn typed(raw: &str) -> EngineRouter {
 
 #[test]
 fn spelling_suggestions_keep_original_first_and_commit_without_learning() {
-    const TARGET: &str = "现在在哪里上班";
     const READING: &str = "xian'zai'zai'na'li'shang'ban";
-    for raw in [
-        "xuanzaizainalishangban",
-        "xainzaizainalishangban",
-        "xianzaizainalishangbn",
-        "xianzaizainalishangbann",
+    for (raw, target) in [
+        // This expanded builtin guide uses 那; the spelling repair must keep it.
+        ("xuanzaizainalishangban", "现在在那里上班"),
+        ("xainzaizainalishangban", "现在在哪里上班"),
+        ("xianzaizainalishangbn", "现在在哪里上班"),
+        ("xianzaizainalishangbann", "现在在那里上班"),
     ] {
         let mut router = typed(raw);
         let input = router.ai_input().unwrap();
@@ -31,13 +31,18 @@ fn spelling_suggestions_keep_original_first_and_commit_without_learning() {
         );
         let first = router.session().candidates_on_current_page()[0].clone();
         let update = router
-            .apply_ai_spelling_candidate(&input, TARGET, READING)
-            .unwrap();
+            .apply_ai_spelling_candidate(&input, target, READING)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no spelling candidate for {raw}: {} / {}",
+                    input.source, input.reading
+                )
+            });
         assert_eq!(update.candidates[0], first);
-        assert_eq!(update.candidates[1].text, TARGET);
+        assert_eq!(update.candidates[1].text, target);
         assert!(update.candidates[1].is_ai());
         let commit = router.process_key(KeyEvent::plain(Key::Char('2'))).unwrap();
-        assert_eq!(commit.commit.as_deref(), Some(TARGET));
+        assert_eq!(commit.commit.as_deref(), Some(target));
         assert!(router.pending_learning().is_empty());
         assert!(router.pending_promotions().is_empty());
     }
@@ -57,7 +62,7 @@ fn spelling_response_rejects_unrelated_changes_multiple_edits_and_stale_input() 
     assert!(eligible_request(&request));
     let response = Response {
         id: 1,
-        corrected: Some("现在在哪里上班".into()),
+        corrected: Some("现在在那里上班".into()),
         reading: "xian'zai'zai'na'li'shang'ban".into(),
     };
     assert!(valid_response(&request, &response));
@@ -65,7 +70,7 @@ fn spelling_response_rejects_unrelated_changes_multiple_edits_and_stale_input() 
     wrong.id = 2;
     assert!(!valid_response(&request, &wrong));
     wrong = response.clone();
-    wrong.corrected = Some("现在在那里上班".into());
+    wrong.corrected = Some("现在在哪里上班".into());
     assert!(
         !valid_response(&request, &wrong),
         "unchanged syllables must keep their original characters"
@@ -78,7 +83,7 @@ fn spelling_response_rejects_unrelated_changes_multiple_edits_and_stale_input() 
     assert!(!eligible_request(&invalid));
     router.process_key(KeyEvent::plain(Key::Char('a'))).unwrap();
     assert!(router
-        .apply_ai_spelling_candidate(&input, "现在在哪里上班", &response.reading)
+        .apply_ai_spelling_candidate(&input, "现在在那里上班", &response.reading)
         .is_none());
 }
 

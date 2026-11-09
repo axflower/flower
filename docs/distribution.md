@@ -453,10 +453,10 @@ python scripts/package.py --ai-assets "<固定完整AI资产目录>" --output-di
 python scripts/installer.py --package "<新ZIP路径>" --output-dir "<新输出目录>"
 ```
 
-公开字词数据现在来自精确锁定的`flower-dictionary`依赖，不在Flower仓库重复维护。
+公开字词数据来自GitHub上的`flower-dict 0.2.0`，Cargo.lock已固定实际提交`d01e9ac5f6309e05344017ebce4680cf537854a9`，不在Flower仓库重复维护；来源验收见`docs/dictionary-crate.md`。
 组包通过Cargo metadata的直接依赖package ID找到实际manifest目录，支持registry及明确的开发path，
 不会扫描缓存、猜兄弟目录或在缺依赖时回退旧数据树。`Cargo.lock`和原数据可信摘要仍须匹配。
-公开原料、重建和词库生成测试位于独立的`flower-dictionary`仓库；
+公开原料、重建和词库生成测试位于独立的`flower-dict`仓库；
 在该仓库执行`python scripts/build_lexicon.py --check`、`build_phrases.py --check`
 和`build_categories.py --check`，本输入法保留真实引擎查词、提交和分发验证。
 crate发布归档提供消费/验包所需数据及许可，不含私人词典、AI模型或所有重建大原料。

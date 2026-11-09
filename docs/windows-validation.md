@@ -2,8 +2,8 @@
 
 ## 公开词库独立crate的联调记录
 
-公开`data/pinyin`的54个文件及6个生成/数据测试脚本已迁到独立`flower-dictionary`
-仓库，两次逐文件摘要核对与原工作树一致后才移除Flower副本；不读取个人用户词典。
+公开`data/pinyin`及生成/数据测试脚本已迁到独立词库，当前已接入GitHub上的`flower-dict 0.2.0`，固定提交`d01e9ac5f6309e05344017ebce4680cf537854a9`；83个下载源文件的差异仅有6个文本换行，其余逐字节一致，词表与许可正文完全一致（见`docs/dictionary-crate.md`）。下方0.1.0/crates.io记录是历史验证，不能当作本轮Git来源或扩充数据的验收。
+首次迁移在两次逐文件摘要核对与原工作树一致后才移除Flower副本；不读取个人用户词典。
 人工usage分类的135个词对也移入独立数据，是否应用该prior仍由消费者决定。
 crate 0.1.0无第三方运行依赖、禁止unsafe，提供18张all/16张default表、借用条目迭代、
 原始TSV、许可元数据和精确静态asset访问，不引入Windows或Flower候选类型。

@@ -3,13 +3,13 @@ use std::sync::{Arc, OnceLock};
 
 use super::{Candidate, EngineError};
 
-const BUILTIN_LEXICON: &str = flower_dictionary::DEFAULT_TSV;
+const BUILTIN_LEXICON: &str = flower_dict::DEFAULT_TSV;
 
-const EVERYDAY_PHRASES: &str = flower_dictionary::EVERYDAY_TSV;
+const EVERYDAY_PHRASES: &str = flower_dict::EVERYDAY_TSV;
 
 // Project-maintained usage prior, NOT corpus frequency or new readings.
 // Exact pairs prevent a future additional reading inheriting the classification.
-const EVERYDAY_PAIRS: &str = flower_dictionary::COMMON_USAGE_PAIRS;
+const EVERYDAY_PAIRS: &str = flower_dict::COMMON_USAGE_PAIRS;
 
 const EVERYDAY_RANKING_FLOOR: u32 = 16384;
 
@@ -1160,7 +1160,7 @@ mod tests {
             .collect();
         let mut baseline = HashSet::new();
         for line in std::str::from_utf8(
-            flower_dictionary::asset("data/pinyin/sources/kMandarin_8105.txt").unwrap(),
+            flower_dict::asset("data/pinyin/sources/kMandarin_8105.txt").unwrap(),
         )
         .unwrap()
         .lines()

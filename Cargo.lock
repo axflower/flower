@@ -50,7 +50,7 @@ dependencies = [
 name = "flower"
 version = "0.4.20"
 dependencies = [
- "flower-dictionary",
+ "flower-dict",
  "ort",
  "ort-sys",
  "serde",
@@ -62,10 +62,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "flower-dictionary"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b7e0eed72e32737ed72ddc83d57b69128f141d71d932edd210d4d9e6b9fc634"
+name = "flower-dict"
+version = "0.2.0"
+source = "git+https://github.com/axflower/flower-dict.git?branch=main#d01e9ac5f6309e05344017ebce4680cf537854a9"
 
 [[package]]
 name = "generic-array"

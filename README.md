@@ -95,8 +95,8 @@ Flower 仍处于早期开发和兼容性验证阶段。测试安装包尚未签�
 Flower 使用 Rust 实现，Windows 平台通过 TSF 接入系统。欢迎提交问题、改进词库、
 补充兼容性反馈或贡献代码。
 
-公开字词数据独立维护于[flower-dictionary](https://github.com/axflower/flower-dictionary)，
-Flower通过crates.io上的`flower-dictionary 0.1.0`精确版本依赖消费词表，不再保留第二份可编辑词库。
+公开字词数据独立维护于[flower-dict](https://github.com/axflower/flower-dict)，
+Flower通过GitHub依赖消费`flower-dict 0.2.0`，Cargo.lock固定提交`d01e9ac5`；来源与验证见[接入说明](docs/dictionary-crate.md)。Flower不保留第二份可编辑词库。
 其他输入法也可使用其静态TSV、分类元数据及零拷贝Rust迭代接口；
 它不依赖Flower引擎或Windows。词库数据、来源/许可、生成脚本的修改请在该仓库进行。
 本机用户词典、自动词记忆和个人排序仍归本输入法管理，不进入公开数据包。

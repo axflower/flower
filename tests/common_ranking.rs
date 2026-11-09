@@ -1,6 +1,6 @@
 use flower::engine::{Key, KeyEvent, Lexicon, PinyinSession};
 
-const EVERYDAY: &str = flower_dictionary::EVERYDAY_TSV;
+const EVERYDAY: &str = flower_dict::EVERYDAY_TSV;
 
 #[test]
 fn bounded_daily_prior_keeps_greetings_without_overriding_high_frequency_words() {

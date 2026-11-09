@@ -109,8 +109,7 @@ fn process_key_advances_selection_commit_cancel_and_paging() {
     // Keep a two-page fixture to test the short last page independently of
     // future expansion of the production dictionary.
     let mut router =
-        EngineRouter::from_lexicon_tsv(flower_dictionary::table("legacy-mvp").unwrap().tsv, 9)
-            .unwrap();
+        EngineRouter::from_lexicon_tsv(flower_dict::table("legacy-mvp").unwrap().tsv, 9).unwrap();
     let typed = type_text(&mut router, "shi");
     assert!(router.is_composing());
     assert_eq!(typed.page_count, 2);

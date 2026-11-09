@@ -11,7 +11,7 @@ name = "flower"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-flower-dictionary = "=0.1.0"
+flower-dict = { git = "https://github.com/axflower/flower-dict.git", branch = "main", version = "=0.2.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

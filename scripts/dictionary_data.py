@@ -41,9 +41,9 @@ def resolve_dictionary_root(repo_root: Path, metadata=None) -> Path:
             raise ValueError("Flower resolve 节点缺失或重复")
         # Resolve by package ID, not the dependency's possibly renamed crate name.
         matches = [by_id[dep["pkg"]] for dep in nodes[0]["deps"]
-                   if by_id[dep["pkg"]]["name"] == "flower-dictionary"]
-        if len(matches) != 1 or matches[0]["version"] != "0.1.0":
-            raise ValueError("必须唯一直接依赖 flower-dictionary 0.1.0")
+                   if by_id[dep["pkg"]]["name"] == "flower-dict"]
+        if len(matches) != 1 or matches[0]["version"] != "0.2.0":
+            raise ValueError("必须唯一直接依赖 flower-dict 0.2.0")
         manifest = Path(matches[0]["manifest_path"])
         if not manifest.is_absolute() or manifest.name != "Cargo.toml":
             raise ValueError("字典 manifest_path 异常")

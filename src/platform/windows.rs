@@ -6862,7 +6862,9 @@ mod windows_exports {
                         .snapshot()
                         .unwrap()
                         .clone();
-                    assert_eq!(snapshot.candidates[0].text, "选在在哪里上班");
+                    // flower-dict 0.2.0 adds 悬在; the builtin guide also uses 那.
+                    // The positive response repairs only the edited first syllable.
+                    assert_eq!(snapshot.candidates[0].text, "悬在在那里上班");
                     (active.token, active.owner_thread, snapshot)
                 };
                 struct PopupGuard(ActivationToken, ThreadId);
@@ -6904,17 +6906,17 @@ mod windows_exports {
                         let requests = capture.requests.borrow();
                         assert_eq!(requests.len(), 1);
                         let request = &requests[0];
-                        assert_eq!(request.text, "选在在哪里上班");
+                        assert_eq!(request.text, "悬在在那里上班");
                         assert_eq!(request.raw, "xuanzaizainalishangban");
                         assert_eq!(request.reading, "xuan'zai'zai'na'li'shang'ban");
                         *capture.response.borrow_mut() = Some(Response {
                             id: request.id,
                             corrected: Some(
                                 if accepted {
-                                    "现在在哪里上班"
-                                } else {
-                                    // A valid first repair cannot authorize an unrelated 哪→那.
                                     "现在在那里上班"
+                                } else {
+                                    // A valid first repair cannot authorize an unrelated 那→哪.
+                                    "现在在哪里上班"
                                 }
                                 .into(),
                             ),
@@ -6953,7 +6955,7 @@ mod windows_exports {
                         .unwrap();
                     assert_eq!(snapshot.candidates[0], original.candidates[0]);
                     if accepted {
-                        assert_eq!(snapshot.candidates[1].text, "现在在哪里上班");
+                        assert_eq!(snapshot.candidates[1].text, "现在在那里上班");
                         assert!(snapshot.candidates[1].is_ai());
                         assert_eq!(ai_status(active), AiStatus::Suggested);
                     } else {
@@ -6963,7 +6965,7 @@ mod windows_exports {
                 }
                 if accepted {
                     send_key(&sink, &host.context, b'2');
-                    assert_eq!(read_document(&host, None), "现在在哪里上班");
+                    assert_eq!(read_document(&host, None), "现在在那里上班");
                 }
                 {
                     let state = shared.borrow();

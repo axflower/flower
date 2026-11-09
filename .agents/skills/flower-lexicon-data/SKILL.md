@@ -7,9 +7,9 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 
 ## 独立词库权威边界
 
-公开词表、来源许可、覆盖、生成器及其测试已迁至独立的 `flower-dictionary` crate/repository；本技能下方 `data/pinyin/`、`scripts/build_lexicon.py`、`build_phrases.py`、`build_categories.py` 与对应生成测试路径现在相对于词库仓库，不应在Flower重建第二份。Flower保留引擎、排序、TSF、用户数据和分发消费者，详见 `design/dictionary-crate-extraction.md`、`docs/dictionary-crate.md`。
+公开词表、来源许可、覆盖、生成器及其测试由独立的 `flower-dict` crate/repository维护；本技能下方 `data/pinyin/`、`scripts/build_lexicon.py`、`build_phrases.py`、`build_categories.py` 与对应生成测试路径相对于词库仓库，不应在Flower重建第二份。Flower保留引擎、排序、TSF、用户数据和分发消费者，详见 `design/dictionary-crate-extraction.md`、`docs/dictionary-crate.md`。
 
-Flower通过锁定版本的直接依赖消费；Python资产根应由Cargo metadata根manifest身份及直接依赖package ID定位，支持rename，缺失/歧义/错误版本拒绝，不猜兄弟路径或扫描缓存。开发path不等于registry发布完成；实际上传须正常认证并核验返回及registry来源，不读取/打印令牌，不以dry-run冒充发布。crate只带消费/验包子集，但原jieba频次校验需要dict.txt与固定生成器，不能因移动来源而删门禁。完整许可按实际标准正文校验，新增合法变体先读全文再窄增可信摘要，标题或章节占位不得算完整许可。
+当前分发目标为GitHub完整仓库，保留单crate与静态API，不以满足crates.io上传体积而删词或强制分包。Flower通过直接Git依赖消费，Cargo.lock须绑定实际提交；Python资产根由Cargo metadata根manifest身份及直接依赖package ID定位，支持rename，缺失/歧义/错误版本拒绝，不猜兄弟路径或扫描缓存。本地path或隔离验证副本不等于真实GitHub联调；远端更名、包名提交同步及真实来源校验完成后才报告接入成功。认证或远端404保留具体阻塞，不伪造lock、不读取/打印令牌、不自动改用户Git索引或擅自提交推送。Git源码包含重建原料，crate归档可仅带消费子集；原jieba频次校验仍需dict.txt与固定生成器，不能因移动来源而删门禁。完整许可按实际标准正文校验，新增合法变体先读全文再窄增可信摘要，标题或章节占位不得算完整许可。
 
 静态数据crate不应依赖Flower候选类型、Windows、私有词典或AI模型。all/default表明确区分可选专名/MVP，原拼接字节与词对并集、人工prior的可选性分别核对。公开包只包含明确白名单，完整重建大原料留源码仓库；检查真实 `.crate` 而非仅Cargo清单，改文档或源后应重固定归档并比源码身份，publish dry-run不保证已保存 `.crate` 文件被更新。
 
@@ -86,6 +86,14 @@ Flower通过锁定版本的直接依赖消费；Python资产根应由Cargo metad
 - 词级补充不再用jieba词频存在性决定收录；低频/无频词的排名与默认加载另有明确契约。儿化仅保留来源明确的末尾r词对，不机械造儿字或er别名。每表/provenance/coverage须能区分来源支持、待补读音、默认lookup可达及真正提交。
 - 运行包仅固定生成表/manifest/coverage/NOTICE和原路径必需许可，原语料、provenance/rejected留源码审计。打包与Inno都用精确白名单和必需项；运行验证须绑定代码可信manifest摘要，不能只信载荷重算的自签摘要及零统计。取合法音节前先验证base本体摘要，来源例外须明确，防任意字母串伪称拼音。
 - 新数据会改变普通首项与AI生成候选，因此补真实品牌/儿化全拼、简拼、混拼提交及受影响模型正反例；固定性能负载测共享快照和冷/热成本。仅改旧测试的首项基线时记录数据原因，不把旧词库证明当作新词库证明。
+
+## 大规模词目同步与自动注音
+
+- “词目完整”与“全部可用拼音查询”分开取证。盘点实际词典及辅助运行候选，包括英文、混输、繁体、addon、emoji、符号映射值；符号候选须按整个字符串保留，不导入YAML键或结构说明。维护检查片段、错词负例、内部控制项及动态生成输出应明确排除范围，不能静默漏词或整表盲收。
+- 仅同步词目文字时，不自动复制原始频次或排名；项目统一低权重须标明不是统计词频。自动注音仅在用户已允许时使用，固定维护依赖版本，区分既有整词读音、自动推导、非拼音文本及待补项；未知生僻字保留文字和缺音证据，不编造读音或做多音笛卡尔积。自动音节合法不等于词义读音正确。
+- 可选专名表的独有读音不得经扩充生成器提升到默认层；用包含proper-only读音的正反fixture验证。Python与Rust对控制字符的拒绝边界应一致，例如Unicode Cc包含C1，不能只拒ASCII；emoji所需的ZWJ等格式字符不能混同控制字符删除。
+- 大原料不进crate时，明确离线重建/check要求完整源码仓库，不能承诺解包归档即可重建。检查必须只读、不导入刷新专用依赖；用真实全量差集、旧表字节不变、默认词对并集、字典API与实际归档载荷一致性验收。
+- 大规模静态表应实测真实crate压缩体积、解包编译及源码逐字节对应，不能仅凭Cargo白名单或本地package成功称为注册表已发布。新增数据权利未核定时不冒称全部MIT或公开再分发已获保证；用户偏好不能替代实际来源证据。
 
 ## 最小充分验证
 
