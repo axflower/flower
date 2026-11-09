@@ -530,6 +530,16 @@ impl Lexicon {
             .collect()
     }
 
+    pub(crate) fn contains_exact_pair(&self, reading: &str, text: &str) -> bool {
+        self.entries
+            .get(&reading.replace('\'', ""))
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.reading == reading && entry.text == text)
+            })
+    }
+
     /// Bounded exact-key probes for standalone short-word spelling suggestions.
     pub(crate) fn extra_syllable_choices(
         &self,

@@ -102,6 +102,14 @@ impl EngineRouter {
         self.session.pending_learning()
     }
 
+    pub fn pending_phrase_learning(&self) -> &[super::LearningEvent] {
+        self.session.pending_phrase_learning()
+    }
+
+    pub fn set_auto_phrase_lexicon(&mut self, lexicon: Option<std::sync::Arc<Lexicon>>) {
+        self.session.set_auto_phrase_lexicon(lexicon);
+    }
+
     pub fn pending_promotions(&self) -> &[super::PromotionEvent] {
         self.session.pending_promotions()
     }

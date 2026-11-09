@@ -101,7 +101,29 @@ fn core_mixed_ranks_are_measured_not_assumed_first() {
         let mut session = PinyinSession::from_lexicon(lexicon.clone(), 9).unwrap();
         type_text(&mut session, raw);
         let (actual, index) = locate(&mut session, text, reading);
-        assert_eq!(actual, rank, "{raw}");
+        // Optional spelling suggestions were added after these ordinary-rank
+        // measurements. Measure the ordinary lane without treating a suggestion
+        // inserted ahead of it as a change to the underlying mixed decoder.
+        let target_page = session.page();
+        while session.page() > 0 {
+            session.previous_page().unwrap();
+        }
+        let mut suggestions = 0;
+        for page in 0..=target_page {
+            let end = if page == target_page {
+                index
+            } else {
+                session.candidates_on_current_page().len()
+            };
+            suggestions += session.candidates_on_current_page()[..end]
+                .iter()
+                .filter(|c| c.is_spelling())
+                .count();
+            if page < target_page {
+                session.next_page().unwrap();
+            }
+        }
+        assert_eq!(actual - suggestions, rank, "{raw}");
         assert_eq!(
             session.select_candidate(index).unwrap().commit.as_deref(),
             Some(text)

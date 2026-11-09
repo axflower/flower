@@ -13,7 +13,9 @@ use thiserror::Error;
 
 use crate::engine::{promote_order, LearningEvent, PromotionEvent, RankingOrder};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
+const MAX_AUTO_PHRASES: usize = 4096;
+const AUTO_PHRASE_WEIGHT: u32 = 16384;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RECORDS: usize = 100_000;
 pub const MAX_LEARNING_COUNT: u32 = 8192;
@@ -76,6 +78,13 @@ pub struct LearnedEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AutoPhrase {
+    pub pinyin: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserDictionary {
     pub schema_version: u32,
     pub generation: u64,
@@ -87,6 +96,8 @@ pub struct UserDictionary {
     pub entries: Vec<DictionaryEntry>,
     pub domains: Vec<DomainDictionary>,
     pub learned: Vec<LearnedEntry>,
+    #[serde(default)]
+    pub auto_phrases: Vec<AutoPhrase>,
 }
 
 impl Default for UserDictionary {
@@ -100,6 +111,7 @@ impl Default for UserDictionary {
             entries: Vec::new(),
             domains: Vec::new(),
             learned: Vec::new(),
+            auto_phrases: Vec::new(),
         }
     }
 }
@@ -107,6 +119,19 @@ impl Default for UserDictionary {
 impl UserDictionary {
     /// A canonical TSV snapshot; learned counts are not static frequencies.
     pub fn lexicon_tsv(&self) -> Result<String, DictionaryError> {
+        self.snapshot_tsv(true)
+    }
+
+    pub fn base_lexicon_tsv(&self) -> Result<String, DictionaryError> {
+        self.snapshot_tsv(false)
+    }
+
+    pub fn auto_phrase_tsv(&self) -> Result<String, DictionaryError> {
+        self.validate()?;
+        auto_phrases_tsv(&self.auto_phrases)
+    }
+
+    fn snapshot_tsv(&self, include_auto: bool) -> Result<String, DictionaryError> {
         self.validate()?;
         let entries = self.entries.iter().chain(
             self.domains
@@ -121,6 +146,14 @@ impl UserDictionary {
                 .entry((&entry.pinyin, &entry.text))
                 .and_modify(|w| *w = (*w).max(entry.weight))
                 .or_insert(entry.weight);
+        }
+        if include_auto {
+            for phrase in &self.auto_phrases {
+                merged
+                    .entry((&phrase.pinyin, &phrase.text))
+                    .and_modify(|w| *w = (*w).max(AUTO_PHRASE_WEIGHT))
+                    .or_insert(AUTO_PHRASE_WEIGHT);
+            }
         }
         let mut output = String::new();
         for ((pinyin, text), weight) in merged {
@@ -137,11 +170,13 @@ impl UserDictionary {
             return Err(DictionaryError::UnsupportedVersion);
         }
         validate_rankings(&self.rankings)?;
+        validate_auto_phrases(&self.auto_phrases)?;
         if self.domains.len() > MAX_RECORDS
             || self
                 .entries
                 .len()
                 .saturating_add(self.learned.len())
+                .saturating_add(self.auto_phrases.len())
                 .saturating_add(self.domains.iter().map(|d| d.entries.len()).sum::<usize>())
                 .saturating_add(
                     self.rankings
@@ -178,6 +213,96 @@ impl UserDictionary {
 
 fn default_adaptive_ranking_enabled() -> bool {
     true
+}
+
+fn validate_auto_pair(pinyin: &str, text: &str) -> Result<(), DictionaryError> {
+    validate_pair(pinyin, text)?;
+    if !(2..=32).contains(&text.chars().count())
+        || !text.chars().all(|c| matches!(c, '\u{4e00}'..='\u{9fff}'))
+        || pinyin.bytes().filter(|b| *b != b'\'').count() > 128
+        || !pinyin
+            .split('\'')
+            .all(|s| s.bytes().any(|b| b"aeiouv".contains(&b)))
+    {
+        return Err(DictionaryError::InvalidData);
+    }
+    Ok(())
+}
+
+fn validate_auto_phrases(phrases: &[AutoPhrase]) -> Result<(), DictionaryError> {
+    if phrases.len() > MAX_AUTO_PHRASES {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    let mut seen = HashSet::new();
+    for phrase in phrases {
+        validate_auto_pair(&phrase.pinyin, &phrase.text)?;
+        if !seen.insert((&phrase.pinyin, &phrase.text)) {
+            return Err(DictionaryError::InvalidData);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn remember_auto_phrases(
+    phrases: &mut Vec<AutoPhrase>,
+    events: &[LearningEvent],
+) -> Result<(), DictionaryError> {
+    validate_auto_phrases(phrases)?;
+    if events.len() > MAX_BATCH {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    for event in events {
+        validate_auto_pair(&event.pinyin, &event.text)?;
+    }
+    for event in events {
+        phrases.retain(|p| p.pinyin != event.pinyin || p.text != event.text);
+        phrases.push(AutoPhrase {
+            pinyin: event.pinyin.clone(),
+            text: event.text.clone(),
+        });
+        if phrases.len() > MAX_AUTO_PHRASES {
+            phrases.remove(0);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn auto_phrases_tsv(phrases: &[AutoPhrase]) -> Result<String, DictionaryError> {
+    validate_auto_phrases(phrases)?;
+    let mut output = String::new();
+    for phrase in phrases {
+        output.push_str(&format!(
+            "{}\t{}\t{AUTO_PHRASE_WEIGHT}\n",
+            phrase.pinyin, phrase.text
+        ));
+    }
+    if output.len() > MAX_FILE_BYTES {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    Ok(output)
+}
+
+fn validate_commit(
+    promotions: &[PromotionEvent],
+    phrases: &[LearningEvent],
+) -> Result<(), DictionaryError> {
+    if promotions.len().saturating_add(phrases.len()) > MAX_BATCH {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    validate_promotions(promotions)?;
+    for phrase in phrases {
+        validate_auto_pair(&phrase.pinyin, &phrase.text)?;
+    }
+    // Include both halves in the queue's serialized payload budget.
+    let pairs: Vec<_> = phrases.iter().map(|p| (&p.pinyin, &p.text)).collect();
+    if serde_json::to_vec(&(promotions, pairs))
+        .map_err(|_| DictionaryError::InvalidData)?
+        .len()
+        > MAX_FILE_BYTES
+    {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    Ok(())
 }
 
 fn validate_order(order: &RankingOrder) -> Result<(), DictionaryError> {
@@ -492,6 +617,9 @@ impl DictionaryStore {
                 entry.pinyin, entry.text, entry.weight
             ));
         }
+        if domain.is_none() {
+            output = dictionary.lexicon_tsv()?;
+        }
         if output.len() > MAX_FILE_BYTES {
             return Err(DictionaryError::LimitExceeded);
         }
@@ -551,6 +679,7 @@ impl DictionaryStore {
         self.update(true, |dictionary| {
             dictionary.learned.clear();
             dictionary.rankings.clear();
+            dictionary.auto_phrases.clear();
             Ok(true)
         })
     }
@@ -574,6 +703,30 @@ impl DictionaryStore {
                 // a later event to hide a resource-limit violation.
                 dictionary.validate()?;
             }
+            Ok(true)
+        })
+    }
+
+    pub fn commit_if_generation(
+        &self,
+        generation: u64,
+        promotions: &[PromotionEvent],
+        phrases: &[LearningEvent],
+    ) -> Result<(), DictionaryError> {
+        validate_commit(promotions, phrases)?;
+        self.update(false, |dictionary| {
+            if !dictionary.adaptive_ranking_enabled
+                || dictionary.generation != generation
+                || (promotions.is_empty() && phrases.is_empty())
+            {
+                return Ok(false);
+            }
+            for event in promotions {
+                promote_order(&mut dictionary.rankings, event);
+                dictionary.validate()?;
+            }
+            remember_auto_phrases(&mut dictionary.auto_phrases, phrases)?;
+            dictionary.validate()?;
             Ok(true)
         })
     }
@@ -632,10 +785,8 @@ fn load_path(path: &Path) -> Result<UserDictionary, DictionaryError> {
     let mut dictionary: UserDictionary =
         serde_json::from_slice(&bytes).map_err(|_| DictionaryError::InvalidData)?;
     match dictionary.schema_version {
-        1 => {
+        1 | 2 => {
             dictionary.schema_version = SCHEMA_VERSION;
-            dictionary.adaptive_ranking_enabled = true;
-            dictionary.rankings.clear();
         }
         SCHEMA_VERSION => {}
         _ => return Err(DictionaryError::UnsupportedVersion),
@@ -1154,6 +1305,7 @@ fn current_user_path() -> Result<PathBuf, DictionaryError> {
 enum WorkerMessage {
     Learn(Vec<LearningEvent>),
     Promote(Vec<PromotionEvent>),
+    Commit(Vec<PromotionEvent>, Vec<LearningEvent>),
     Stop,
 }
 
@@ -1172,6 +1324,15 @@ impl LearningWorker {
                 let mut failed = false;
                 while let Ok(message) = receiver.recv() {
                     match message {
+                        WorkerMessage::Commit(promotions, phrases) => {
+                            if !failed
+                                && store
+                                    .commit_if_generation(generation, &promotions, &phrases)
+                                    .is_err()
+                            {
+                                failed = true;
+                            }
+                        }
                         WorkerMessage::Stop => break,
                         WorkerMessage::Learn(events) => {
                             if !failed && store.learn_if_generation(generation, &events).is_err() {
@@ -1216,6 +1377,22 @@ impl LearningWorker {
             .as_ref()
             .ok_or(DictionaryError::WorkerStopped)?
             .try_send(WorkerMessage::Promote(events.to_vec()))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => DictionaryError::QueueFull,
+                TrySendError::Disconnected(_) => DictionaryError::WorkerStopped,
+            })
+    }
+
+    pub fn submit_commit(
+        &self,
+        promotions: &[PromotionEvent],
+        phrases: &[LearningEvent],
+    ) -> Result<(), DictionaryError> {
+        validate_commit(promotions, phrases)?;
+        self.sender
+            .as_ref()
+            .ok_or(DictionaryError::WorkerStopped)?
+            .try_send(WorkerMessage::Commit(promotions.to_vec(), phrases.to_vec()))
             .map_err(|error| match error {
                 TrySendError::Full(_) => DictionaryError::QueueFull,
                 TrySendError::Disconnected(_) => DictionaryError::WorkerStopped,

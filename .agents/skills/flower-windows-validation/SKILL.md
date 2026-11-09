@@ -5,6 +5,13 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 # Flower Windows 验证
 
+## 稳定刷新与逐段自动词增量
+
+- 候选闪烁先检查生产发布是否对旧caret和新caret重复布局、同屏是否无条件hide/show，不把音节更新等同HWND重建。可用自有HWND记录WM_SHOWWINDOW、geometry及paint消息，证明同屏无可见性翻转且至多一次必要布局；保持新revision撤销旧命中、绘制成功才授权、失败/UIless/真正失焦隐藏。消息计数不外推真实DWM视觉或多屏体验，跨屏仍验证目标DPI。
+- 自动词与旧学习计数/相邻调序分离；以`design/stable-popup-and-auto-phrases.md`核对完整逐段选择、规范reading、raw耗尽、成功安全发布及独立小索引。用真实builtin例串引擎、生产TSF按键、当前activation下次输入、fresh context、worker drain及隔离Store重载；全拼/简拼/混拼查词与未完/取消/原拼/AI/SP不造词分开断言。不在按键中读盘或重建基础大索引，组词中不偷偷换索引；已有显式排名优先，不把个人词总应首项写成泛化断言。
+- schema升级需验证旧版本只读迁移不重写、显式关闭保留、复合事务坏批次原文件不变、总限制和自动词有界淘汰、clear推进generation防队列复活。关闭记忆仅停新增，已存自动词仍可查；清空删除自动词/排名/计数但保留手工与专业词。设置/导出/CLI状态等消费者需同步语义，旧版本降级不兼容须随包说明。
+- 混拼普通候选排名回归应区分普通lane与后来插入的可选拼写建议；定位失败先检查实际provenance及raw消费，不把拼写建议当部分普通候选，也不为了测试扩张既有部分简拼规则。未变模型质量证据可按范围复用，新增索引及提交链证据独立记录。
+
 0.4.18普通学习的未声明范围兼容以 `design/composed-spelling-and-learning-compatibility.md` 为准，覆盖下方历史“只扩AI、不扩普通学习”。用户保留每次相邻前移一步；兼容复用既有 `ai_undeclared_scope_compatibility`（默认true、显式false保留），独立于AI总开关，仅S04/S08通过原窗口/焦点/身份/style/密码掩码检查，不扩异常接口或明确敏感。须用真实自定义HWND和生产TSF提交、下一同raw、跨context、worker drain/隔离Store重载验证，仍不等于实际微信现场。其他宿主正常而某宿主不学时先查门禁，勿把保存或步进算法当作已证根因，也不通过按键磁盘扫描刷新解决。
 
 当前0.4.15未声明范围默认兼容以 `design/default-ai-scope-compatibility.md` 为准；用户已明确选择默认开启AI及兼容S04/S08，可关闭兼容恢复严格路径。只允许既定窗口/focus身份及style检查通过的缺声明场景，不扩普通学习，不将Sensitive/Unsupported/损坏接口错误转为安全。下文历史“未知一律拒绝”的AI表述不覆盖此新合同；自定义敏感框未声明且无标准密码标记可能无法识别，须随设置及README告知。发送与发布两次只读检查、原生password mask和自定义控件不发消息的边界仍要分别证明。

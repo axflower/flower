@@ -46,7 +46,10 @@ mod windows_exports {
     use crate::platform::diagnostics::{record, record_result, Stage};
     use crate::platform::{CandidatePopupModel, CandidatePopupWindow, PopupError};
     use crate::settings::{Settings, SettingsStore};
-    use crate::user_dictionary::{DictionaryStore, LearningWorker};
+    use crate::user_dictionary::{
+        auto_phrases_tsv, remember_auto_phrases, AutoPhrase, DictionaryError, DictionaryStore,
+        LearningWorker,
+    };
     use windows::core::{implement, AsImpl, Error, IUnknown, Interface, Result, GUID, HRESULT};
     use windows::Win32::Foundation::{
         BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_POINTER,
@@ -348,6 +351,8 @@ mod windows_exports {
         settings: Settings,
         lexicon: Lexicon,
         rankings: Arc<Vec<RankingOrder>>,
+        auto_phrases: Arc<Vec<AutoPhrase>>,
+        auto_phrase_lexicon: Option<Arc<Lexicon>>,
         adaptive_ranking_enabled: bool,
         learning: Option<LearningWorker>,
         _learning_registration: Option<ObjectRegistration>,
@@ -765,7 +770,7 @@ mod windows_exports {
                 }
                 if let Some(mut popup) = take_thread_popup(this.ticket.token, this.ticket.owner) {
                     popup.window.cancel_pending_actions();
-                    if popup.window.update(&snapshot).is_ok() {
+                    if popup.window.update_snapshot(&snapshot).is_ok() {
                         if let Some(caret) = caret.filter(|_| ui_allows(&shared, this.ticket.token))
                         {
                             let _ = popup.window.show_at(PopupRect::new(
@@ -1148,8 +1153,20 @@ mod windows_exports {
         if let Ok(activation) = shared.try_borrow() {
             if let Some(active) = activation.as_ref().filter(|a| a.token == token) {
                 router.set_ranking_orders(Arc::clone(&active.rankings));
+                router.set_auto_phrase_lexicon(active.auto_phrase_lexicon.clone());
             }
         }
+    }
+
+    fn auto_phrase_index(
+        phrases: &[AutoPhrase],
+    ) -> std::result::Result<Option<Arc<Lexicon>>, DictionaryError> {
+        if phrases.is_empty() {
+            return Ok(None);
+        }
+        Lexicon::from_tsv(&auto_phrases_tsv(phrases)?)
+            .map(|lexicon| Some(Arc::new(lexicon)))
+            .map_err(|_| DictionaryError::InvalidData)
     }
 
     fn context_key(context: &ITfContext) -> Result<ContextKey> {
@@ -2525,6 +2542,11 @@ mod windows_exports {
         } else {
             Vec::new()
         };
+        let phrase_events = if update.commit.is_some() {
+            entry.router.pending_phrase_learning().to_vec()
+        } else {
+            Vec::new()
+        };
         entry.composition = outcome.composition;
         entry.controller = outcome.controller;
         let caret = outcome.caret;
@@ -2604,7 +2626,7 @@ mod windows_exports {
             if entry
                 .popup_model
                 .snapshot()
-                .is_some_and(|snapshot| popup.window.update(snapshot).is_ok())
+                .is_some_and(|snapshot| popup.window.update_snapshot(snapshot).is_ok())
             {
                 let can_show_now = allow_show && ui_allows(&target.activation, target.token) && {
                     target
@@ -2668,7 +2690,7 @@ mod windows_exports {
                 if target.switch_to_english && still_focused {
                     active.english = true;
                 }
-                if !events.is_empty()
+                if (!events.is_empty() || !phrase_events.is_empty())
                     && claim_promotion(
                         &target.promotion_claim,
                         still_focused && learning_allowed && active.adaptive_ranking_enabled,
@@ -2678,15 +2700,30 @@ mod windows_exports {
                     for event in &events {
                         promote_order(&mut orders, event);
                     }
-                    if orders.iter().map(|o| o.candidates.len()).sum::<usize>() <= 100_000 {
-                        active.rankings = Arc::new(orders);
-                    } else {
-                        active.local_data_error = true;
-                    }
-                    if let Some(worker) = active.learning.as_ref() {
-                        if worker.submit_promotions(&events).is_err() {
-                            active.local_data_error = true;
+                    let mut phrases = active.auto_phrases.as_ref().clone();
+                    let index =
+                        remember_auto_phrases(&mut phrases, &phrase_events).and_then(|()| {
+                            if phrases == *active.auto_phrases {
+                                Ok(active.auto_phrase_lexicon.clone())
+                            } else {
+                                auto_phrase_index(&phrases)
+                            }
+                        });
+                    match index {
+                        Ok(index)
+                            if orders.iter().map(|o| o.candidates.len()).sum::<usize>()
+                                <= 100_000 =>
+                        {
+                            active.rankings = Arc::new(orders);
+                            active.auto_phrases = Arc::new(phrases);
+                            active.auto_phrase_lexicon = index;
+                            if let Some(worker) = active.learning.as_ref() {
+                                if worker.submit_commit(&events, &phrase_events).is_err() {
+                                    active.local_data_error = true;
+                                }
+                            }
                         }
+                        _ => active.local_data_error = true,
                     }
                 }
                 if still_focused
@@ -2709,6 +2746,9 @@ mod windows_exports {
                         entry
                             .router
                             .set_ranking_orders(Arc::clone(&active.rankings));
+                        entry
+                            .router
+                            .set_auto_phrase_lexicon(active.auto_phrase_lexicon.clone());
                     }
                     displaced = active.contexts.insert(target.key, entry);
                 }
@@ -2898,6 +2938,8 @@ mod windows_exports {
             let mut local_data_error = false;
             let mut learning = None;
             let mut rankings = Arc::new(Vec::new());
+            let mut auto_phrases = Arc::new(Vec::new());
+            let mut auto_phrase_lexicon = None;
             let mut adaptive_ranking_enabled = false;
             match self
                 .get_impl()
@@ -2909,12 +2951,19 @@ mod windows_exports {
             {
                 Ok((store, data)) => {
                     match data
-                        .lexicon_tsv()
+                        .base_lexicon_tsv()
                         .ok()
                         .and_then(|tsv| lexicon.with_overlay(&tsv).ok())
                     {
                         Some(snapshot) => {
                             lexicon = snapshot;
+                            match auto_phrase_index(&data.auto_phrases) {
+                                Ok(index) => {
+                                    auto_phrase_lexicon = index;
+                                    auto_phrases = Arc::new(data.auto_phrases.clone());
+                                }
+                                Err(_) => local_data_error = true,
+                            }
                             adaptive_ranking_enabled = data.adaptive_ranking_enabled;
                             if adaptive_ranking_enabled {
                                 rankings = Arc::new(data.rankings.clone());
@@ -3034,6 +3083,8 @@ mod windows_exports {
                         settings,
                         lexicon,
                         rankings,
+                        auto_phrases,
+                        auto_phrase_lexicon,
                         adaptive_ranking_enabled,
                         _learning_registration: learning
                             .as_ref()
@@ -3408,7 +3459,7 @@ mod windows_exports {
             };
             let key = context_key(context)?;
 
-            let (router, page_size, lexicon, rankings) = {
+            let (router, page_size, lexicon, rankings, auto_phrase_lexicon) = {
                 let Ok(activation) = self.get_impl().activation.try_borrow() else {
                     return Ok(FALSE);
                 };
@@ -3427,6 +3478,7 @@ mod windows_exports {
                     active.settings.candidate_page_size,
                     active.lexicon.clone(),
                     Arc::clone(&active.rankings),
+                    active.auto_phrase_lexicon.clone(),
                 )
             };
             let mut router = match router {
@@ -3443,6 +3495,7 @@ mod windows_exports {
             };
             if !router.is_composing() {
                 router.set_ranking_orders(rankings);
+                router.set_auto_phrase_lexicon(auto_phrase_lexicon);
             }
 
             match router.test_key(event) {
@@ -3693,6 +3746,8 @@ mod windows_exports {
                 settings: Settings::default(),
                 lexicon: Lexicon::from_tsv("ni\t你\t100\nhao\t好\t100\nni'hao\t你好\t200").unwrap(),
                 rankings: Arc::new(Vec::new()),
+                auto_phrases: Arc::new(Vec::new()),
+                auto_phrase_lexicon: None,
                 adaptive_ranking_enabled: true,
                 learning: None,
                 _learning_registration: None,
@@ -5447,6 +5502,8 @@ mod windows_exports {
                     },
                     lexicon: Lexicon::builtin().unwrap(),
                     rankings: Arc::new(Vec::new()),
+                    auto_phrases: Arc::new(Vec::new()),
+                    auto_phrase_lexicon: None,
                     adaptive_ranking_enabled: !matches!(index, 17 | 18),
                     learning: if index == 18 {
                         None
@@ -5687,6 +5744,245 @@ mod windows_exports {
         }
 
         #[test]
+        fn native_auto_phrase_commit_is_safe_immediate_cross_context_and_durable() {
+            use windows::core::w;
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+            use windows::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+            };
+
+            struct OwnedView(HWND, HWND);
+            impl Drop for OwnedView {
+                fn drop(&mut self) {
+                    COMPAT_VIEW.with(|v| v.set(HWND::default()));
+                    unsafe {
+                        let _ = SetFocus(self.1);
+                        let _ = DestroyWindow(self.0);
+                    }
+                }
+            }
+            fn choose(
+                shared: &SharedActivation,
+                sink: &ITfKeyEventSink,
+                context: &ITfContext,
+                text: &str,
+            ) {
+                let pages = shared.borrow().as_ref().unwrap().contexts[&context_key(context)]
+                    .popup_model
+                    .snapshot()
+                    .unwrap()
+                    .page_count;
+                for _ in 0..pages {
+                    let index = shared.borrow().as_ref().unwrap().contexts[&context_key(context)]
+                        .popup_model
+                        .snapshot()
+                        .unwrap()
+                        .candidates
+                        .iter()
+                        .position(|c| c.text == text && !c.is_ai() && !c.is_spelling());
+                    if let Some(index) = index {
+                        send_key(sink, context, b'1' + index as u8);
+                        return;
+                    }
+                    send_key(sink, context, 0x22);
+                }
+                panic!("missing ordinary candidate {text}");
+            }
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let root = std::path::PathBuf::from(
+                std::env::var_os("FLOWER_TEST_SCRATCH")
+                    .expect("native phrase test requires isolated scratch"),
+            );
+            assert!(root.is_absolute());
+            let base = Lexicon::builtin().unwrap();
+            for (index, (scopes, fail, compat, adaptive, allowed)) in [
+                (Some(vec![0]), false, true, true, true),
+                (Some(vec![61]), false, true, true, false),
+                (Some(vec![999]), false, true, true, false),
+                (None, false, true, true, true),
+                (Some(vec![]), false, true, true, true),
+                (None, false, false, true, false),
+                (Some(vec![0]), false, true, false, false),
+                (Some(vec![0]), true, true, true, false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                eprintln!("native auto phrase case {index}");
+                let value = scopes.map_or_else(VARIANT::default, |scopes| {
+                    let scope: IUnknown = TestScope(scopes).into();
+                    VARIANT::from(scope)
+                });
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(value),
+                    fail,
+                    calls: Rc::new(Cell::new(0)),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let previous = unsafe { GetFocus() };
+                let window = unsafe {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("Static"),
+                        w!(""),
+                        WS_POPUP,
+                        0,
+                        0,
+                        100,
+                        30,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                .unwrap();
+                let _view = OwnedView(window, previous);
+                COMPAT_VIEW.with(|v| v.set(window));
+                let _ = unsafe { SetFocus(window) };
+                unsafe { host.manager.SetFocus(&host.document) }.unwrap();
+                let path = root.join(format!(
+                    "native-auto-{}-{index}-{}.json",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                assert!(!path.exists());
+                let store = DictionaryStore::new(&path);
+                let data = store.load().unwrap();
+                let service: ITfTextInputProcessor = TextService::new().into();
+                let implementation =
+                    unsafe { <ITfTextInputProcessor as AsImpl<TextService>>::as_impl(&service) };
+                let shared = implementation.activation.clone();
+                *shared.borrow_mut() = Some(Activation {
+                    ui: Rc::new(UiState::default()),
+                    _activation_flags: 0,
+                    thread_manager: host.manager.clone(),
+                    keystroke_manager: host.manager.cast().unwrap(),
+                    client_id: host.client,
+                    contexts: HashMap::new(),
+                    token: next_activation_token(),
+                    owner_thread: std::thread::current().id(),
+                    focus_epoch: 0,
+                    foreground: true,
+                    shown_context: None,
+                    processing: false,
+                    english: false,
+                    shift: ShiftGesture::default(),
+                    context_generation: Rc::new(Cell::new(0)),
+                    _thread_events: None,
+                    settings: Settings {
+                        ai_correction_enabled: false,
+                        ai_undeclared_scope_compatibility: compat,
+                        ..Settings::default()
+                    },
+                    lexicon: base.clone(),
+                    rankings: Arc::new(Vec::new()),
+                    auto_phrases: Arc::new(Vec::new()),
+                    auto_phrase_lexicon: None,
+                    adaptive_ranking_enabled: adaptive,
+                    learning: Some(LearningWorker::start(store.clone(), data.generation).unwrap()),
+                    _learning_registration: None,
+                    local_data_error: false,
+                    ai: None,
+                    ai_unavailable: AiStatus::Disabled,
+                });
+                let sink: ITfKeyEventSink = service.cast().unwrap();
+                for key in b"XINJIAJUAN" {
+                    send_key(&sink, &host.context, *key);
+                }
+                choose(&shared, &sink, &host.context, "新");
+                choose(&shared, &sink, &host.context, "加");
+                assert!(shared.borrow().as_ref().unwrap().auto_phrases.is_empty());
+                choose(&shared, &sink, &host.context, "卷");
+                assert_eq!(read_document(&host, None), "新加卷");
+                assert_eq!(
+                    shared.borrow().as_ref().unwrap().auto_phrases.len(),
+                    usize::from(allowed),
+                    "case {index}"
+                );
+                if allowed {
+                    // Same activation, no disk reload or base index rebuild.
+                    for key in b"XINJIAJUAN" {
+                        send_key(&sink, &host.context, *key);
+                    }
+                    {
+                        let state = shared.borrow();
+                        let candidate = &state.as_ref().unwrap().contexts
+                            [&context_key(&host.context)]
+                            .popup_model
+                            .snapshot()
+                            .unwrap()
+                            .candidates[0];
+                        assert_eq!(candidate.text, "新加卷");
+                        assert!(!candidate.is_ai() && !candidate.is_spelling());
+                    }
+                    send_key(&sink, &host.context, b'1');
+                    assert_eq!(read_document(&host, None), "新加卷新加卷");
+                    let mut fresh = None;
+                    let mut cookie = 0;
+                    let document = unsafe { host.manager.CreateDocumentMgr() }.unwrap();
+                    unsafe {
+                        document.CreateContext(
+                            host.client,
+                            0,
+                            Some(&owner),
+                            &mut fresh,
+                            &mut cookie,
+                        )
+                    }
+                    .unwrap();
+                    let fresh = fresh.unwrap();
+                    let source: windows::Win32::UI::TextServices::ITfSource = fresh.cast().unwrap();
+                    let advice =
+                        unsafe { source.AdviseSink(&ITfContextOwner::IID, &owner) }.unwrap();
+                    unsafe {
+                        document.Push(&fresh).unwrap();
+                        host.manager.SetFocus(&document).unwrap();
+                    }
+                    for key in b"XJJ" {
+                        send_key(&sink, &fresh, *key);
+                    }
+                    assert_eq!(
+                        shared.borrow().as_ref().unwrap().contexts[&context_key(&fresh)]
+                            .popup_model
+                            .snapshot()
+                            .unwrap()
+                            .candidates[0]
+                            .text,
+                        "新加卷"
+                    );
+                    send_key(&sink, &fresh, 0x1B);
+                    unsafe {
+                        source.UnadviseSink(advice).unwrap();
+                        document.Pop(TF_POPF_ALL).unwrap();
+                        host.manager.SetFocus(&host.document).unwrap();
+                    }
+                }
+                let mut active = shared.borrow_mut().take().unwrap();
+                assert!(!active.local_data_error);
+                active.learning.as_mut().unwrap().shutdown().unwrap();
+                drop(active);
+                let saved = store.load().unwrap();
+                assert_eq!(saved.auto_phrases.len(), usize::from(allowed));
+                if allowed {
+                    assert_eq!(saved.auto_phrases[0].pinyin, "xin'jia'juan");
+                    assert_eq!(saved.auto_phrases[0].text, "新加卷");
+                }
+                if path.exists() {
+                    std::fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+
+        #[test]
         fn native_owner_application_scope_path() {
             unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
                 .ok()
@@ -5909,6 +6205,8 @@ mod windows_exports {
                 settings: Settings::default(),
                 lexicon: Lexicon::from_tsv("jin'tian'xin'qing\t今天新情\t100").unwrap(),
                 rankings: Arc::new(Vec::new()),
+                auto_phrases: Arc::new(Vec::new()),
+                auto_phrase_lexicon: None,
                 adaptive_ranking_enabled: true,
                 learning: None,
                 _learning_registration: None,
@@ -7216,6 +7514,8 @@ mod windows_exports {
                 settings: Settings::default(),
                 lexicon: Lexicon::from_tsv("ni\t你\t100\nhao\t好\t100\nni'hao\t你好\t200").unwrap(),
                 rankings: Arc::new(Vec::new()),
+                auto_phrases: Arc::new(Vec::new()),
+                auto_phrase_lexicon: None,
                 adaptive_ranking_enabled: true,
                 learning: None,
                 _learning_registration: None,
@@ -7456,6 +7756,8 @@ mod windows_exports {
                 settings: Settings::default(),
                 lexicon: Lexicon::builtin().unwrap(),
                 rankings: Arc::new(Vec::new()),
+                auto_phrases: Arc::new(Vec::new()),
+                auto_phrase_lexicon: None,
                 adaptive_ranking_enabled: false,
                 learning: None,
                 _learning_registration: None,

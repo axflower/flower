@@ -840,7 +840,7 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
     })?;
     let learning_hint = create_control(
         hwnd, instance, windows::core::w!("STATIC"),
-        windows::core::w!("默认开启，勾选后立即保存。\n成功选词会将候选向前移一位。\n清空学习不删除个人词条或专业词库。"),
+        windows::core::w!("默认开启；选词前移，逐段组词可记忆。\n关闭停止新增，已有自动词仍可使用。\n清空删除自动词，保留手工/专业词条。"),
         WS_CHILD.0 | WS_VISIBLE.0, LEARNING_HINT_ID,
     )?;
     update_controls(state, |controls| controls.learning_hint = learning_hint)?;
@@ -1376,8 +1376,8 @@ fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
                 );
             }
             let status = format!(
-                "个人词条 {} · 学习作用域 {} · 词库 {}\n选中词库：{}。立即保存，切换输入法生效。\n选词前移一位；清空学习不删除个人词条。",
-                data.entries.len(), data.rankings.len(), data.domains.len(),
+                "手工 {} · 自动词 {} · 排序 {} · 词库 {}\n选中词库：{}。立即保存，切换输入法生效。\n清空删除自动词，保留手工/专业词条。",
+                data.entries.len(), data.auto_phrases.len(), data.rankings.len(), data.domains.len(),
                 data.domains.get(selected_index).map(|item| if item.enabled { "已启用" } else { "已停用" }).unwrap_or("无"));
             let _ = set_control_text(hwnd, DICTIONARY_STATUS_ID, &status);
         }
@@ -1435,7 +1435,7 @@ fn dictionary_action(hwnd: HWND, state: &RefCell<SettingsUiState>, id: i32) {
     if id == CLEAR_LEARNING_ID
         && (message_box(
             hwnd,
-            "确定清空全部本地学习记录？\n\n不会删除个人词条或专业词库。此操作不可撤销。",
+            "确定清空全部本地学习记录和自动记忆词语？\n\n保留手工个人词条和专业词库。此操作不可撤销。",
             "Flower 设置",
             MB_YESNO,
         ) != IDYES

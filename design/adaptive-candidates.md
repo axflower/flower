@@ -71,6 +71,8 @@ pub struct PromotionEvent {
 三者为 Clone/Debug/PartialEq/Eq、serde Serialize/Deserialize 数据，未知字段拒绝。
 保存的输入作用域区分简拼和全拼；`yingshe` 的提升不强行改变另一缩写的排序。
 只有完整候选（consumed等于input长度）生成PromotionEvent，部分选择本身不记录；
+0.4.19另增完整逐段选词的自动词记忆，以`stable-popup-and-auto-phrases.md`为准，
+不改变本页PromotionEvent的相邻前移语义。
 组合完整候选作为一个身份，不把组成词的旧LearningEvent错误当作一次选择。
 
 调序算法：解码基础列表生成后应用该输入的显式顺序，未知/已不存在身份忽略，

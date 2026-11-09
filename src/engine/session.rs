@@ -23,6 +23,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 9;
 #[derive(Debug, Clone)]
 pub struct PinyinSession {
     lexicon: Lexicon,
+    auto_phrase_lexicon: Option<Arc<Lexicon>>,
     page_size: usize,
     candidate_width: Option<u32>,
     page_ranges: Vec<Range<usize>>,
@@ -34,6 +35,7 @@ pub struct PinyinSession {
     confirmed: Vec<Confirmed>,
     choices: Vec<Choice>,
     pending_learning: Vec<LearningEvent>,
+    pending_phrase_learning: Vec<LearningEvent>,
     candidates: Vec<Candidate>,
     page: usize,
     highlighted: Option<usize>,
@@ -73,6 +75,7 @@ impl PinyinSession {
 
         Ok(Self {
             lexicon,
+            auto_phrase_lexicon: None,
             page_size,
             candidate_width: None,
             page_ranges: Vec::new(),
@@ -84,6 +87,7 @@ impl PinyinSession {
             confirmed: Vec::new(),
             choices: Vec::new(),
             pending_learning: Vec::new(),
+            pending_phrase_learning: Vec::new(),
             candidates: Vec::new(),
             page: 0,
             highlighted: None,
@@ -116,6 +120,7 @@ impl PinyinSession {
                 } else {
                     self.pending_learning.clear();
                     self.pending_promotions.clear();
+                    self.pending_phrase_learning.clear();
                     self.snapshot(true)
                 };
                 update
@@ -134,6 +139,7 @@ impl PinyinSession {
                 }
                 self.pending_learning.clear();
                 self.pending_promotions.clear();
+                self.pending_phrase_learning.clear();
                 self.raw
                     .insert(self.raw_caret, character.to_ascii_lowercase());
                 self.raw_caret += 1;
@@ -152,6 +158,7 @@ impl PinyinSession {
                     }
                     self.pending_learning.clear();
                     self.pending_promotions.clear();
+                    self.pending_phrase_learning.clear();
                     self.raw.insert(self.raw_caret, '\'');
                     self.raw_caret += 1;
                     self.refresh_candidates();
@@ -188,6 +195,7 @@ impl PinyinSession {
                 }
                 self.pending_learning.clear();
                 self.pending_promotions.clear();
+                self.pending_phrase_learning.clear();
                 if self.raw.is_empty() && self.confirmed.is_empty() {
                     self.clear_composition();
                 } else {
@@ -203,6 +211,7 @@ impl PinyinSession {
                     self.raw.remove(self.raw_caret);
                     self.pending_learning.clear();
                     self.pending_promotions.clear();
+                    self.pending_phrase_learning.clear();
                     if self.raw.is_empty() && self.confirmed.is_empty() {
                         self.clear_composition();
                     } else {
@@ -473,6 +482,19 @@ impl PinyinSession {
         &self.pending_learning
     }
 
+    /// Novel words formed by at least two explicit ordinary selections.
+    /// Successful host editing and privacy checks are still required.
+    pub fn pending_phrase_learning(&self) -> &[LearningEvent] {
+        &self.pending_phrase_learning
+    }
+
+    /// Replace the small personal index only between compositions.
+    pub fn set_auto_phrase_lexicon(&mut self, lexicon: Option<Arc<Lexicon>>) {
+        if !self.is_composing() {
+            self.auto_phrase_lexicon = lexicon;
+        }
+    }
+
     pub fn page(&self) -> usize {
         self.page
     }
@@ -625,11 +647,45 @@ impl PinyinSession {
             .iter()
             .flat_map(|s| s.events.clone())
             .collect();
+        let phrase = self.completed_phrase();
         self.clear_composition();
         self.pending_learning = events;
+        self.pending_phrase_learning.extend(phrase);
         let mut update = self.snapshot(true);
         update.commit = Some(text);
         Ok(update)
+    }
+
+    fn completed_phrase(&self) -> Option<LearningEvent> {
+        if !self.raw.is_empty() || self.confirmed.len() < 2 {
+            return None;
+        }
+        let text: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
+        let pinyin = self
+            .confirmed
+            .iter()
+            .map(|s| s.reading.as_str())
+            .collect::<Vec<_>>()
+            .join("'");
+        let characters = text.chars().count();
+        if !(2..=32).contains(&characters)
+            || !text.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+            || pinyin.split('\'').count() != characters
+            || pinyin.bytes().filter(|&b| b != b'\'').count() > 128
+            || !pinyin.split('\'').all(|s| {
+                !s.is_empty()
+                    && s.bytes().all(|b| b.is_ascii_lowercase())
+                    && s.bytes().any(|b| b"aeiouv".contains(&b))
+            })
+            || self.lexicon.contains_exact_pair(&pinyin, &text)
+            || self
+                .auto_phrase_lexicon
+                .as_ref()
+                .is_some_and(|l| l.contains_exact_pair(&pinyin, &text))
+        {
+            return None;
+        }
+        Some(LearningEvent { pinyin, text })
     }
 
     fn refresh_candidates(&mut self) {
@@ -639,7 +695,20 @@ impl PinyinSession {
             .map(|s| s.text.as_str())
             .collect::<String>()
             + &self.raw;
-        self.choices = decode(&self.lexicon, &self.raw);
+        self.choices = self
+            .auto_phrase_lexicon
+            .as_ref()
+            .map(|lexicon| decode(lexicon, &self.raw))
+            .unwrap_or_default();
+        self.choices.extend(decode(&self.lexicon, &self.raw));
+        let mut seen_choices = std::collections::HashSet::new();
+        self.choices.retain(|choice| {
+            seen_choices.insert((
+                choice.candidate.text.clone(),
+                choice.candidate.comment.clone(),
+                choice.consumed,
+            ))
+        });
         let (complete, partial): (Vec<_>, Vec<_>) = self
             .choices
             .drain(..)
@@ -658,14 +727,21 @@ impl PinyinSession {
             self.choices = complete;
         }
         self.choices.extend(partial);
-        let mut proposals = self.lexicon.short_spelling_choices(&self.raw);
-        if let Some(source) = self.choices.iter().find(|c| c.consumed == self.raw.len()) {
-            proposals.extend(
-                self.lexicon
-                    .extra_syllable_choices(&self.raw, &source.candidate),
-            );
+        let mut proposals = Vec::new();
+        if !self
+            .auto_phrase_lexicon
+            .as_ref()
+            .is_some_and(|lexicon| !lexicon.exact_choices(&self.raw).is_empty())
+        {
+            proposals.extend(self.lexicon.short_spelling_choices(&self.raw));
+            if let Some(source) = self.choices.iter().find(|c| c.consumed == self.raw.len()) {
+                proposals.extend(
+                    self.lexicon
+                        .extra_syllable_choices(&self.raw, &source.candidate),
+                );
+            }
+            proposals.extend(self.lexicon.composed_spelling_choices(&self.raw));
         }
-        proposals.extend(self.lexicon.composed_spelling_choices(&self.raw));
         let mut spelling = Vec::new();
         for choice in proposals {
             if self
@@ -804,6 +880,7 @@ impl PinyinSession {
         self.choices.clear();
         self.pending_learning.clear();
         self.pending_promotions.clear();
+        self.pending_phrase_learning.clear();
         self.candidates.clear();
         self.page_ranges.clear();
         self.page = 0;

@@ -9,6 +9,219 @@ use flower::user_dictionary::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn auto_phrase_validation_bounds_and_snapshot_max_weights() {
+    use flower::user_dictionary::{AutoPhrase, DictionaryEntry, LearnedEntry, UserDictionary};
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let mut dictionary = UserDictionary {
+        auto_phrases: vec![AutoPhrase {
+            pinyin: "ni'hao".into(),
+            text: "你好".into(),
+        }],
+        entries: vec![DictionaryEntry {
+            pinyin: "ni'hao".into(),
+            text: "你好".into(),
+            weight: 20000,
+        }],
+        ..UserDictionary::default()
+    };
+    assert_eq!(dictionary.lexicon_tsv().unwrap(), "ni'hao\t你好\t20000\n");
+    dictionary.entries[0].weight = 1;
+    assert_eq!(dictionary.lexicon_tsv().unwrap(), "ni'hao\t你好\t16384\n");
+    assert_eq!(dictionary.base_lexicon_tsv().unwrap(), "ni'hao\t你好\t1\n");
+    let bytes = serde_json::to_vec(&dictionary).unwrap();
+    fs::write(store.path(), &bytes).unwrap();
+    assert_eq!(store.load().unwrap(), dictionary);
+    let long = LearningEvent {
+        pinyin: vec!["zhang"; 26].join("'"),
+        text: "张".repeat(26),
+    };
+    let too_many = LearningEvent {
+        pinyin: vec!["ni"; 33].join("'"),
+        text: "你".repeat(33),
+    };
+    for invalid in [long, too_many] {
+        assert!(store
+            .commit_if_generation(0, &[promotion(4)], &[invalid])
+            .is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+    }
+    store
+        .commit_if_generation(
+            0,
+            &[],
+            &[LearningEvent {
+                pinyin: vec!["ni"; 32].join("'"),
+                text: "你".repeat(32),
+            }],
+        )
+        .unwrap();
+    assert_eq!(store.load().unwrap().auto_phrases.len(), 2);
+    let mut value = serde_json::to_value(&dictionary).unwrap();
+    value["auto_phrases"][0]["extra"] = serde_json::json!(true);
+    fs::write(store.path(), serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(store.load().is_err());
+    dictionary
+        .auto_phrases
+        .push(dictionary.auto_phrases[0].clone());
+    fs::write(store.path(), serde_json::to_vec(&dictionary).unwrap()).unwrap();
+    assert!(store.load().is_err());
+    dictionary.auto_phrases.pop();
+    dictionary.entries.clear();
+    dictionary.learned = (0..100_000u32)
+        .map(|n| LearnedEntry {
+            pinyin: "ni'hao".into(),
+            text: format!(
+                "{}{}",
+                char::from_u32(0x4e00 + n / 20000).unwrap(),
+                char::from_u32(0x4e00 + n % 20000).unwrap()
+            ),
+            count: 1,
+        })
+        .collect();
+    fs::write(store.path(), serde_json::to_vec(&dictionary).unwrap()).unwrap();
+    assert!(matches!(store.load(), Err(DictionaryError::LimitExceeded)));
+}
+
+#[test]
+fn old_schemas_preserve_all_fields_without_rewriting() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    for version in [1, 2] {
+        let mut dictionary = flower::user_dictionary::UserDictionary {
+            schema_version: version,
+            generation: 29,
+            adaptive_ranking_enabled: false,
+            learning_enabled: true,
+            rankings: vec![promotion(1).order],
+            learned: vec![flower::user_dictionary::LearnedEntry {
+                pinyin: "ni'hao".into(),
+                text: "你好".into(),
+                count: 9,
+            }],
+            ..flower::user_dictionary::UserDictionary::default()
+        };
+        let mut value = serde_json::to_value(&dictionary).unwrap();
+        value.as_object_mut().unwrap().remove("auto_phrases");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(store.path(), &bytes).unwrap();
+        dictionary.schema_version = 3;
+        assert_eq!(store.load().unwrap(), dictionary);
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+        assert!(dictionary.auto_phrase_tsv().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn compound_commit_is_atomic_and_worker_drains_with_generation_gates() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    store
+        .commit_if_generation(0, &[promotion(4)], &[event()])
+        .unwrap();
+    let original = fs::read(store.path()).unwrap();
+    for (pinyin, text) in [
+        ("ni", "你"),
+        ("n'h", "你好"),
+        ("Ni'hao", "你好"),
+        ("ni hao", "你好"),
+        ("ni''hao", "你好"),
+        ("ni'hao", "你！"),
+        ("ni'hao", "你㐀"),
+        ("ni'hao", "你𠀀"),
+    ] {
+        let invalid = LearningEvent {
+            pinyin: pinyin.into(),
+            text: text.into(),
+        };
+        assert!(store
+            .commit_if_generation(0, &[promotion(4)], &[event(), invalid])
+            .is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), original);
+    }
+    let mut worker = LearningWorker::start(store.clone(), 0).unwrap();
+    assert!(matches!(
+        worker.submit_commit(&[promotion(1)], &vec![event(); 1024]),
+        Err(DictionaryError::LimitExceeded)
+    ));
+    worker.submit_commit(&[promotion(4)], &[event()]).unwrap();
+    worker.shutdown().unwrap();
+    let dictionary = store.load().unwrap();
+    assert_eq!(dictionary.auto_phrases.len(), 1);
+    assert_eq!(
+        dictionary.auto_phrase_tsv().unwrap(),
+        "ni'hao\t你好\t16384\n"
+    );
+    assert!(dictionary.base_lexicon_tsv().unwrap().is_empty());
+    assert_eq!(
+        dictionary.lexicon_tsv().unwrap(),
+        dictionary.auto_phrase_tsv().unwrap()
+    );
+    let output = fixture.path("export.tsv");
+    store.export_tsv(&output, None).unwrap();
+    assert_eq!(
+        fs::read_to_string(output).unwrap(),
+        dictionary.lexicon_tsv().unwrap()
+    );
+    store.set_learning_enabled(false).unwrap();
+    store
+        .commit_if_generation(1, &[promotion(4)], &[event()])
+        .unwrap();
+    assert_eq!(store.load().unwrap().auto_phrases, dictionary.auto_phrases);
+    store.clear_learning().unwrap();
+    store
+        .commit_if_generation(0, &[promotion(4)], &[event()])
+        .unwrap();
+    let cleared = store.load().unwrap();
+    assert_eq!(cleared.generation, 2);
+    assert!(
+        cleared.auto_phrases.is_empty()
+            && cleared.rankings.is_empty()
+            && cleared.learned.is_empty()
+    );
+}
+
+#[test]
+fn automatic_recent_list_capacity_and_concurrent_merges() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let phrase = |index: u32| LearningEvent {
+        pinyin: "ni'hao".into(),
+        text: format!("你{}", char::from_u32(0x4e00 + index).unwrap()),
+    };
+    for batch in 0..4 {
+        let events: Vec<_> = (batch * 1024..(batch + 1) * 1024).map(phrase).collect();
+        store.commit_if_generation(0, &[], &events).unwrap();
+    }
+    store
+        .commit_if_generation(0, &[], &[phrase(0), phrase(4096)])
+        .unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.auto_phrases.len(), 4096);
+    assert_eq!(snapshot.auto_phrases[0].text, phrase(2).text);
+    assert_eq!(snapshot.auto_phrases[4094].text, phrase(0).text);
+    std::thread::scope(|scope| {
+        for index in 4097..4101 {
+            let store = &store;
+            let event = phrase(index);
+            scope.spawn(move || {
+                store
+                    .commit_if_generation(0, &[promotion(4)], &[event])
+                    .unwrap()
+            });
+        }
+    });
+    let snapshot = store.load().unwrap();
+    for index in 4097..4101 {
+        assert!(snapshot
+            .auto_phrases
+            .iter()
+            .any(|p| p.text == phrase(index).text));
+    }
+    assert_eq!(snapshot.rankings[0].candidates[0].text, "五");
+}
+
 fn promotion(selected: usize) -> flower::engine::PromotionEvent {
     use flower::engine::{PromotionEvent, RankingCandidate, RankingOrder};
     let candidates: Vec<_> = ["一", "二", "三", "四", "五"]
@@ -35,7 +248,7 @@ fn schema_one_migrates_only_on_update() {
     let bytes = br#"{"schema_version":1,"generation":7,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#;
     fs::write(store.path(), bytes).unwrap();
     let snapshot = store.load().unwrap();
-    assert_eq!(snapshot.schema_version, 2);
+    assert_eq!(snapshot.schema_version, 3);
     assert!(snapshot.adaptive_ranking_enabled);
     assert!(!snapshot.learning_enabled);
     assert_eq!(fs::read(store.path()).unwrap(), bytes);
@@ -44,7 +257,7 @@ fn schema_one_migrates_only_on_update() {
     assert_eq!(snapshot.rankings[0].candidates[3].text, "五");
     assert_eq!(snapshot.generation, 7);
     let json: serde_json::Value = serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(snapshot, store.load().unwrap());
 }
 
@@ -212,7 +425,7 @@ fn missing_load_has_no_side_effect_and_learning_defaults_off() {
     let fixture = Fixture::new();
     let store = DictionaryStore::new(fixture.path("missing").join("dictionary.json"));
     let dictionary = store.load().unwrap();
-    assert_eq!(dictionary.schema_version, 2);
+    assert_eq!(dictionary.schema_version, 3);
     assert!(dictionary.adaptive_ranking_enabled);
     assert!(!dictionary.learning_enabled);
     assert_eq!(dictionary.generation, 0);
@@ -250,13 +463,14 @@ fn personal_and_domain_round_trip_preserves_boundaries() {
     let domain = fixture.path("domain.tsv");
     store.export_tsv(&personal, None).unwrap();
     store.export_tsv(&domain, Some("医学")).unwrap();
-    assert_eq!(fs::read_to_string(&personal).unwrap(), "ni'hao\t你好\t17\n");
+    let usable = "ni'hao\t你好\t17\nzhong'guo\t中国\t29\n";
+    assert_eq!(fs::read_to_string(&personal).unwrap(), usable);
     assert_eq!(
         fs::read_to_string(&domain).unwrap(),
         "zhong'guo\t中国\t29\n"
     );
     assert!(store.export_tsv(&personal, None).is_err());
-    assert_eq!(fs::read_to_string(personal).unwrap(), "ni'hao\t你好\t17\n");
+    assert_eq!(fs::read_to_string(personal).unwrap(), usable);
     store.remove_entry("ni hao", "你好", None).unwrap();
     assert!(store.load().unwrap().entries.is_empty());
     assert_eq!(store.load().unwrap().domains[0].entries.len(), 1);
@@ -310,7 +524,7 @@ fn corrupt_unknown_and_oversized_data_are_not_replaced() {
     let store = fixture.store();
     for bytes in [
         b"{not json".to_vec(),
-        br#"{"schema_version":3,"generation":0,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#.to_vec(),
+        br#"{"schema_version":4,"generation":0,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#.to_vec(),
         vec![b' '; MAX_FILE_BYTES + 1],
     ] {
         fs::write(store.path(), &bytes).unwrap();
@@ -423,7 +637,7 @@ fn cooperative_public_loads_and_updates_preserve_complete_monotonic_snapshots() 
                     let mut previous_count = 0;
                     for _ in 0..32 {
                         let snapshot = store.load()?;
-                        assert_eq!(snapshot.schema_version, 2);
+                        assert_eq!(snapshot.schema_version, 3);
                         assert_eq!(snapshot.generation, generation);
                         assert!(snapshot.learning_enabled);
                         assert!(snapshot.learned.len() <= 1);

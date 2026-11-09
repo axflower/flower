@@ -112,6 +112,13 @@ mod windows_impl {
     const WM_FLOWER_DISPATCH_ACTION: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
     const AI_IDLE_TIMER: usize = 0x4641;
 
+    #[cfg(test)]
+    std::thread_local! {
+        // Only the HWND explicitly enrolled by this thread's test is observed.
+        static MESSAGE_COUNTS: RefCell<(HWND, usize, usize, usize)> =
+            RefCell::new((HWND::default(), 0, 0, 0));
+    }
+
     /// Keeps status geometry out of the selectable candidate model.
     struct PopupLayout {
         candidates: CandidatePopupLayout,
@@ -716,6 +723,7 @@ mod windows_impl {
 
         /// 替换绘制快照，并按当前 DPI 设置自然尺寸。
         pub fn update(&mut self, snapshot: &CandidatePopupSnapshot) -> Result<(), PopupError> {
+            self.update_snapshot(snapshot)?;
             self.ensure_alive()?;
 
             // SAFETY: `self.hwnd` is a live popup window owned by this struct,
@@ -758,13 +766,7 @@ mod windows_impl {
                     .ok_or(PopupError::Destroyed)?
                     .try_borrow_mut()
                     .map_err(|_| state_busy_error())?;
-                if state.snapshot.as_ref() != Some(snapshot) {
-                    state.scroll_offset = None;
-                    state.presented = None;
-                }
-                state.snapshot = Some(snapshot.clone());
                 state.dpi = dpi;
-                state.pending_actions.clear();
             }
 
             // A visible refresh must retain its caret anchor and screen clamp.
@@ -791,6 +793,27 @@ mod windows_impl {
                 ));
             }
 
+            Ok(())
+        }
+
+        /// Replaces model state without changing visibility or native geometry.
+        pub fn update_snapshot(
+            &mut self,
+            snapshot: &CandidatePopupSnapshot,
+        ) -> Result<(), PopupError> {
+            self.ensure_alive()?;
+            let mut state = self
+                .state
+                .as_deref()
+                .ok_or(PopupError::Destroyed)?
+                .try_borrow_mut()
+                .map_err(|_| state_busy_error())?;
+            if state.snapshot.as_ref() != Some(snapshot) {
+                state.scroll_offset = None;
+            }
+            state.snapshot = Some(snapshot.clone());
+            state.presented = None;
+            state.pending_actions.clear();
             Ok(())
         }
 
@@ -870,8 +893,20 @@ mod windows_impl {
         /// 弹窗不调用前台或焦点 API。跨显示器时先把隐藏窗口移动到目标显示器，
         /// 让 `GetDpiForWindow` 返回目标 DPI，再按工作区限制尺寸。
         pub fn show_at(&self, caret: PopupRect) -> Result<(), PopupError> {
+            let result = self.show_at_inner(caret);
+            if result.is_err() {
+                self.hide();
+            }
+            result
+        }
+
+        fn show_at_inner(&self, caret: PopupRect) -> Result<(), PopupError> {
             self.ensure_alive()?;
             let snapshot = self.snapshot().ok_or(PopupError::NoSnapshot)?;
+            if snapshot.candidates.is_empty() {
+                self.hide();
+                return Ok(());
+            }
             let status = self
                 .state
                 .as_deref()
@@ -879,7 +914,16 @@ mod windows_impl {
                 .try_borrow()
                 .map_err(|_| state_busy_error())?
                 .ai_status;
-            self.hide();
+            {
+                let mut state = self
+                    .state
+                    .as_deref()
+                    .ok_or(PopupError::Destroyed)?
+                    .try_borrow_mut()
+                    .map_err(|_| state_busy_error())?;
+                state.pending_actions.clear();
+                state.presented = None;
+            }
             let native_caret = RECT {
                 left: caret.left,
                 top: caret.top,
@@ -909,35 +953,40 @@ mod windows_impl {
                 ));
             }
             let work_area = rect_from_windows(monitor_info.rcWork);
+            let same_monitor =
+                unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) == monitor };
 
             // Move while hidden with a temporary size that fits the selected
             // monitor. This guarantees that `GetDpiForWindow` observes the
             // target monitor rather than an adjacent monitor at the caret edge.
-            let temporary_layout = PopupLayout::new(
-                &snapshot,
-                BASE_DPI,
-                PopupSize::new(work_area.width(), work_area.height()),
-                status,
-            );
-            let temporary = position_candidate_popup(caret, temporary_layout.size, work_area)
-                .ok_or_else(|| {
+            if !same_monitor {
+                self.hide();
+                let temporary_layout = PopupLayout::new(
+                    &snapshot,
+                    BASE_DPI,
+                    PopupSize::new(work_area.width(), work_area.height()),
+                    status,
+                );
+                let temporary = position_candidate_popup(caret, temporary_layout.size, work_area)
+                    .ok_or_else(|| {
                     PopupError::win32(
                         "temporary placement",
                         WindowsError::from_hresult(E_UNEXPECTED),
                     )
                 })?;
-            unsafe {
-                SetWindowPos(
-                    self.hwnd,
-                    HWND::default(),
-                    temporary.left,
-                    temporary.top,
-                    temporary.width(),
-                    temporary.height(),
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )
+                unsafe {
+                    SetWindowPos(
+                        self.hwnd,
+                        HWND::default(),
+                        temporary.left,
+                        temporary.top,
+                        temporary.width(),
+                        temporary.height(),
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                }
+                .map_err(|error| PopupError::win32("target monitor move", error))?;
             }
-            .map_err(|error| PopupError::win32("target monitor move", error))?;
             let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(BASE_DPI);
             let layout = PopupLayout::new(
                 &snapshot,
@@ -975,18 +1024,25 @@ mod windows_impl {
             // SAFETY: The window is live. SWP_SHOWWINDOW shows it without
             // activation, and the placement is already clipped to the monitor
             // work area. No foreground or focus API is called.
+            let mut current = RECT::default();
             unsafe {
-                SetWindowPos(
-                    self.hwnd,
-                    HWND::default(),
-                    placement.left,
-                    placement.top,
-                    layout.size.width,
-                    layout.size.height,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                )
+                windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut current)
             }
-            .map_err(|error| PopupError::win32("show", error))?;
+            .map_err(|error| PopupError::win32("window geometry", error))?;
+            if !self.is_visible() || rect_from_windows(current) != placement {
+                unsafe {
+                    SetWindowPos(
+                        self.hwnd,
+                        HWND::default(),
+                        placement.left,
+                        placement.top,
+                        layout.size.width,
+                        layout.size.height,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    )
+                }
+                .map_err(|error| PopupError::win32("show", error))?;
+            }
 
             // SAFETY: The window is live and the null rectangle invalidates the
             // complete client area after any cross-monitor DPI change.
@@ -1013,6 +1069,7 @@ mod windows_impl {
             };
             if let Ok(mut state) = state.try_borrow_mut() {
                 state.pending_actions.clear();
+                state.presented = None;
             }
             if self.ensure_alive().is_err() {
                 return;
@@ -1151,6 +1208,21 @@ mod windows_impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        #[cfg(test)]
+        MESSAGE_COUNTS.with(|counts| {
+            let mut counts = counts.borrow_mut();
+            if counts.0 == hwnd {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    WM_SHOWWINDOW, WM_WINDOWPOSCHANGING,
+                };
+                match message {
+                    WM_SHOWWINDOW => counts.1 += 1,
+                    WM_WINDOWPOSCHANGING => counts.2 += 1,
+                    WM_PAINT => counts.3 += 1,
+                    _ => {}
+                }
+            }
+        });
         match catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: Windows invokes this procedure only for live windows of
             // the registered popup class. The raw state pointer is non-owning
@@ -2529,6 +2601,98 @@ mod windows_impl {
                 .borrow()
                 .scroll_offset
                 .is_none());
+            popup.destroy().unwrap();
+        }
+
+        #[test]
+        fn native_same_monitor_refresh_has_no_visibility_flips() {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, PeekMessageW, MSG, PM_REMOVE,
+            };
+            let pump = |hwnd| unsafe {
+                let mut message = MSG::default();
+                while PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&message);
+                }
+            };
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let mut snapshot = long_snapshot();
+            popup.update_snapshot(&snapshot).unwrap();
+            let caret = PopupRect::new(10, 10, 11, 30);
+            popup.show_at(caret).unwrap();
+            pump(popup.hwnd);
+            for step in 0..6 {
+                MESSAGE_COUNTS.with(|c| *c.borrow_mut() = (popup.hwnd, 0, 0, 0));
+                snapshot.revision += 1;
+                if step == 2 {
+                    snapshot.candidates.truncate(1);
+                }
+                popup.update_snapshot(&snapshot).unwrap();
+                assert!(popup.is_visible());
+                assert!(popup.state.as_ref().unwrap().borrow().presented.is_none());
+                popup
+                    .show_at(PopupRect::new(10 + step, 10, 11 + step, 30))
+                    .unwrap();
+                pump(popup.hwnd);
+                MESSAGE_COUNTS.with(|c| {
+                    let counts = c.borrow();
+                    println!(
+                        "snapshot step {step}: visibility={}, geometry={}, paint={}",
+                        counts.1, counts.2, counts.3
+                    );
+                    assert_eq!(counts.1, 0, "same-monitor refresh toggled visibility");
+                    assert!(counts.2 <= 1, "refresh committed geometry more than once");
+                    assert!(counts.3 > 0);
+                });
+                MESSAGE_COUNTS.with(|c| *c.borrow_mut() = (popup.hwnd, 0, 0, 0));
+                popup
+                    .set_ai_status(if step % 2 == 0 {
+                        AiStatus::Waiting
+                    } else {
+                        AiStatus::Checking
+                    })
+                    .unwrap();
+                pump(popup.hwnd);
+                MESSAGE_COUNTS.with(|c| {
+                    assert_eq!(c.borrow().1, 0);
+                    assert!(c.borrow().2 <= 1);
+                });
+                MESSAGE_COUNTS.with(|c| *c.borrow_mut() = (popup.hwnd, 0, 0, 0));
+                popup
+                    .show_at(PopupRect::new(10 + step, 10, 11 + step, 30))
+                    .unwrap();
+                popup
+                    .set_ai_status(if step % 2 == 0 {
+                        AiStatus::Waiting
+                    } else {
+                        AiStatus::Checking
+                    })
+                    .unwrap();
+                pump(popup.hwnd);
+                MESSAGE_COUNTS.with(|c| {
+                    assert_eq!(c.borrow().1, 0);
+                    assert_eq!(
+                        c.borrow().2,
+                        0,
+                        "unchanged geometry should not be submitted"
+                    );
+                });
+            }
+            popup.hide();
+            pump(popup.hwnd);
+            MESSAGE_COUNTS
+                .with(|c| assert_eq!(c.borrow().1, 1, "real hide must remain observable"));
+            MESSAGE_COUNTS.with(|c| *c.borrow_mut() = (popup.hwnd, 0, 0, 0));
+            snapshot.revision += 1;
+            popup.update_snapshot(&snapshot).unwrap();
+            popup.set_ai_status(AiStatus::Waiting).unwrap();
+            pump(popup.hwnd);
+            assert!(!popup.is_visible());
+            MESSAGE_COUNTS.with(|c| {
+                assert_eq!(c.borrow().1, 0);
+                assert_eq!(c.borrow().2, 0);
+            });
+            MESSAGE_COUNTS.with(|c| *c.borrow_mut() = (HWND::default(), 0, 0, 0));
             popup.destroy().unwrap();
         }
 

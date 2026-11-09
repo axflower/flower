@@ -32,7 +32,8 @@ const USAGE: &str = "Flower 设置程序
 
 无参数打开设置窗口。词典管理仅操作当前用户本地数据，不提权。
 导入/导出使用三列 TSV（拼音、文字、正整数权重）；读音以单引号分音。
-选词顺序默认本地保存；成功选中前移一位。可关闭或清空，不删除个人词条。
+选词顺序默认本地保存；成功选中前移一位，完整逐段组词可记忆。
+关闭停止新增；清空删除自动词和排序，保留手工个人词条及专业词库。
 修改后请重新切换到 Flower 输入法使设置生效。";
 
 #[derive(Debug, PartialEq)]
@@ -270,7 +271,7 @@ fn execute(command: Command) -> Result<(), String> {
         Command::Status => {
             let data = store.load().map_err(|e| e.to_string())?;
             println!(
-                "格式版本：{}\n代次：{}\n记住选词顺序：{}\n个人词条：{}\n排序作用域：{}",
+                "格式版本：{}\n代次：{}\n记住选词顺序：{}\n个人词条：{}\n排序作用域：{}\n自动记忆词语：{}",
                 data.schema_version,
                 data.generation,
                 if data.adaptive_ranking_enabled {
@@ -279,7 +280,8 @@ fn execute(command: Command) -> Result<(), String> {
                     "关闭"
                 },
                 data.entries.len(),
-                data.rankings.len()
+                data.rankings.len(),
+                data.auto_phrases.len()
             );
             for item in data.domains {
                 println!(

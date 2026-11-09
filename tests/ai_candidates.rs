@@ -42,6 +42,7 @@ fn ai_marks_existing_correction_without_duplicate_or_learning() {
     );
     assert!(r.pending_learning().is_empty());
     assert!(r.pending_promotions().is_empty());
+    assert!(r.pending_phrase_learning().is_empty());
 }
 
 #[test]

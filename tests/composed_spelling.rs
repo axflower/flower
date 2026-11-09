@@ -38,6 +38,7 @@ fn a_correct_word_survives_all_four_edit_types_in_the_other_word() {
                 assert!(s.pending_input().is_empty());
                 assert!(s.pending_learning().is_empty());
                 assert!(s.pending_promotions().is_empty());
+                assert!(s.pending_phrase_learning().is_empty());
                 committed = true;
                 break;
             }

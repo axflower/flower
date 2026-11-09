@@ -21,6 +21,7 @@ fn raw_conversion_restores_selected_prefix_and_never_learns() {
     assert!(!session.is_composing());
     assert!(session.pending_learning().is_empty());
     assert!(session.pending_promotions().is_empty());
+    assert!(session.pending_phrase_learning().is_empty());
     assert!(!session.commit_raw().handled);
 }
 
