@@ -47,6 +47,36 @@ fn real_model_spelling_and_correct_controls() {
             Some("现在在哪里上班"),
         ),
         (
+            "qingxuanzexuyaodexuanxiang",
+            "请选择需要的选项",
+            "qing'xuan'ze'xu'yao'de'xuan'xiang",
+            None,
+        ),
+        (
+            "womenxuanzezaizhelijianmian",
+            "我们选择在这里见面",
+            "wo'men'xuan'ze'zai'zhe'li'jian'mian",
+            None,
+        ),
+        (
+            "zhegexuanxiangyijingbaocun",
+            "这个选项已经保存",
+            "zhe'ge'xuan'xiang'yi'jing'bao'cun",
+            None,
+        ),
+        (
+            "tajintianzaizhelishangban",
+            "他今天在这里上班",
+            "ta'jin'tian'zai'zhe'li'shang'ban",
+            None,
+        ),
+        (
+            "tajintianzaizhelishangban",
+            "她今天在这里上班",
+            "ta'jin'tian'zai'zhe'li'shang'ban",
+            None,
+        ),
+        (
             "womenxuanzainalijianmian",
             "我们选在哪里见面",
             "wo'men'xuan'zai'na'li'jian'mian",

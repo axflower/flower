@@ -30,7 +30,7 @@ struct Path {
 }
 
 fn valid_raw(raw: &str) -> bool {
-    (8..=128).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_lowercase())
+    (4..=128).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 fn canonical_reading(reading: &str) -> bool {
@@ -141,10 +141,37 @@ impl SpellingIndex {
     }
 
     pub fn candidates(&self, raw: &str, limit: usize) -> Vec<SpellingCandidate> {
-        self.search(raw, limit, STATE_LIMIT).0
+        self.search_guided(raw, limit, STATE_LIMIT, None, false).0
     }
 
-    fn search(&self, raw: &str, limit: usize, budget: usize) -> (Vec<SpellingCandidate>, usize) {
+    pub fn candidates_with_source(
+        &self,
+        raw: &str,
+        limit: usize,
+        source: &str,
+        reading: &str,
+    ) -> Vec<SpellingCandidate> {
+        if !crate::ai::eligible_spelling_text(source)
+            || !(reading.len() <= 512
+                && reading
+                    .split('\'')
+                    .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase()))
+                && reading.split('\'').count() == source.chars().count())
+        {
+            return Vec::new();
+        }
+        self.search_guided(raw, limit, STATE_LIMIT, Some((source, reading)), true)
+            .0
+    }
+
+    fn search_guided(
+        &self,
+        raw: &str,
+        limit: usize,
+        budget: usize,
+        guide: Option<(&str, &str)>,
+        delete_first: bool,
+    ) -> (Vec<SpellingCandidate>, usize) {
         if !valid_raw(raw) || limit == 0 {
             return (Vec::new(), 0);
         }
@@ -158,6 +185,21 @@ impl SpellingIndex {
             characters: 0,
         });
         let mut states = 0;
+        let mut priority = Vec::new();
+        if delete_first && guide.is_some() {
+            for i in 0..n {
+                if states == budget {
+                    break;
+                }
+                let mut deleted = raw.as_bytes().to_vec();
+                deleted.remove(i);
+                for path in self.exact_paths(&deleted, &mut states, budget, guide, raw) {
+                    if complete_ok(&path, guide, raw) {
+                        retain_path(&mut priority, path);
+                    }
+                }
+            }
+        }
         for start in 0..n {
             if paths[start].iter().all(Vec::is_empty) {
                 continue;
@@ -212,7 +254,11 @@ impl SpellingIndex {
                     for prefix in prefixes {
                         for word in &words {
                             if let Some(path) = append_word(&prefix, word) {
-                                retain_path(&mut paths[end][spent + cost as usize], path);
+                                if prefix_ok(&path, guide)
+                                    && (end != n || complete_ok(&path, guide, raw))
+                                {
+                                    retain_path(&mut paths[end][spent + cost as usize], path);
+                                }
                             }
                         }
                     }
@@ -223,6 +269,9 @@ impl SpellingIndex {
             }
         }
         let mut complete = std::mem::take(&mut paths[n][1]);
+        for path in priority {
+            retain_path(&mut complete, path);
+        }
         // A word-local DP cannot see a swap straddling two dictionary edges.
         // Exact trie walks of the adjacent swaps cover these cases without
         // invoking the ordinary decoder or resetting the shared state budget.
@@ -235,15 +284,17 @@ impl SpellingIndex {
                 continue;
             }
             swapped.swap(offset, offset + 1);
-            for path in self.exact_paths(&swapped, &mut states, budget) {
-                retain_path(&mut complete, path);
+            for path in self.exact_paths(&swapped, &mut states, budget, guide, raw) {
+                if complete_ok(&path, guide, raw) {
+                    retain_path(&mut complete, path);
+                }
             }
             swapped.swap(offset, offset + 1);
         }
         let mut seen = BTreeSet::new();
         let result = complete
             .iter()
-            .filter(|p| p.characters >= 4 && single_spelling_edit(raw, &p.reading))
+            .filter(|p| p.characters >= 2 && single_spelling_edit(raw, &p.reading))
             .filter(|p| seen.insert(p.text.clone()))
             .take(limit.min(BEAM))
             .map(|p| SpellingCandidate {
@@ -255,7 +306,14 @@ impl SpellingIndex {
         (result, states)
     }
 
-    fn exact_paths(&self, raw: &[u8], states: &mut usize, budget: usize) -> Vec<Path> {
+    fn exact_paths(
+        &self,
+        raw: &[u8],
+        states: &mut usize,
+        budget: usize,
+        guide: Option<(&str, &str)>,
+        original_raw: &str,
+    ) -> Vec<Path> {
         let mut paths = vec![Vec::new(); raw.len() + 1];
         paths[0].push(Path {
             text: String::new(),
@@ -281,7 +339,11 @@ impl SpellingIndex {
                 for prefix in &prefixes {
                     for word in &self.nodes[node].words {
                         if let Some(path) = append_word(prefix, word) {
-                            retain_path(&mut paths[end + 1], path);
+                            if prefix_ok(&path, guide)
+                                && (end + 1 != raw.len() || complete_ok(&path, guide, original_raw))
+                            {
+                                retain_path(&mut paths[end + 1], path);
+                            }
                         }
                     }
                 }
@@ -291,16 +353,66 @@ impl SpellingIndex {
     }
 }
 
+fn prefix_ok(p: &Path, guide: Option<(&str, &str)>) -> bool {
+    let Some((source, reading)) = guide else {
+        return true;
+    };
+    for ((a, b), (x, y)) in p
+        .reading
+        .split('\'')
+        .zip(reading.split('\''))
+        .zip(p.text.chars().zip(source.chars()))
+    {
+        if a != b {
+            break;
+        }
+        if x != y {
+            return false;
+        }
+    }
+    true
+}
+fn complete_ok(p: &Path, guide: Option<(&str, &str)>, raw: &str) -> bool {
+    let Some((source, reading)) = guide else {
+        return true;
+    };
+    crate::ai::spelling_change_span(raw, source, reading, &p.text, &p.reading).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guided_delete_and_swap_share_budget() {
+        let index = SpellingIndex::new(
+            &Lexicon::from_tsv("ni'hao\t你好\t1000\nshi'jie\t世界\t1000\n").unwrap(),
+        );
+        for (raw, source, reading) in [
+            ("nihaoshijiee", "你好世界鄂", "ni'hao'shi'jie'e"),
+            ("nihasohijie", "你好嗖界", "ni'hao'sou'jie"),
+        ] {
+            let guide = Some((source, reading));
+            let (full, states) = index.search_guided(raw, 8, usize::MAX, guide, true);
+            assert!(states <= STATE_LIMIT);
+            assert!(full.iter().any(|c| c.text == "你好世界"));
+            for budget in 0..=states {
+                let (found, used) = index.search_guided(raw, 8, budget, guide, true);
+                assert!(used <= budget);
+                assert!(found.iter().all(|c| crate::ai::spelling_change_span(
+                    raw, source, reading, &c.text, &c.reading
+                )
+                .is_some()));
+            }
+        }
+    }
+
     #[test]
     fn budget_is_shared_and_exhaustion_keeps_only_complete_paths() {
         let index =
             SpellingIndex::new(&Lexicon::from_tsv("ni'hao'shi'jie\t你好世界\t100\n").unwrap());
         let mut retained_on_exhaustion = false;
         for budget in 0..=100 {
-            let (found, states) = index.search("nihaoshijiee", 8, budget);
+            let (found, states) = index.search_guided("nihaoshijiee", 8, budget, None, false);
             assert!(states <= budget);
             for candidate in &found {
                 assert_eq!(candidate.text, "你好世界");
@@ -315,17 +427,41 @@ mod tests {
         // the third walk, which must not return a
         // partial prefix as a complete path.
         let mut states = STATE_LIMIT - 23;
-        let first = index.exact_paths(b"nihaoshijie", &mut states, STATE_LIMIT);
+        let first = index.exact_paths(
+            b"nihaoshijie",
+            &mut states,
+            STATE_LIMIT,
+            None,
+            "nihaoshijie",
+        );
         assert_eq!(states, STATE_LIMIT - 12);
         assert_eq!(first[0].text, "你好世界");
-        let second = index.exact_paths(b"nihaoshijie", &mut states, STATE_LIMIT);
+        let second = index.exact_paths(
+            b"nihaoshijie",
+            &mut states,
+            STATE_LIMIT,
+            None,
+            "nihaoshijie",
+        );
         assert_eq!(states, STATE_LIMIT - 1);
         assert_eq!(second[0].text, "你好世界");
-        let third = index.exact_paths(b"nihaoshijie", &mut states, STATE_LIMIT);
+        let third = index.exact_paths(
+            b"nihaoshijie",
+            &mut states,
+            STATE_LIMIT,
+            None,
+            "nihaoshijie",
+        );
         assert!(third.is_empty());
         assert_eq!(states, STATE_LIMIT);
         assert!(index
-            .exact_paths(b"nihaoshijie", &mut states, STATE_LIMIT)
+            .exact_paths(
+                b"nihaoshijie",
+                &mut states,
+                STATE_LIMIT,
+                None,
+                "nihaoshijie"
+            )
             .is_empty());
         assert_eq!(states, STATE_LIMIT);
     }
@@ -336,14 +472,14 @@ mod tests {
             &Lexicon::from_tsv("ni'hao\t你好\t1000\nshi'jie\t世界\t1000\n").unwrap(),
         );
         let raw = "nihasohijie";
-        let (full, states) = index.search(raw, 8, STATE_LIMIT);
+        let (full, states) = index.search_guided(raw, 8, STATE_LIMIT, None, false);
         assert!(full.iter().any(|c| c.text == "你好世界"));
         assert!(states < STATE_LIMIT);
-        let (none, _) = index.search(raw, 8, 0);
+        let (none, _) = index.search_guided(raw, 8, 0, None, false);
         assert!(none.is_empty());
         let mut first_success = None;
         for budget in 1..=states {
-            let (found, used) = index.search(raw, 8, budget);
+            let (found, used) = index.search_guided(raw, 8, budget, None, false);
             assert!(used <= budget);
             assert!(found
                 .iter()
@@ -355,8 +491,14 @@ mod tests {
         }
         let first_success = first_success.unwrap();
         assert!(first_success > raw.len());
-        assert!(index.search(raw, 8, first_success - 1).0.is_empty());
-        assert!(!index.search(raw, 8, first_success).0.is_empty());
+        assert!(index
+            .search_guided(raw, 8, first_success - 1, None, false)
+            .0
+            .is_empty());
+        assert!(!index
+            .search_guided(raw, 8, first_success, None, false)
+            .0
+            .is_empty());
     }
 
     #[test]
@@ -371,7 +513,7 @@ mod tests {
         let index = SpellingIndex::new(&Lexicon::from_tsv(&tsv).unwrap());
         let raw = "a".repeat(64);
         // Even a caller-supplied larger test budget cannot raise the cap.
-        let (found, states) = index.search(&raw, 8, usize::MAX);
+        let (found, states) = index.search_guided(&raw, 8, usize::MAX, None, false);
         assert_eq!(states, STATE_LIMIT);
         assert!(!found.is_empty());
         for candidate in found {

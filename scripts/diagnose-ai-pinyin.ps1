@@ -126,8 +126,10 @@ function Invoke-FixedRequest($PipeName, $Request) {
 }
 
 $report = [ordered]@{
-    diagnostic = 'flower-fixed-pinyin-0.4.12'
-    diagnostic_revision = 2
+    diagnostic = 'flower-fixed-pinyin-0.4.15'
+    diagnostic_revision = 3
+    host_requests_captured = $false
+    fixed_fixture_metadata = $true
     utc = [DateTime]::UtcNow.ToString('o')
     powershell = $PSVersionTable.PSVersion.ToString()
     os = [Environment]::OSVersion.VersionString
@@ -150,27 +152,28 @@ try {
 } finally { $registry.Dispose() }
 $report.registered_dll = $registered
 # Enumerate binary modules only; never query window titles or document buffers.
-foreach ($process in @(Get-Process -Name Notepad -ErrorAction SilentlyContinue)) {
+foreach ($process in @(Get-Process -Name Notepad,Weixin,WeChat -ErrorAction SilentlyContinue)) {
     try {
         foreach ($module in $process.Modules) {
             if ($module.ModuleName -ieq 'flower.dll') {
                 $report.loaded_modules += [ordered]@{
                     pid = $process.Id
+                    host = $process.ProcessName
                     path = $module.FileName
                     disk_sha256 = Get-Digest $module.FileName
                     note = 'Hash of file on disk; does not prove bytes of an already loaded image.'
                 }
             }
         }
-    } catch { $report.loaded_modules += @{pid=$process.Id; error='Module query unavailable'} }
+    } catch { $report.loaded_modules += @{pid=$process.Id; host=$process.ProcessName; error='Module query unavailable'} }
 }
 $Helper = Resolve-DiagnosticHelper $Helper $registered
 $canonicalHelper = [FlowerPinyinDiagnostic]::Canonical($Helper)
 $report.helper = $Helper
 $report.helper_sha256 = Get-Digest $Helper
-$expectedHelper = '364231d3ac3f1a50b607b4d006b37dcb8f6027d72ffaac0476530b63760c1cc8'
+$expectedHelper = 'ad011979bbfbb219436f0ba751bc657c1fbe6abe31bdf52ea35631f82cae0d41'
 if ($report.helper_sha256 -ne $expectedHelper) {
-    throw 'Selected helper does not match the delivered 0.4.12 binary; no executable was started.'
+    throw 'Selected helper does not match the delivered 0.4.15 binary; no executable was started.'
 }
 $root = Split-Path -Parent $Helper
 $report.dll_sha256 = Get-Digest (Join-Path $root 'flower.dll')
@@ -178,7 +181,7 @@ $report.model_sha256 = Get-Digest (Join-Path $root 'ai/model_int8.onnx')
 $report.runtime_sha256 = Get-Digest (Join-Path $root 'ai/onnxruntime.dll')
 $material = [byte[]](
     [Text.Encoding]::Unicode.GetBytes($canonicalHelper + [char]0) +
-    [Text.Encoding]::UTF8.GetBytes('0.4.12'))
+    [Text.Encoding]::UTF8.GetBytes('0.4.15'))
 $sha = [Security.Cryptography.SHA256]::Create()
 try { $digest = ([BitConverter]::ToString($sha.ComputeHash($material))).Replace('-', '').ToLowerInvariant() }
 finally { $sha.Dispose() }
@@ -203,8 +206,8 @@ try {
     $target = -join ([char[]]@(0x73b0,0x5728,0x5728,0x54ea,0x91cc,0x4e0a,0x73ed))
     $cases = @(
         @('replacement','xuanzaizainalishangban',@(0x9009,0x5728,0x5728,0x54ea,0x91cc,0x4e0a,0x73ed),"xuan'zai'zai'na'li'shang'ban",$target),
-        @('swap','xainzaizainalishangban',@(0x559c,0x7231,0x55ef,0x5728,0x5728,0x54ea,0x91cc,0x4e0a,0x73ed),"xi'ai'n'zai'zai'na'li'shang'ban",$target),
-        @('extra','xiaanzaizainalishangban',@(0x4e0b,0x6309,0x5728,0x5728,0x54ea,0x91cc,0x4e0a,0x73ed),"xia'an'zai'zai'na'li'shang'ban",$target),
+        @('swap','xainzaizainalishangban',@(0x559c,0x7231,0x5185,0x5728,0x5728,0x54ea,0x91cc,0x4e0a,0x73ed),"xi'ai'nei'zai'zai'na'li'shang'ban",$target),
+        @('extra','xiaanzaizainalishangban',@(0x4e0b,0x5cb8,0x5728,0x5728,0x54ea,0x91cc,0x4e0a,0x73ed),"xia'an'zai'zai'na'li'shang'ban",$target),
         @('omission','xinzaizainalishangban',@(0x65b0,0x5728,0x5728,0x54ea,0x91cc,0x4e0a,0x73ed),"xin'zai'zai'na'li'shang'ban",$target),
         @('correct','xianzaizainalishangban',@(0x73b0,0x5728,0x5728,0x54ea,0x91cc,0x4e0a,0x73ed),"xian'zai'zai'na'li'shang'ban",$null),
         @('correct-xuan','womenxuanzainalijianmian',@(0x6211,0x4eec,0x9009,0x5728,0x54ea,0x91cc,0x89c1,0x9762),"wo'men'xuan'zai'na'li'jian'mian",$null),

@@ -830,7 +830,7 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         instance,
         windows::core::w!("STATIC"),
         windows::core::w!(
-            "离线检查，首次加载最多5秒。\n仅处理未提交候选，不读取正文。\n自定义私密框未声明时可能无法识别。\n可关闭兼容恢复严格限制。\n保存后切换生效，AI建议须手动选择。"
+            "离线检查，首次加载最多5秒。\n普通排序学习与AI共用兼容，不读取正文。\n自定义私密框未声明时可能无法识别。\n可关闭兼容恢复严格限制。\n保存后切换生效，AI建议须手动选择。"
         ),
         WS_CHILD.0 | WS_VISIBLE.0,
         AI_CORRECTION_HINT_ID,

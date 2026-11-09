@@ -1,5 +1,8 @@
 # 单字首字母候选
 
+0.4.18起独立辅音字母的exact/首字母候选统一按有效词频排序，
+见 `composed-spelling-and-learning-compatibility.md`；覆盖下文m/n一律exact优先的旧约定。
+
 ## 范围
 
 承接0.4.14通用混拼，在输入区仅有一个小写拉丁字母时，显示以该字母开头的

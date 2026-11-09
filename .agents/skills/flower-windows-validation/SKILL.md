@@ -5,6 +5,8 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 # Flower Windows 验证
 
+0.4.18普通学习的未声明范围兼容以 `design/composed-spelling-and-learning-compatibility.md` 为准，覆盖下方历史“只扩AI、不扩普通学习”。用户保留每次相邻前移一步；兼容复用既有 `ai_undeclared_scope_compatibility`（默认true、显式false保留），独立于AI总开关，仅S04/S08通过原窗口/焦点/身份/style/密码掩码检查，不扩异常接口或明确敏感。须用真实自定义HWND和生产TSF提交、下一同raw、跨context、worker drain/隔离Store重载验证，仍不等于实际微信现场。其他宿主正常而某宿主不学时先查门禁，勿把保存或步进算法当作已证根因，也不通过按键磁盘扫描刷新解决。
+
 当前0.4.15未声明范围默认兼容以 `design/default-ai-scope-compatibility.md` 为准；用户已明确选择默认开启AI及兼容S04/S08，可关闭兼容恢复严格路径。只允许既定窗口/focus身份及style检查通过的缺声明场景，不扩普通学习，不将Sensitive/Unsupported/损坏接口错误转为安全。下文历史“未知一律拒绝”的AI表述不覆盖此新合同；自定义敏感框未声明且无标准密码标记可能无法识别，须随设置及README告知。发送与发布两次只读检查、原生password mask和自定义控件不发消息的边界仍要分别证明。
 
 先读 `docs/distribution.md`、`docs/windows-validation.md` 和当前 `design/mixed-input-and-installation.md`，分页与调序见 `design/adaptive-candidates.md`，旧版补充见 `design/input-and-installation.md`。历史设计文件若已不存在，不按旧摘要恢复；以当前源码和实际宿主事实为准，不将历史通过记录当成本次版本通过。
@@ -73,6 +75,12 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 原拼音转换恢复 confirmed.raw+remaining raw，不学习；同步编辑成功且token/epoch/context/generation有效才发布英文模式。无效client、写前stale校验、失焦及纯试探需单独证明，不承诺TSF部分写后失败能回滚宿主文档。
 - 安装完成默认启动现在只普通用户 enable 后退出，不再打开设置，取代下方0.4.3启动GUI约定。无参设置入口保持；包核验禁止运行有效启动命令。
 
+## 跨CPU纠错证据
+
+- 先核对实际报告的helper/model/runtime摘要和请求metadata；同字节模型在不同CPU上可能给出不同概率，执行机通过不覆盖目标机。记录候选、source_p、masked概率、margin、gain和调用/耗时后再定修复，不凭None或短耗时猜哪个门禁拒绝，也不把CPU量化饱和当已证事实。
+- 对照程序须在同一目标机器执行旧规则和修复候选，正确句与错句同时断言；错误的假设即使在开发机控制组通过也应按目标机日志否决。缺EXE/摘要检查失败属于模型未启动，不当作模型结果；先确认完整解压，安全隔离时保持防护，不改扩展名/关闭防护绕过。
+- 0.4.16拼音联合证据以 `design/cpu-robust-spelling-evidence.md` 为准：保留原字不确定度与原CSC，目标最弱概率在[0.90,0.95)时需更强gain≥2；不能把它误写为取消source门禁或把全部阈值降为0.90。数值单测覆盖目标机实际概率不等于新包已在目标CPU运行。
+
 ## 可选离线AI与分发验证
 
 - 契约见 `design/offline-ai-correction.md`。0.4.7起默认开启（显式关闭配置保留）、停顿后追加 `✓ AI` 建议、显式选择才提交；原候选立即可用，AI不学习、不改已提交正文、不读取周边宿主文本。发出与发布前分别在真实只读cookie内用 `GetAppProperty` 检查安全scope，未知/敏感拒绝，不能用模型probe替代这些门禁。0.4.10的AI明确文本集合为0/50/52/53/54/55/57/58/68，学习仍仅0/57/58；拒绝原因固定S01–S11。Chromium形态须用真实ITextStoreACP属性host补验，owner测试不能代替ACP桥接；官方示例使用GetAppProperty，不以GetProperty或VT_EMPTY兜底。GetInputScopes即使失败/超限也释放已返回的COM分配指针，失败/超限不构造slice。
@@ -115,6 +123,9 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 原生AI兼容边界以design/long-candidates-and-ai-compatibility.md为准，需遵守用户已明确授权的隐私取舍；不能把同进程类名或非密码style单独当安全声明。当前实现限定四类声明缺失/失败并组合焦点/context view、PID/TID、原生类、style和类过程密码字符检查；明确敏感仍拒，本地学习不回退。SendMessageTimeout在同消息队列会忽略超时，跨线程超时夹具不能证明同线程生产有界；GetClassLongPtrW/CallWindowProcW只读类过程检查须验证绕过应用子类拦截后仍读取真实掩码，不宣称可抢占任意宿主/系统代码。
 
 ## 拼音修复与通用选词记忆
+
+- 短词和额外音节的词典建议以 `design/broad-pinyin-correction.md` 为准，显示“✓ 拼写”，不可将词库召回冒充真实模型纠正。测试先验证真实 raw 消费：同字部分候选留下尾部拼音不算完整命中；同字普通完整候选与词典建议的去重规则不同于已通过模型的 AI 升级。显式选择须完整提交、确认前缀一次、无学习及个人前移，并补退格恢复再选择的交叉路径。
+- 广测试集在执行前固定金标，逐项保存进度并单列输入长度拒绝、无完整来源、词库未召回、模型拒绝/词表不支持及非金标建议；正确控制的原解码差异不能混算为模型误改。控制项出现额外可选拼写提议也须报告，不能只报无 AI 响应。原生 fixture 若关闭 learning，只证明提交及排序；不学习事件由引擎断言承担，不能外推持久化无写入。
 
 - 拼音误输验证须分开记录原始raw、真实builtin首候选/规范reading、生成器召回、模型放行、协议proof和最终提交；生成金标在候选中不等于AI已展示。用替换、交换、漏字、多字以及正确自然句对照，保留未达门槛的边界，不为演示降低原CSC阈值。新拼音路径可用独立组合证据，但发布端仍须校验编辑距离、局部音节/字数和未变前后缀，不能借修拼音顺便改其他同音字。
 - 原始拼音与reading的IPC扩展保持有界、身份及期限，旧空metadata路径要有兼容测试；真实包内AiClient/自有broker应包含新拼音正例、正确对照和旧CSC，退出只停止自己持有的进程。真实WM_TIMER只读session+fakeResponse证明接线，不能冒充真实模型或用户宿主端到端。隔离原生组合应串起真实按键、实际请求、生产管道/模型及最终提交，并区分快打、前缀响应完成后继续和前缀仍在途继续；旧None结果不得覆盖新完整句。即使该组合通过，用户已确认版本且重开宿主后仍失败，也不能推定旧DLL或宣称修复。可用固定公开句诊断脚本在实机记录后台响应/阶段/耗时、模块路径与磁盘摘要；不读取正文/词典，不把固定metadata等同TSF实际metadata，磁盘hash不等于已加载映像身份，复用后台不终止它，自有进程清理须核实退出。

@@ -1,5 +1,8 @@
 # Flower 0.4.2：完整安装、单行分页与相邻调序
 
+0.4.18普通学习的S04/S08自定义宿主兼容以
+`composed-spelling-and-learning-compatibility.md` 为准；每次相邻前移一步保持。
+
 0.4.12的普通文本类型与原生兼容学习门禁以 `pinyin-repair-and-ranking.md` 为准；
 相邻交换、成功提交与持久化身份规则继续有效。
 

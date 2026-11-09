@@ -174,6 +174,14 @@ fn decode_lanes(
     }
     let mut output = lexicon.exact_choices(raw);
     if raw.len() == 1 {
+        if !b"aeiouv".contains(&raw.as_bytes()[0]) {
+            let mut seen = HashSet::new();
+            return lexicon
+                .single_initial_choices(raw)
+                .into_iter()
+                .filter(|choice| seen.insert(choice.candidate.text.clone()))
+                .collect();
+        }
         let mut seen: HashSet<_> = output
             .iter()
             .map(|choice| choice.candidate.text.clone())

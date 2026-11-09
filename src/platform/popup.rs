@@ -1635,11 +1635,8 @@ mod windows_impl {
                 rect.right - padding,
                 rect.bottom,
             ));
-            let (text, _) = fitted_candidate_text(
-                hdc,
-                &status.display_label(),
-                text_rect.right - text_rect.left,
-            );
+            let (text, _) =
+                fitted_candidate_text(hdc, status.label(), text_rect.right - text_rect.left);
             set_text_color(hdc, COLORREF(palette.text));
             draw_text(
                 hdc,

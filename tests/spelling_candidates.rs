@@ -3,6 +3,8 @@ use std::time::Instant;
 
 #[test]
 fn exact_single_edit_contract() {
+    assert!(single_spelling_edit("xuexo", "xue'xi"));
+    assert!(!single_spelling_edit("xue", "xue'xi"));
     for raw in ["nihaoshijia", "nihaoshijiee", "nihaoshjie", "nihaoshijei"] {
         assert!(single_spelling_edit(raw, "ni'hao'shi'jie"), "{raw}");
     }
@@ -16,6 +18,99 @@ fn exact_single_edit_contract() {
     ] {
         assert!(!single_spelling_edit(raw, "ni'hao'shi'jie"), "{raw}");
     }
+}
+
+#[test]
+fn guided_builtin_user_examples_and_old_positives() {
+    let index = SpellingIndex::new(&Lexicon::builtin().unwrap());
+    for (raw, source, reading, gold, rank) in [
+        (
+            "xueerunishuixingzhou",
+            "学鄂如逆水行舟",
+            "xue'e'ru'ni'shui'xing'zhou",
+            "学如逆水行舟",
+            7,
+        ),
+        ("xuexo", "学校哦", "xue'xiao'o", "学习", 1),
+        (
+            "xuanzaizainalishangban",
+            "选在在哪里上班",
+            "xuan'zai'zai'na'li'shang'ban",
+            "现在在哪里上班",
+            1,
+        ),
+        (
+            "xainzaizainalishangban",
+            "喜爱内在在哪里上班",
+            "xi'ai'nei'zai'zai'na'li'shang'ban",
+            "现在在哪里上班",
+            1,
+        ),
+        (
+            "xianzaizainalishangbn",
+            "现在在哪里上不能",
+            "xian'zai'zai'na'li'shang'bu'neng",
+            "现在在哪里上班",
+            1,
+        ),
+        (
+            "xianzaizainalishangbann",
+            "现在在哪里上班嗯",
+            "xian'zai'zai'na'li'shang'ban'n",
+            "现在在哪里上班",
+            1,
+        ),
+    ] {
+        let found = index.candidates_with_source(raw, 8, source, reading);
+        assert_eq!(
+            found.iter().position(|c| c.text == gold).map(|i| i + 1),
+            Some(rank),
+            "{raw}: {found:?}"
+        );
+        assert!(found.len() <= 8);
+        assert_eq!(found, index.candidates_with_source(raw, 8, source, reading));
+        for candidate in found {
+            assert!(flower::ai::spelling_change_span(
+                raw,
+                source,
+                reading,
+                &candidate.text,
+                &candidate.reading
+            )
+            .is_some());
+        }
+    }
+    assert!(index
+        .candidates("xuexo", 8)
+        .iter()
+        .any(|c| c.text == "学习"));
+}
+
+#[test]
+fn invalid_guides_and_unchanged_homophones_are_rejected() {
+    let index = SpellingIndex::new(
+        &Lexicon::from_tsv("ni'hao\t你好\t1000\nshi'jie\t世界\t1000\n").unwrap(),
+    );
+    for (source, reading) in [
+        ("a好", "ni'hao"),
+        ("你", "ni"),
+        ("你好", "ni"),
+        ("你好", "Ni'hao"),
+        ("你好", "ni''hao"),
+        ("你好", "n'hao"),
+    ] {
+        assert!(index
+            .candidates_with_source("nihaoshijia", 8, source, reading)
+            .is_empty());
+    }
+    // The unchanged ni syllable must not silently replace 泥 by 你.
+    assert!(index
+        .candidates_with_source("nihaoshijia", 8, "泥好世家", "ni'hao'shi'jia")
+        .is_empty());
+    let found = index.candidates_with_source("nihasohijie", 8, "你好是界", "ni'ha'so'hi'jie");
+    assert!(found.is_empty()); // Invalid guide: five syllables for four characters.
+    let found = index.candidates_with_source("nihasohijie", 8, "你好嗖界", "ni'hao'sou'jie");
+    assert!(found.iter().any(|c| c.text == "你好世界"), "{found:?}");
 }
 
 #[test]

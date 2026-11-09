@@ -340,8 +340,16 @@ impl PinyinSession {
                 candidate_count,
             })?;
 
-        if choice.candidate.is_ai() {
-            let corrected = choice.candidate.text;
+        if choice.candidate.is_ai() || choice.candidate.is_spelling() {
+            let corrected = if choice.candidate.is_spelling() {
+                self.confirmed
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+                    + &choice.candidate.text
+            } else {
+                choice.candidate.text
+            };
             self.clear_composition();
             let mut update = self.snapshot(true);
             update.commit = Some(corrected);
@@ -353,7 +361,11 @@ impl PinyinSession {
                 candidates: self
                     .choices
                     .iter()
-                    .filter(|c| c.consumed == self.raw.len() && !c.candidate.is_ai())
+                    .filter(|c| {
+                        c.consumed == self.raw.len()
+                            && !c.candidate.is_ai()
+                            && !c.candidate.is_spelling()
+                    })
                     .map(Self::ranking_candidate)
                     .collect(),
             },
@@ -524,10 +536,13 @@ impl PinyinSession {
         {
             return None;
         }
-        let choice = self.choices.iter().find(|c| c.consumed == self.raw.len())?;
+        let choice = self
+            .choices
+            .iter()
+            .find(|c| c.consumed == self.raw.len() && !c.candidate.is_spelling())?;
         let prefix: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
         let source = prefix + &choice.candidate.text;
-        if !crate::ai::eligible_text(&source) {
+        if !crate::ai::eligible_spelling_text(&source) {
             return None;
         }
         let raw: String = self.confirmed.iter().map(|s| s.raw.as_str()).collect();
@@ -539,11 +554,12 @@ impl PinyinSession {
             .filter(|reading| !reading.is_empty())
             .collect::<Vec<_>>()
             .join("'");
-        Some(crate::ai::AiInput {
+        let input = crate::ai::AiInput {
             reading,
             raw: raw + &self.raw,
             source,
-        })
+        };
+        (4..=128).contains(&input.raw.len()).then_some(input)
     }
 
     pub fn apply_ai_candidate(
@@ -642,6 +658,35 @@ impl PinyinSession {
             self.choices = complete;
         }
         self.choices.extend(partial);
+        let mut proposals = self.lexicon.short_spelling_choices(&self.raw);
+        if let Some(source) = self.choices.iter().find(|c| c.consumed == self.raw.len()) {
+            proposals.extend(
+                self.lexicon
+                    .extra_syllable_choices(&self.raw, &source.candidate),
+            );
+        }
+        proposals.extend(self.lexicon.composed_spelling_choices(&self.raw));
+        let mut spelling = Vec::new();
+        for choice in proposals {
+            if self
+                .choices
+                .iter()
+                .any(|c| c.consumed == self.raw.len() && c.candidate.text == choice.candidate.text)
+                || spelling
+                    .iter()
+                    .any(|c: &super::decoder::Choice| c.candidate.text == choice.candidate.text)
+            {
+                continue;
+            }
+            self.choices
+                .retain(|c| c.candidate.text != choice.candidate.text);
+            spelling.push(choice);
+            if spelling.len() == 4 {
+                break;
+            }
+        }
+        let insertion = usize::from(!self.choices.is_empty());
+        self.choices.splice(insertion..insertion, spelling);
         self.candidates = self
             .choices
             .iter()

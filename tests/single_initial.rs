@@ -49,6 +49,41 @@ fn standalone_initials_commit_one_raw_letter_with_canonical_learning() {
 }
 
 #[test]
+fn consonants_rank_common_characters_by_frequency_without_losing_exact_readings() {
+    let mut builtin = PinyinSession::new().unwrap();
+    type_text(&mut builtin, "n");
+    assert!(builtin
+        .candidates_on_current_page()
+        .iter()
+        .any(|c| c.text == "你"));
+    assert_ne!(builtin.candidates_on_current_page()[0].text, "嗯");
+    assert_eq!(select(&mut builtin, "嗯").commit.as_deref(), Some("嗯"));
+    let mut session = PinyinSession::from_lexicon_tsv(
+        "n\t嗯\t10\nni\t你\t100\nna\t那\t80\nm\t呣\t1\nma\t吗\t200",
+        9,
+    )
+    .unwrap();
+    type_text(&mut session, "n");
+    let candidates = session.candidates_on_current_page();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>(),
+        ["你", "那", "嗯"]
+    );
+    assert_eq!(candidates[0].comment, "ni");
+    assert_eq!(select(&mut session, "你").commit.as_deref(), Some("你"));
+    assert_eq!(session.pending_learning()[0].pinyin, "ni");
+    type_text(&mut session, "m");
+    assert_eq!(session.candidates_on_current_page()[0].text, "吗");
+    assert!(session
+        .candidates_on_current_page()
+        .iter()
+        .any(|c| c.text == "呣" && c.comment == "m"));
+}
+
+#[test]
 fn exact_syllables_stay_first_and_polyphonic_characters_are_not_duplicated() {
     let mut session = PinyinSession::from_lexicon_tsv(
         "a\t啊\t1\nan\t安\t500\na\t阿\t2\nan\t阿\t700\nai\t爱\t900",

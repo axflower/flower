@@ -530,6 +530,299 @@ impl Lexicon {
             .collect()
     }
 
+    /// Bounded exact-key probes for standalone short-word spelling suggestions.
+    pub(crate) fn extra_syllable_choices(
+        &self,
+        raw: &str,
+        source: &Candidate,
+    ) -> Vec<super::decoder::Choice> {
+        if !(4..=128).contains(&raw.len())
+            || !raw.bytes().all(|b| b.is_ascii_lowercase())
+            || self.entries.contains_key(raw)
+            || source.is_ai()
+            || source.is_spelling()
+            || !crate::ai::eligible_spelling_text(&source.text)
+        {
+            return Vec::new();
+        }
+        let syllables: Vec<_> = source.comment.split('\'').collect();
+        let chars: Vec<_> = source.text.chars().collect();
+        if syllables.len() != chars.len() || syllables.concat() != raw {
+            return Vec::new();
+        }
+        let mut queries = 0;
+        let mut choices = Vec::new();
+        for offset in 0..syllables.len() {
+            if !["a", "e", "o"].contains(&syllables[offset]) {
+                continue;
+            }
+            let text: String = chars
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != offset)
+                .map(|(_, c)| *c)
+                .collect();
+            let reading = syllables
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != offset)
+                .map(|(_, s)| *s)
+                .collect::<Vec<_>>()
+                .join("'");
+            if crate::ai::spelling_change_span(raw, &source.text, &source.comment, &text, &reading)
+                .is_none()
+                || !self.exact_text_coverage(&text, &reading, &mut queries)
+            {
+                continue;
+            }
+            let mut choice = super::decoder::Choice::word(
+                Candidate::new(text, format!("{}{}", Candidate::SPELLING_PREFIX, reading)),
+                raw.len(),
+                1,
+            );
+            choice.events.clear();
+            choices.push(choice);
+            if choices.len() == 4 {
+                break;
+            }
+        }
+        choices
+    }
+
+    fn exact_text_coverage(&self, text: &str, reading: &str, queries: &mut usize) -> bool {
+        let syllables: Vec<_> = reading.split('\'').collect();
+        let chars: Vec<_> = text.chars().collect();
+        let mut reached = vec![false; chars.len() + 1];
+        reached[0] = true;
+        for start in 0..chars.len() {
+            if !reached[start] {
+                continue;
+            }
+            let mut key = String::new();
+            let mut word = String::new();
+            for end in start..chars.len() {
+                if *queries >= 1024 {
+                    return false;
+                }
+                *queries += 1;
+                key.push_str(syllables[end]);
+                word.push(chars[end]);
+                if self.entries.get(&key).is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.text == word && entry.reading == syllables[start..=end].join("'")
+                    })
+                }) {
+                    reached[end + 1] = true;
+                }
+            }
+        }
+        reached[chars.len()]
+    }
+
+    /// Bounded exact-key probes for standalone short-word spelling suggestions.
+    pub(crate) fn short_spelling_choices(&self, raw: &str) -> Vec<super::decoder::Choice> {
+        if !(4..=24).contains(&raw.len())
+            || !raw.bytes().all(|b| b.is_ascii_lowercase())
+            || self.entries.contains_key(raw)
+        {
+            return Vec::new();
+        }
+        self.edited_spelling_entries(raw, &mut 0, 1321)
+            .into_iter()
+            .map(|entry| {
+                let mut choice = entry.choice(raw.len());
+                choice.candidate.comment =
+                    format!("{}{}", Candidate::SPELLING_PREFIX, entry.reading);
+                choice.events.clear();
+                choice
+            })
+            .collect()
+    }
+
+    fn edited_spelling_entries(
+        &self,
+        raw: &str,
+        queries: &mut usize,
+        limit: usize,
+    ) -> Vec<&LexiconEntry> {
+        if !(4..=24).contains(&raw.len())
+            || !raw.bytes().all(|b| b.is_ascii_lowercase())
+            || *queries >= limit
+        {
+            return Vec::new();
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for i in 0..raw.len() {
+            let mut key = raw.as_bytes().to_vec();
+            key.remove(i);
+            keys.insert(key);
+            for byte in b'a'..=b'z' {
+                if byte != raw.as_bytes()[i] {
+                    let mut key = raw.as_bytes().to_vec();
+                    key[i] = byte;
+                    keys.insert(key);
+                }
+            }
+        }
+        for i in 0..=raw.len() {
+            for byte in b'a'..=b'z' {
+                let mut key = raw.as_bytes().to_vec();
+                key.insert(i, byte);
+                keys.insert(key);
+            }
+        }
+        for i in 0..raw.len() - 1 {
+            let mut key = raw.as_bytes().to_vec();
+            key.swap(i, i + 1);
+            if key != raw.as_bytes() {
+                keys.insert(key);
+            }
+        }
+        let mut words = Vec::new();
+        for key in &keys {
+            if *queries >= limit {
+                break;
+            }
+            *queries += 1;
+            let key = std::str::from_utf8(key).expect("lowercase ASCII spelling");
+            if let Some(entries) = self.entries.get(key) {
+                words.extend(entries.iter().filter(|entry| {
+                    (2..=4).contains(&entry.text.chars().count())
+                        && entry
+                            .text
+                            .chars()
+                            .all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+                        && entry.reading.split('\'').count() == entry.text.chars().count()
+                        && super::single_spelling_edit(raw, &entry.reading)
+                }));
+            }
+        }
+        words.sort_by(|a, b| rank_entries(a, b));
+        let mut seen = std::collections::HashSet::new();
+        words
+            .into_iter()
+            .filter(|entry| seen.insert(entry.text.as_str()))
+            .take(4)
+            .collect()
+    }
+
+    /// One edited dictionary word joined to one exact dictionary word.
+    pub(crate) fn composed_spelling_choices(&self, raw: &str) -> Vec<super::decoder::Choice> {
+        const LIMIT: usize = 4096;
+        if !(4..=48).contains(&raw.len()) || !raw.bytes().all(|b| b.is_ascii_lowercase()) {
+            return Vec::new();
+        }
+        let mut queries = 1;
+        if self.entries.contains_key(raw) {
+            return Vec::new();
+        }
+        let eligible = |entry: &&LexiconEntry| {
+            (1..=4).contains(&entry.text.chars().count())
+                && entry
+                    .text
+                    .chars()
+                    .all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+                && entry.reading.split('\'').count() == entry.text.chars().count()
+                && entry
+                    .reading
+                    .split('\'')
+                    .all(|s| s.bytes().any(|b| b"aeiouv".contains(&b)))
+        };
+        // Validate an unchanged two-word parse independently of repair lengths.
+        for split in 1..raw.len() {
+            queries += 1;
+            if self
+                .entries
+                .get(&raw[..split])
+                .is_some_and(|words| words.iter().any(|word| eligible(&word)))
+            {
+                queries += 1;
+                if self
+                    .entries
+                    .get(&raw[split..])
+                    .is_some_and(|words| words.iter().any(|word| eligible(&word)))
+                {
+                    return Vec::new();
+                }
+            }
+        }
+        let mut splits = Vec::new();
+        for split in 1..raw.len() {
+            for exact_first in [true, false] {
+                let (exact, edited) = if exact_first {
+                    (&raw[..split], &raw[split..])
+                } else {
+                    (&raw[split..], &raw[..split])
+                };
+                if !(4..=24).contains(&edited.len()) {
+                    continue;
+                }
+                queries += 1;
+                if let Some(entries) = self.entries.get(exact) {
+                    let entries: Vec<_> = entries.iter().filter(eligible).take(4).collect();
+                    if !entries.is_empty() {
+                        splits.push((exact.len(), split, exact_first, entries));
+                    }
+                }
+            }
+        }
+        splits
+            .sort_by_key(|(length, split, first, _)| (std::cmp::Reverse(*length), *split, *first));
+        let mut candidates = Vec::new();
+        for (_, split, exact_first, entries) in splits {
+            if queries >= LIMIT {
+                break;
+            }
+            let edited = if exact_first {
+                &raw[split..]
+            } else {
+                &raw[..split]
+            };
+            let repairs = self.edited_spelling_entries(edited, &mut queries, LIMIT);
+            for exact in entries {
+                for repair in &repairs {
+                    let (left, right) = if exact_first {
+                        (exact, *repair)
+                    } else {
+                        (*repair, exact)
+                    };
+                    let text = format!("{}{}", left.text, right.text);
+                    let reading = format!("{}'{}", left.reading, right.reading);
+                    if !super::single_spelling_edit(raw, &reading) {
+                        continue;
+                    }
+                    let score = |entry: &LexiconEntry| {
+                        super::decoder::lexical_score(
+                            if entry.everyday {
+                                entry.weight.max(EVERYDAY_RANKING_FLOOR)
+                            } else {
+                                entry.weight
+                            },
+                            entry.text.chars().count(),
+                        )
+                    };
+                    candidates.push((score(left) + score(right), text, reading));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let mut seen = std::collections::HashSet::new();
+        candidates
+            .into_iter()
+            .filter(|(_, text, _)| seen.insert(text.clone()))
+            .take(4)
+            .map(|(_, text, reading)| {
+                let mut choice = super::decoder::Choice::word(
+                    Candidate::new(text, format!("{}{}", Candidate::SPELLING_PREFIX, reading)),
+                    raw.len(),
+                    1,
+                );
+                choice.events.clear();
+                choice
+            })
+            .collect()
+    }
+
     /// Make one immutable activation snapshot with explicitly supplied local words.
     pub fn with_overlay(&self, tsv: &str) -> Result<Self, EngineError> {
         if tsv.trim().is_empty() {
@@ -638,6 +931,24 @@ impl Lexicon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spelling_key_budget_is_shared_and_never_reset_between_segments() {
+        let lexicon = Lexicon::from_tsv("jin'tian\t今天\t100\nzao'shang\t早上\t100").unwrap();
+        let mut queries = 31;
+        lexicon.edited_spelling_entries("jintain", &mut queries, 32);
+        assert_eq!(queries, 32);
+        assert!(lexicon
+            .edited_spelling_entries("zaosahng", &mut queries, 32)
+            .is_empty());
+        assert_eq!(queries, 32);
+        assert!(lexicon
+            .composed_spelling_choices(&"q".repeat(49))
+            .is_empty());
+        assert!(lexicon
+            .composed_spelling_choices("jin'tainzaoshang")
+            .is_empty());
+    }
 
     #[test]
     fn supplemental_metadata_penalizes_vowelless_syllables_without_changing_legacy() {

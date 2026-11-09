@@ -1490,6 +1490,7 @@ mod windows_exports {
         );
     }
 
+    #[cfg(test)]
     fn scope_allows_learning(context: &ITfContext, cookie: u32) -> bool {
         check_scope(context, cookie, ScopePolicy::Learning).is_ok()
     }
@@ -1525,7 +1526,24 @@ mod windows_exports {
         cookie: u32,
         allow_undeclared: bool,
     ) -> std::result::Result<(), ScopeBlockReason> {
-        let result = check_scope(context, cookie, ScopePolicy::Ai);
+        check_undeclared_scope(context, cookie, ScopePolicy::Ai, allow_undeclared)
+    }
+
+    fn check_learning_scope(
+        context: &ITfContext,
+        cookie: u32,
+        allow_undeclared: bool,
+    ) -> std::result::Result<(), ScopeBlockReason> {
+        check_undeclared_scope(context, cookie, ScopePolicy::Learning, allow_undeclared)
+    }
+
+    fn check_undeclared_scope(
+        context: &ITfContext,
+        cookie: u32,
+        policy: ScopePolicy,
+        allow_undeclared: bool,
+    ) -> std::result::Result<(), ScopeBlockReason> {
+        let result = check_scope(context, cookie, policy);
         if allow_undeclared
             && matches!(
                 result,
@@ -1897,8 +1915,22 @@ mod windows_exports {
             {
                 return Err(E_UNEXPECTED.into());
             }
-            let learning_allowed =
-                this.update.commit.is_some() && scope_allows_learning(&this.context, edit_cookie);
+            // Copy the current activation setting, releasing the borrow before
+            // application COM calls. Missing/stale snapshots grant no compatibility.
+            let allow_undeclared = this
+                .key_preflight
+                .as_ref()
+                .or_else(|| completion.as_ref().map(|completion| &completion.target))
+                .is_some_and(|target| {
+                    target.activation.try_borrow().ok().is_some_and(|state| {
+                        state.as_ref().is_some_and(|active| {
+                            active.token == target.token
+                                && active.settings.ai_undeclared_scope_compatibility
+                        })
+                    })
+                });
+            let learning_allowed = this.update.commit.is_some()
+                && check_learning_scope(&this.context, edit_cookie, allow_undeclared).is_ok();
             let mut host = TfCompositionHost::new(this.context.clone(), composition, edit_cookie);
             let mut controller = controller;
             let result = controller
@@ -3259,7 +3291,7 @@ mod windows_exports {
                 update,
                 entry.composition.take(),
                 entry.controller,
-                event.is_none().then(|| target.clone()),
+                Some(target.clone()),
             );
 
             let Some(outcome) = outcome else {
@@ -5267,12 +5299,28 @@ mod windows_exports {
             use windows::core::w;
             use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
             use windows::Win32::UI::WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
+                WNDCLASSW, WS_POPUP,
             };
             unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
                 .ok()
                 .unwrap();
             let _apartment = Apartment;
+            let custom_class = w!("FlowerLearningCompatibilityTest");
+            unsafe extern "system" fn custom_proc(
+                window: windows::Win32::Foundation::HWND,
+                message: u32,
+                wparam: WPARAM,
+                lparam: LPARAM,
+            ) -> windows::Win32::Foundation::LRESULT {
+                DefWindowProcW(window, message, wparam, lparam)
+            }
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(custom_proc),
+                lpszClassName: custom_class,
+                ..Default::default()
+            };
+            assert_ne!(unsafe { RegisterClassW(&class) }, 0);
             let rich =
                 unsafe { windows::Win32::System::LibraryLoader::LoadLibraryW(w!("Msftedit.dll")) }
                     .unwrap();
@@ -5301,10 +5349,20 @@ mod windows_exports {
                 (Some(vec![0]), true, true),
                 (Some(vec![0]), false, false), // adaptive ranking explicitly disabled
                 (Some(vec![0]), false, false), // learning disabled, with no worker
+                (None, false, true),           // custom S04, AI remains unavailable
+                (Some(vec![]), false, true),   // custom S08
+                (None, false, false),          // compatibility explicitly disabled
+                (Some(vec![]), false, false),  // compatibility explicitly disabled
+                (Some(vec![31]), false, false), // custom password
+                (Some(vec![61]), false, false), // custom private
+                (Some(vec![999]), false, false), // custom unsupported
+                (Some(vec![0]), true, false),  // custom failed property
+                (None, false, false),          // custom focus identity lost
             ]
             .into_iter()
             .enumerate()
             {
+                eprintln!("native learning scope case {index}");
                 let value = scopes.map_or_else(VARIANT::default, |s| {
                     let scope: IUnknown = TestScope(s).into();
                     VARIANT::from(scope)
@@ -5320,7 +5378,9 @@ mod windows_exports {
                 let window = unsafe {
                     CreateWindowExW(
                         WINDOW_EX_STYLE::default(),
-                        if index % 2 == 0 {
+                        if index >= 19 {
+                            custom_class
+                        } else if index % 2 == 0 {
                             w!("Edit")
                         } else {
                             w!("RICHEDIT50W")
@@ -5341,6 +5401,14 @@ mod windows_exports {
                 let previous = unsafe { GetFocus() };
                 let _ = unsafe { SetFocus(window) };
                 COMPAT_VIEW.with(|v| v.set(window));
+                if index == 27 {
+                    let _ = unsafe { SetFocus(previous) };
+                }
+                unsafe { host.manager.SetFocus(&host.document) }.unwrap();
+                assert_eq!(
+                    focused_context_key(&host.manager),
+                    Some(context_key(&host.context))
+                );
                 let path = root.join(format!(
                     "native-learning-{index}-{}-{}.json",
                     std::process::id(),
@@ -5372,10 +5440,14 @@ mod windows_exports {
                     shift: ShiftGesture::default(),
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
-                    settings: Settings::default(),
+                    settings: Settings {
+                        ai_correction_enabled: index < 19,
+                        ai_undeclared_scope_compatibility: !matches!(index, 21 | 22),
+                        ..Settings::default()
+                    },
                     lexicon: Lexicon::builtin().unwrap(),
                     rankings: Arc::new(Vec::new()),
-                    adaptive_ranking_enabled: index < 17,
+                    adaptive_ranking_enabled: !matches!(index, 17 | 18),
                     learning: if index == 18 {
                         None
                     } else {
@@ -5697,7 +5769,8 @@ mod windows_exports {
             assert!(
                 unsafe { sink.OnTestKeyDown(context, WPARAM(key as usize), LPARAM(0)) }
                     .unwrap()
-                    .as_bool()
+                    .as_bool(),
+                "native TSF prediction for key {key:#x} must succeed"
             );
             assert!(
                 unsafe { sink.OnKeyDown(context, WPARAM(key as usize), LPARAM(0)) }
@@ -6379,6 +6452,68 @@ mod windows_exports {
                         .router
                         .pending_promotions()
                         .is_empty());
+                }
+                drop(shared.borrow_mut().take());
+                drop(service);
+            }
+        }
+
+        #[test]
+        fn native_builtin_spelling_suggestions_commit_without_learning() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for (raw, gold) in [("xuexo", "学习"), ("xueerunishuixingzhou", "学如逆水行舟")]
+            {
+                let scope: IUnknown = TestScope(vec![0]).into();
+                let calls = Rc::new(Cell::new(0));
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(scope)),
+                    fail: false,
+                    calls: calls.clone(),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let capture = Rc::new(CapturedAi::default());
+                let (service, shared) = ai_fixture(&host, &capture, &calls);
+                let sink: ITfKeyEventSink = service.cast().unwrap();
+                send_key(&sink, &host.context, 0x1B);
+                {
+                    let mut state = shared.borrow_mut();
+                    let active = state.as_mut().unwrap();
+                    active.contexts.clear();
+                    active.lexicon = Lexicon::builtin().unwrap();
+                }
+                for key in raw.bytes() {
+                    send_key(&sink, &host.context, key.to_ascii_uppercase());
+                }
+                let (index, rankings) = {
+                    let state = shared.borrow();
+                    let active = state.as_ref().unwrap();
+                    let snapshot = active.contexts[&context_key(&host.context)]
+                        .popup_model
+                        .snapshot()
+                        .unwrap();
+                    let index = snapshot
+                        .candidates
+                        .iter()
+                        .position(|c| c.text == gold)
+                        .unwrap();
+                    assert!(snapshot.candidates[index].is_spelling());
+                    assert!(!snapshot.candidates[index].is_ai());
+                    assert_ne!(read_document(&host, None), gold);
+                    (index, active.rankings.clone())
+                };
+                send_key(&sink, &host.context, b'1' + index as u8);
+                assert_eq!(read_document(&host, None), gold);
+                {
+                    let state = shared.borrow();
+                    let active = state.as_ref().unwrap();
+                    let router = &active.contexts[&context_key(&host.context)].router;
+                    assert!(router.pending_learning().is_empty());
+                    assert!(router.pending_promotions().is_empty());
+                    assert_eq!(active.rankings, rankings);
                 }
                 drop(shared.borrow_mut().take());
                 drop(service);

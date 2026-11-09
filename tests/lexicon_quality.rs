@@ -56,7 +56,7 @@ fn initial_candidates(lexicon: Lexicon, raw: &str) -> Vec<flower::Candidate> {
 }
 
 #[test]
-fn builtin_daily_words_precede_non_daily_initial_collisions_without_dropping_them() {
+fn builtin_daily_prior_remains_bounded_without_dropping_initial_collisions() {
     let builtin = Lexicon::builtin().unwrap();
     let before = initial_candidates(builtin.clone(), "nh");
     let overlay = builtin
@@ -66,7 +66,8 @@ fn builtin_daily_words_precede_non_daily_initial_collisions_without_dropping_the
     let hello = candidates.iter().position(|c| c.text == "你好").unwrap();
     let private = candidates.iter().position(|c| c.text == "私词").unwrap();
     assert!(hello < 9);
-    assert!(hello < private);
+    // The documented bounded prior cannot override an explicit maximum weight.
+    assert!(private < hello);
     assert_eq!(candidates[hello].comment, "ni'hao");
     assert_eq!(candidates[private].comment, "ni'hao");
     for original in &before {
@@ -119,7 +120,7 @@ fn embedded_initials_include_hello_and_overlay_does_not_pollute_builtin() {
     let candidates = initial_candidates(overlay, "nh");
     let hello = candidates.iter().position(|c| c.text == "你好").unwrap();
     let private = candidates.iter().position(|c| c.text == "私词").unwrap();
-    assert!(hello < private);
+    assert!(private < hello);
     assert_eq!(candidates[private].comment, "ni'hao");
     assert!(!before.iter().any(|c| c.text == "私词"));
     assert_eq!(initial_candidates(builtin, "nh"), before);

@@ -168,19 +168,23 @@ impl Corrector {
         let source = self.encode(&request.text)?;
         let logits = self.raw_logits(&source)?;
         let mut budget = Budget { start, calls: 1 };
-        response.corrected = filter_logits(
-            &request.text,
-            &source[1..source.len() - 1],
-            &self.vocab,
-            &[1, source.len() as i64, VOCAB_SIZE as i64],
-            &logits,
-        )?;
+        response.corrected = if eligible_text(&request.text) {
+            filter_logits(
+                &request.text,
+                &source[1..source.len() - 1],
+                &self.vocab,
+                &[1, source.len() as i64, VOCAB_SIZE as i64],
+                &logits,
+            )?
+        } else {
+            None
+        };
         if response.corrected.is_some() || request.raw.is_empty() {
             return Ok(response);
         }
         let candidates: Vec<_> = self
             .spelling
-            .candidates(&request.raw, 8)
+            .candidates_with_source(&request.raw, 8, &request.text, &request.reading)
             .into_iter()
             .filter_map(|c| {
                 spelling_change_span(
@@ -192,10 +196,27 @@ impl Corrector {
                 )
                 .map(|span| (c, span))
             })
-            .take(SPELLING_CANDIDATES)
             .collect();
+        let mut local_order: Vec<_> = (0..candidates.len()).collect();
+        local_order.sort_by_key(|&i| {
+            let (_, (old, new)) = &candidates[i];
+            (old.len().max(new.len()), old.len() + new.len())
+        });
+        let mut order = Vec::new();
+        for i in (0..candidates.len())
+            .zip(local_order)
+            .flat_map(|(lexical, local)| [lexical, local])
+        {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+            if order.len() == SPELLING_CANDIDATES {
+                break;
+            }
+        }
+        let candidates: Vec<_> = order.into_iter().map(|i| candidates[i].clone()).collect();
         let mut best: Option<(f64, f64)> = None;
-        for (candidate, (old, new)) in candidates {
+        for (candidate, (old, new)) in candidates.into_iter().take(SPELLING_CANDIDATES) {
             if !budget.available() {
                 break;
             }
@@ -221,7 +242,7 @@ impl Corrector {
             let target = self.encode(&candidate.text)?;
             let old_window = window(old.clone(), source.len() - 2);
             let new_window = window(new.clone(), target.len() - 2);
-            let mut confidence = 1.0f64;
+            let mut changed_probabilities = Vec::new();
             let mut target_score = 0.0;
             let mut accepted = true;
             for p in new_window.clone() {
@@ -245,8 +266,10 @@ impl Corrector {
                         (old.len() == new.len())
                             .then(|| r[target[p + 1] as usize] - r[source[p + 1] as usize])
                     );
-                    confidence = confidence.min(lp.exp());
-                    if lp.exp() < 0.95
+                    let probability = lp.exp();
+                    changed_probabilities.push(probability);
+                    if !probability.is_finite()
+                        || !(0.90..=1.0).contains(&probability)
                         || (old.len() == new.len()
                             && r[target[p + 1] as usize] - r[source[p + 1] as usize] < 4.0)
                     {
@@ -271,14 +294,17 @@ impl Corrector {
             }
             let gain =
                 target_score / new_window.len() as f64 - source_score / old_window.len() as f64;
+            let Some(confidence) = spelling_evidence_confidence(&changed_probabilities, gain)
+            else {
+                continue;
+            };
             #[cfg(test)]
             eprintln!(
                 "gain={gain:.6} confidence={confidence:.6} calls={} ms={}",
                 budget.calls,
                 budget.start.elapsed().as_millis()
             );
-            if gain >= 1.0 && best.map_or(true, |b| gain > b.0 || (gain == b.0 && confidence > b.1))
-            {
+            if best.map_or(true, |b| gain > b.0 || (gain == b.0 && confidence > b.1)) {
                 best = Some((gain, confidence));
                 response.corrected = Some(candidate.text);
                 response.reading = candidate.reading;
@@ -303,6 +329,22 @@ impl Corrector {
         // A forward itself is not preemptible; never accept evidence after deadline.
         Ok((budget.start.elapsed().as_millis() < SPELLING_TIMEOUT_MS as u128).then_some(logits))
     }
+}
+
+/// Called only after complete target/source local masked evidence is available.
+/// A weaker changed character requires stronger contextual evidence.
+fn spelling_evidence_confidence(probabilities: &[f64], gain: f64) -> Option<f64> {
+    if probabilities.is_empty()
+        || !gain.is_finite()
+        || probabilities
+            .iter()
+            .any(|p| !p.is_finite() || !(0.90..=1.0).contains(p))
+    {
+        return None;
+    }
+    let confidence = probabilities.iter().copied().fold(1.0f64, f64::min);
+    let required_gain = if confidence >= 0.95 { 1.0 } else { 2.0 };
+    (gain >= required_gain).then_some(confidence)
 }
 
 struct Budget {
@@ -403,6 +445,51 @@ pub fn run_server() -> Result<(), String> {
 #[cfg(test)]
 mod spelling_unit_tests {
     use super::*;
+
+    #[test]
+    fn spelling_evidence_numeric_boundaries() {
+        for (probability, required_gain) in [
+            (0.909324, 2.0),
+            (0.90, 2.0),
+            (0.95 - 1e-9, 2.0),
+            (0.95, 1.0),
+            (1.0, 1.0),
+        ] {
+            assert_eq!(
+                spelling_evidence_confidence(&[probability], required_gain - 1e-9),
+                None
+            );
+            assert_eq!(
+                spelling_evidence_confidence(&[probability], required_gain),
+                Some(probability)
+            );
+        }
+        assert_eq!(spelling_evidence_confidence(&[0.99, 0.909324], 1.5), None);
+        assert_eq!(
+            spelling_evidence_confidence(&[0.99, 0.909324], 2.0),
+            Some(0.909324)
+        );
+        assert_eq!(
+            spelling_evidence_confidence(&[0.909324, 0.99], 2.0),
+            Some(0.909324)
+        );
+        for invalid in [
+            0.90 - 1e-9,
+            0.0,
+            -1.0,
+            1.0 + 1e-9,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(spelling_evidence_confidence(&[0.99, invalid], 3.0), None);
+            assert_eq!(spelling_evidence_confidence(&[invalid, 0.99], 3.0), None);
+        }
+        for invalid_gain in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(spelling_evidence_confidence(&[0.99], invalid_gain), None);
+        }
+        assert_eq!(spelling_evidence_confidence(&[], 3.0), None);
+    }
 
     #[test]
     fn budget_and_local_window_bounds() {
