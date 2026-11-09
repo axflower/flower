@@ -94,7 +94,8 @@ fn core_mixed_ranks_are_measured_not_assumed_first() {
     for (raw, text, reading, rank) in [
         ("zheshism", "这是什么", "zhe'shi'shen'me", 5),
         ("zhesm", "这什么", "zhe'shen'me", 1),
-        ("shenmeys", "什么意思", "shen'me'yi'si", 2),
+        // The added everyday word "也是" yields the valid alternative "什么也是".
+        ("shenmeys", "什么意思", "shen'me'yi'si", 3),
         ("womensr", "我们输入", "wo'men'shu'ru", 3),
         ("weixinxx", "微信消息", "wei'xin'xiao'xi", 4),
     ] {
@@ -123,7 +124,12 @@ fn core_mixed_ranks_are_measured_not_assumed_first() {
                 session.next_page().unwrap();
             }
         }
-        assert_eq!(actual - suggestions, rank, "{raw}");
+        assert_eq!(
+            actual - suggestions,
+            rank,
+            "{raw}: {:?}",
+            session.candidates_on_current_page()
+        );
         assert_eq!(
             session.select_candidate(index).unwrap().commit.as_deref(),
             Some(text)

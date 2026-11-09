@@ -318,7 +318,7 @@ fn backspace_edits_then_clears_the_composition() {
 #[test]
 fn page_keys_move_between_candidate_pages() {
     let mut session = PinyinSession::from_lexicon_tsv(
-        include_str!("../data/pinyin/mvp_lexicon.tsv"),
+        flower_dictionary::table("legacy-mvp").unwrap().tsv,
         DEFAULT_PAGE_SIZE,
     )
     .unwrap();

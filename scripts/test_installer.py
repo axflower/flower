@@ -331,6 +331,10 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(verified.version, "0.4.7")
         self.assertIn("data/pinyin/everyday_phrases.tsv", verified.payload)
         self.assertIn("data/pinyin/everyday_phrases.md", verified.payload)
+        self.assertEqual(
+            hashlib.sha256(verified.payload["data/pinyin/everyday_phrases.tsv"]).hexdigest(),
+            installer.pack.EVERYDAY_SHA256,
+        )
         result = self.build()
         self.assertEqual(self.calls, 1)
         digest = hashlib.sha256(result.executable.read_bytes()).hexdigest()

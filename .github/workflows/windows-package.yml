@@ -39,15 +39,9 @@ jobs:
         shell: pwsh
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Python dictionary, packaging and installer boundary tests
+      - name: Python packaging and installer boundary tests
         shell: pwsh
-        run: python -m unittest -v scripts/test_lexicon.py scripts/test_phrases.py scripts/test_package.py scripts/test_installer.py
-
-      - name: Verify reproducible offline dictionary
-        shell: pwsh
-        run: |
-          python scripts/build_lexicon.py --check
-          python scripts/build_phrases.py --check
+        run: python -m unittest -v scripts/test_package.py scripts/test_installer.py
 
       - name: Build ZIP package
         shell: pwsh

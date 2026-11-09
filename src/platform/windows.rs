@@ -6764,6 +6764,7 @@ mod windows_exports {
             let _apartment = Apartment;
             for (raw, gold) in [("xuexo", "学习"), ("xueerunishuixingzhou", "学如逆水行舟")]
             {
+                eprintln!("native ordinary spelling case: {raw}");
                 let scope: IUnknown = TestScope(vec![0]).into();
                 let calls = Rc::new(Cell::new(0));
                 let owner: IUnknown = ScopeOwner {

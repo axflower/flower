@@ -3,50 +3,13 @@ use std::sync::{Arc, OnceLock};
 
 use super::{Candidate, EngineError};
 
-const BUILTIN_LEXICON: &str = concat!(
-    include_str!("../../data/pinyin/base_lexicon.tsv"),
-    "\n",
-    include_str!("../../data/pinyin/phrases/phrase_lexicon.tsv"),
-    "\n",
-    include_str!("../../data/pinyin/everyday_phrases.tsv"),
-    "\n",
-    include_str!("../../data/pinyin/categories/IT.tsv"),
-    include_str!("../../data/pinyin/categories/animal.tsv"),
-    include_str!("../../data/pinyin/categories/caijing.tsv"),
-    include_str!("../../data/pinyin/categories/car.tsv"),
-    include_str!("../../data/pinyin/categories/chengyu.tsv"),
-    include_str!("../../data/pinyin/categories/diming.tsv"),
-    include_str!("../../data/pinyin/categories/food.tsv"),
-    include_str!("../../data/pinyin/categories/law.tsv"),
-    include_str!("../../data/pinyin/categories/lishimingren.tsv"),
-    include_str!("../../data/pinyin/categories/medical.tsv"),
-    include_str!("../../data/pinyin/categories/poem.tsv"),
-    include_str!("../../data/pinyin/categories/cedict_supplement.tsv"),
-    include_str!("../../data/pinyin/categories/erhua.tsv"),
-);
+const BUILTIN_LEXICON: &str = flower_dictionary::DEFAULT_TSV;
 
-const EVERYDAY_PHRASES: &str = include_str!("../../data/pinyin/everyday_phrases.tsv");
+const EVERYDAY_PHRASES: &str = flower_dictionary::EVERYDAY_TSV;
 
 // Project-maintained usage prior, NOT corpus frequency or new readings.
 // Exact pairs prevent a future additional reading inheriting the classification.
-const EVERYDAY_PAIRS: &str = "\
-ni'hao=你好 xie'xie=谢谢 zai'jian=再见 wo'men=我们 ni'men=你们 ta'men=他们 shen'me=什么 yi'si=意思 wei'xin=微信 \
-zen'me=怎么 wei'shen'me=为什么 ke'yi=可以 xu'yao=需要 zhi'dao=知道 xi'huan=喜欢 jin'tian=今天 ming'tian=明天 \
-xian'zai=现在 shi'jian=时间 gong'zuo=工作 xue'xi=学习 dian'nao=电脑 shou'ji=手机 shu'ru'fa=输入法 zhong'guo=中国 \
-da'jia=大家 zi'ji=自己 yi'ge=一个 zhe'ge=这个 na'ge=那个 zhe'xie=这些 na'xie=那些 zhe'li=这里 \
-na'li=那里 zhe'yang=这样 na'yang=那样 duo'shao=多少 shi'hou=时候 yi'jing=已经 hai'shi=还是 yin'wei=因为 \
-suo'yi=所以 ru'guo=如果 dan'shi=但是 er'qie=而且 yi'qi=一起 yi'zhi=一直 yi'ding=一定 ke'neng=可能 \
-ying'gai=应该 mei'you=没有 bu'shi=不是 bu'yao=不要 bu'neng=不能 bu'hao=不好 fei'chang=非常 zhen'de=真的 \
-jue'de=觉得 xi'wang=希望 peng'you=朋友 jia'ren=家人 hai'zi=孩子 lao'shi=老师 xue'sheng=学生 xue'xiao=学校 \
-gong'si=公司 sheng'huo=生活 shi'jie=世界 bei'jing=北京 shang'hai=上海 zao'shang=早上 wan'shang=晚上 xia'wu=下午 \
-shang'wu=上午 zhong'wu=中午 zuo'tian=昨天 yi'hou=以后 yi'qian=以前 kai'shi=开始 jie'shu=结束 ji'xu=继续 \
-deng'dai=等待 bang'zhu=帮助 wen'ti=问题 shi'qing=事情 fang'fa=方法 jie'guo=结果 xiao'xi=消息 dian'hua=电话 \
-di'zhi=地址 ming'zi=名字 hao'ma=号码 you'jian=邮件 wen'jian=文件 ruan'jian=软件 xi'tong=系统 wang'luo=网络 \
-wang'zhan=网站 mi'ma=密码 she'zhi=设置 da'kai=打开 guan'bi=关闭 bao'cun=保存 xuan'ze=选择 shi'yong=使用 \
-an'zhuang=安装 geng'xin=更新 yu'yan=语言 zhong'wen=中文 pin'yin=拼音 wen'zi=文字 yin'yue=音乐 dian'ying=电影 \
-you'xi=游戏 tian'qi=天气 kuai'le=快乐 gao'xing=高兴 kai'xin=开心 jian'kang=健康 an'quan=安全 chi'fan=吃饭 \
-hui'jia=回家 chu'men=出门 shang'ban=上班 xia'ban=下班 xiu'xi=休息 shui'jiao=睡觉 gou'mai=购买 jia'ge=价格 \
-sheng'ri=生日 huan'ying=欢迎 dui'bu'qi=对不起 mei'guan'xi=没关系 bu'ke'qi=不客气 qing'wen=请问";
+const EVERYDAY_PAIRS: &str = flower_dictionary::COMMON_USAGE_PAIRS;
 
 const EVERYDAY_RANKING_FLOOR: u32 = 16384;
 
@@ -1196,7 +1159,12 @@ mod tests {
             .map(|candidate| candidate.text.chars().next().unwrap())
             .collect();
         let mut baseline = HashSet::new();
-        for line in include_str!("../../data/pinyin/sources/kMandarin_8105.txt").lines() {
+        for line in std::str::from_utf8(
+            flower_dictionary::asset("data/pinyin/sources/kMandarin_8105.txt").unwrap(),
+        )
+        .unwrap()
+        .lines()
+        {
             if !line.starts_with("U+") {
                 continue;
             }

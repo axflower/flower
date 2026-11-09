@@ -1,6 +1,5 @@
 use flower::engine::{Key, KeyEvent, Lexicon, PinyinSession};
 use std::collections::HashSet;
-use std::path::Path;
 
 const TABLES: [&str; 13] = [
     "IT",
@@ -20,14 +19,14 @@ const TABLES: [&str; 13] = [
 
 #[test]
 fn every_generated_category_pair_is_reachable_in_default_exact_lookup() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/pinyin/categories");
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(root.join("manifest.json")).unwrap())
-            .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(
+        flower_dictionary::asset("data/pinyin/categories/manifest.json").unwrap(),
+    )
+    .unwrap();
     let lexicon = Lexicon::builtin().unwrap();
     let mut unique = HashSet::new();
     for name in TABLES {
-        let table = std::fs::read_to_string(root.join(format!("{name}.tsv"))).unwrap();
+        let table = flower_dictionary::table(name).unwrap().tsv;
         for line in table
             .lines()
             .filter(|line| !line.is_empty() && !line.starts_with('#'))

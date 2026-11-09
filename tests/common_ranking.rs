@@ -1,6 +1,6 @@
 use flower::engine::{Key, KeyEvent, Lexicon, PinyinSession};
 
-const EVERYDAY: &str = include_str!("../data/pinyin/everyday_phrases.tsv");
+const EVERYDAY: &str = flower_dictionary::EVERYDAY_TSV;
 
 #[test]
 fn bounded_daily_prior_keeps_greetings_without_overriding_high_frequency_words() {
@@ -77,6 +77,8 @@ fn select_phrase(mut session: PinyinSession, word: &str, reading: &str) {
             .iter()
             .position(|c| c.text == word && c.comment == reading)
         {
+            let candidate = &session.candidates_on_current_page()[index];
+            assert!(!candidate.is_ai() && !candidate.is_spelling(), "{word}");
             assert_eq!(
                 session.select_candidate(index).unwrap().commit.as_deref(),
                 Some(word)
@@ -92,7 +94,7 @@ fn select_phrase(mut session: PinyinSession, word: &str, reading: &str) {
 fn every_project_phrase_has_exact_and_initial_candidates_with_canonical_reading() {
     let lexicon = Lexicon::builtin().unwrap();
     let rows = phrase_rows();
-    assert_eq!(rows.len(), 155);
+    assert_eq!(rows.len(), 803);
     let mut pairs = std::collections::HashSet::new();
     for (reading, word) in rows {
         assert!(pairs.insert((reading, word)));
@@ -111,6 +113,48 @@ fn every_project_phrase_has_exact_and_initial_candidates_with_canonical_reading(
             .map(|s| s.chars().next().unwrap())
             .collect();
         select_phrase(session_for(&initials), word, reading);
+    }
+}
+
+#[test]
+fn network_and_spoken_additions_commit_full_initial_and_mixed_as_ordinary_words() {
+    for (reading, word) in [
+        ("qing'xu'jia'zhi", "情绪价值"),
+        ("da'zi", "搭子"),
+        ("xian'yan'bao", "显眼包"),
+        ("beng'bu'zhu", "绷不住"),
+        ("jue'jue'zi", "绝绝子"),
+        ("she'kong", "社恐"),
+        ("she'niu", "社牛"),
+        ("zui'ti", "嘴替"),
+        ("beng'bu'zhu'le", "蚌埠住了"),
+        ("huo'ren'gan", "活人感"),
+        ("yi'jian'san'lian", "一键三连"),
+        ("dan'mu", "弹幕"),
+        ("ping'lun'qu", "评论区"),
+        ("you'xi'da'zi", "游戏搭子"),
+        ("qin'ce'you'xiao", "亲测有效"),
+        ("wo'bu'tai'ming'bai", "我不太明白"),
+        ("neng'ju'ge'li'zi'ma", "能举个例子吗"),
+        ("bie'gei'zi'ji'ya'li", "别给自己压力"),
+        ("bu'yao'jia'bing", "不要加冰"),
+        ("neng'pian'yi'dian'ma", "能便宜点吗"),
+        ("bie'la'dong'xi", "别落东西"),
+    ] {
+        let syllables: Vec<_> = reading.split('\'').collect();
+        let full = syllables.join("");
+        let initials: String = syllables
+            .iter()
+            .map(|s| s.chars().next().unwrap())
+            .collect();
+        let mixed = syllables[0].to_owned()
+            + &syllables[1..]
+                .iter()
+                .map(|s| s.chars().next().unwrap())
+                .collect::<String>();
+        for raw in [&full, &initials, &mixed] {
+            select_phrase(session_for(raw), word, reading);
+        }
     }
 }
 

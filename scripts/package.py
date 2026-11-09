@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 try:
-    from scripts import build_lexicon, package_ai_assets
+    from scripts import dictionary_data, package_ai_assets
 except ModuleNotFoundError:
-    import build_lexicon
+    import dictionary_data
     import package_ai_assets
 
 
@@ -31,7 +31,7 @@ EXPECTED_ROOT_LICENSE = "MIT OR Apache-2.0"
 EXPECTED_DLL_EXPORTS = frozenset({"DllGetClassObject", "DllCanUnloadNow"})
 SAFE_FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 SUPPORTED_LICENSE_IDS = frozenset(
-    {"MIT", "Apache-2.0", "Unlicense", "Unicode-3.0", "ISC"}
+    {"MIT", "Apache-2.0", "Unlicense", "Unicode-3.0", "ISC", "CC-BY-SA-4.0"}
 )
 LICENSE_FILE_PREFIXES = (
     "LICENSE",
@@ -389,11 +389,18 @@ def _license_expression_terms(expression: object, label: str) -> set[str]:
     return terms
 
 
-def _classify_license_text(name: str, text: str) -> set[str]:
+def _classify_license_text(name: str, text: str, *, raw: bytes | None = None) -> set[str]:
     upper_name = name.upper()
     normalized = text.casefold()
     classes: set[str] = set()
-    if "UNICODE LICENSE V3" in text.upper() or "UNICODE-3.0" in text.upper():
+    # Exact original bytes: dictionary source manifests and audited unicode-ident 1.0.27.
+    digest = _sha256(text.encode("utf-8") if raw is None else raw)
+    if digest == "28a9529c7d0bb4dc51f4bf5c116a3d16ef247a052f7591466768ddf563fd1cf5":
+        classes.add("CC-BY-SA-4.0")
+    if digest in {
+        "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96",
+        "f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1",
+    }:
         classes.add("Unicode-3.0")
     if (
         "UNLICENSE" in upper_name
@@ -477,6 +484,13 @@ def _license_files_for_package(package: dict) -> list[Path]:
     for path in direct_entries:
         if path.is_file() and path.name.upper().startswith(LICENSE_FILE_PREFIXES):
             candidates.add(path)
+    licenses_dir = package_dir / "licenses"
+    if licenses_dir.is_dir():
+        for path in licenses_dir.rglob("*"):
+            if path.is_file():
+                if not path.resolve().is_relative_to(package_dir):
+                    raise PackagingError("依赖许可证路径越出包目录")
+                candidates.add(path)
 
     license_file = package.get("license_file")
     if isinstance(license_file, str) and license_file:
@@ -525,8 +539,9 @@ def _dependency_license_bundle(
         for source in files:
             data = _read_bytes(source, f"{label}许可证")
             text = data.decode("utf-8", errors="replace")
-            classes.update(_classify_license_text(source.name, text))
-            destination = f"{destination_dir}/{source.name}"
+            classes.update(_classify_license_text(source.name, text, raw=data))
+            relative = source.relative_to(Path(package["manifest_path"]).parent.resolve())
+            destination = f"{destination_dir}/{relative.as_posix()}"
             folded = destination.casefold()
             if folded in casefold_paths:
                 raise PackagingError(
@@ -1215,6 +1230,7 @@ def _publish_no_overwrite(source: Path, destination: Path) -> PublishedFile:
 
 
 def _dictionary_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
+    build_lexicon = dictionary_data.load_generator(repo_root)
     """Validate the distributable data without depending on dev-only raw Unihan."""
     names = (
         "data/pinyin/base_lexicon.tsv",
@@ -1330,10 +1346,10 @@ def _phrase_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
                      "coverage": coverage, "notice_path": "licenses/phrases/NOTICE.md"}
 
 
-EVERYDAY_COUNT = 155
+EVERYDAY_COUNT = 803
 CATEGORY_PREFIX = "data/pinyin/categories/"
 # Updating the offline snapshot requires an explicit code and evidence update.
-CATEGORY_MANIFEST_SHA256 = "2d9424c64719b08e8ffae04ff13a0db0af489cb9f72443d979ed175aca43c3f6"
+CATEGORY_MANIFEST_SHA256 = "ae910264a79644ed146338169411e319c01053be0c5a9dbdbf886fc8e2d95603"
 CATEGORY_TABLES = tuple(name + ".tsv" for name in (
     "IT", "animal", "caijing", "car", "chengyu", "diming", "food", "law",
     "lishimingren", "medical", "poem", "cedict_supplement", "erhua",
@@ -1352,7 +1368,11 @@ CATEGORY_FILES = frozenset(
 )
 
 
-def _verify_category_payload(payload: Mapping[str, bytes], repo_root: Path) -> dict:
+def _verify_category_payload(
+    payload: Mapping[str, bytes], repo_root: Path, *, dictionary_root: Path | None = None,
+) -> dict:
+    if dictionary_root is None:
+        dictionary_root = dictionary_data.resolve_dictionary_root(repo_root)
     """Verify generated records and independently pinned source-license bytes."""
     try:
         manifest_bytes = payload[CATEGORY_PREFIX + "manifest.json"]
@@ -1379,7 +1399,7 @@ def _verify_category_payload(payload: Mapping[str, bytes], repo_root: Path) -> d
             "characters": "data/pinyin/sources/manifest.json",
         }
         for source, path in source_paths.items():
-            trusted = json.loads(_read_bytes(repo_root / path, "分类来源清单"))
+            trusted = json.loads(_read_bytes(dictionary_root / path, "分类来源清单"))
             if manifest["sources"][source] != trusted:
                 raise ValueError("分类来源清单与固定源不一致")
         for path, (source, name) in CATEGORY_LICENSE_SOURCES.items():
@@ -1446,10 +1466,12 @@ def _category_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
     baseline = {path: _read_bytes(repo_root / path, "分类默认基线") for path in (
         "data/pinyin/base_lexicon.tsv", "data/pinyin/everyday_phrases.tsv",
         "data/pinyin/phrases/phrase_lexicon.tsv")}
-    return payload, _verify_category_payload({**payload, **baseline}, repo_root)
+    return payload, _verify_category_payload(
+        {**payload, **baseline}, repo_root, dictionary_root=repo_root,
+    )
 
 
-EVERYDAY_SHA256 = "86aed552183db1964ca9f0c9f4a1978bd87b11b87202f60a29dea9d997312f2d"
+EVERYDAY_SHA256 = "0b61378faaecc1a53f71400b402d1f3af3ae65b7be2b5b545b2785290fc8fdae"
 
 
 def _everyday_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
@@ -1495,16 +1517,19 @@ def _build_payloads(
     rust_payload: Mapping[str, bytes],
     rust_std: dict,
     ai_bundle: tuple[dict[str, bytes], dict] | None = None,
+    dictionary_root: Path | None = None,
 ) -> tuple[dict[str, bytes], str]:
+    if dictionary_root is None:
+        dictionary_root = dictionary_data.resolve_dictionary_root(repo_root)
     top_level, _, _ = _package_paths(version)
     readme = _read_bytes(repo_root / "docs" / "distribution.md", "中文分发说明")
     lexicon = _read_bytes(
-        repo_root / "data" / "pinyin" / "mvp_lexicon.tsv", "MVP 词库"
+        dictionary_root / "data" / "pinyin" / "mvp_lexicon.tsv", "MVP 词库"
     )
-    dictionary_payload, dictionary_record = _dictionary_bundle(repo_root)
-    phrase_payload, phrase_record = _phrase_bundle(repo_root)
-    everyday_payload, everyday_record = _everyday_bundle(repo_root)
-    category_payload, category_record = _category_bundle(repo_root)
+    dictionary_payload, dictionary_record = _dictionary_bundle(dictionary_root)
+    phrase_payload, phrase_record = _phrase_bundle(dictionary_root)
+    everyday_payload, everyday_record = _everyday_bundle(dictionary_root)
+    category_payload, category_record = _category_bundle(dictionary_root)
     cargo_lock = _read_bytes(repo_root / "Cargo.lock", "Cargo.lock")
     root_mit = _read_bytes(repo_root / "LICENSE-MIT", "MIT 许可证")
     root_apache = _read_bytes(repo_root / "LICENSE-APACHE", "Apache 许可证")
@@ -1673,6 +1698,7 @@ def build_package(
             "cargo",
             "metadata",
             "--locked",
+            "--offline",
             "--format-version",
             "1",
             "--filter-platform",
@@ -1682,6 +1708,10 @@ def build_package(
         "cargo metadata",
     )
     metadata, root_package, package_by_id = _load_metadata(metadata_stdout)
+    try:
+        dictionary_root = dictionary_data.resolve_dictionary_root(repo, metadata)
+    except ValueError as error:
+        raise PackagingError(str(error)) from error
     root_id = metadata["resolve"]["root"]
     version = _safe_component(root_package.get("version"), "包版本")
     _, zip_name, checksum_name = _package_paths(version)
@@ -1743,6 +1773,7 @@ def build_package(
         rust_payload,
         rust_std,
         ai_bundle,
+        dictionary_root=dictionary_root,
     )
 
     if _exists_even_dangling(output):

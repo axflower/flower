@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import contextlib
+import copy
+from functools import lru_cache
 import hashlib
 import importlib.util
 import io
@@ -30,6 +32,11 @@ sys.modules[SPEC.name] = flower_package
 SPEC.loader.exec_module(flower_package)
 
 
+@lru_cache(maxsize=1)
+def dictionary_root():
+    return flower_package.dictionary_data.resolve_dictionary_root(REPO_ROOT)
+
+
 MIT_TEXT = (
     "MIT License\n\n"
     "Permission is hereby granted, free of charge, to any person obtaining a "
@@ -43,7 +50,8 @@ APACHE_TEXT = (
 UNLICENSE_TEXT = (
     "This is free and unencumbered software released into the public domain.\n"
 )
-UNICODE_TEXT = "UNICODE LICENSE V3\nCopyright © 1991-2024 Unicode, Inc.\n"
+def unicode_text():
+    return (dictionary_root() / "licenses/UNICODE-3.0.txt").read_bytes().decode("utf-8")
 RELEASE_PROFILE = {
     "opt_level": "3",
     "debug_assertions": False,
@@ -123,6 +131,112 @@ def make_pe(*, is_dll: bool, exports: set[str] | None = None) -> bytes:
         data[string_offset : string_offset + len(encoded)] = encoded
         string_offset += len(encoded)
     return bytes(data)
+
+
+class DictionaryResolutionTests(unittest.TestCase):
+    def test_exact_direct_dependency_and_rename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "Cargo.toml"
+            manifest.write_text("", encoding="utf-8")
+            metadata = {
+                "packages": [
+                    {"id": "flower", "name": "flower", "manifest_path": str(manifest)},
+                    {"id": "dictionary", "name": "flower-dictionary", "version": "0.1.0",
+                     "manifest_path": str(manifest)},
+                ],
+                "resolve": {"root": "flower", "nodes": [
+                    {"id": "flower", "deps": [{"name": "renamed", "pkg": "dictionary"}]},
+                ]},
+            }
+            resolve = flower_package.dictionary_data.resolve_dictionary_root
+            self.assertEqual(resolve(root, metadata), root.resolve())
+            workspace_metadata = copy.deepcopy(metadata)
+            workspace_metadata["resolve"]["root"] = None
+            self.assertEqual(resolve(root, workspace_metadata), root.resolve())
+            for mutate in (
+                lambda m: m["resolve"]["nodes"][0].update(deps=[]),
+                lambda m: m["resolve"]["nodes"][0]["deps"].append(
+                    {"name": "second", "pkg": "dictionary"}),
+                lambda m: m["packages"][1].update(version="0.2.0"),
+                lambda m: m["packages"][1].update(manifest_path="relative/Cargo.toml"),
+                lambda m: m["packages"][1].update(manifest_path=str(root / "missing/Cargo.toml")),
+                lambda m: m["packages"][0].update(manifest_path="Cargo.toml"),
+                lambda m: m["packages"][0].update(manifest_path=str(root / "other/Cargo.toml")),
+            ):
+                bad = copy.deepcopy(metadata)
+                mutate(bad)
+                with self.subTest(metadata=bad), self.assertRaises(ValueError):
+                    resolve(root, bad)
+
+
+class DictionaryLicenseTests(unittest.TestCase):
+    def test_unicode_ident_standard_variant_and_tampering(self):
+        result = flower_package.subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--locked", "--offline"],
+            cwd=REPO_ROOT, check=True, capture_output=True, text=True,
+        )
+        packages = [p for p in json.loads(result.stdout)["packages"]
+                    if p["name"] == "unicode-ident" and p["version"] == "1.0.27"]
+        self.assertEqual(len(packages), 1)
+        data = (Path(packages[0]["manifest_path"]).parent / "LICENSE-UNICODE").read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(),
+                         "f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = {"name": "unicode-variant-fixture", "version": "1.0.0",
+                       "license": "Unicode-3.0", "manifest_path": str(root / "Cargo.toml")}
+            license_path = root / "LICENSE-UNICODE"
+            license_path.write_bytes(data)
+            payload, _ = flower_package._dependency_license_bundle([package])
+            self.assertEqual(payload["licenses/unicode-variant-fixture-1.0.0/LICENSE-UNICODE"], data)
+            changed = data.replace(b"Permission", b"Restriction", 1)
+            self.assertNotEqual(changed, data)
+            for bad in (data[:len(data) // 2], changed):
+                with self.subTest(body=bad[:50]):
+                    license_path.write_bytes(bad)
+                    with self.assertRaises(flower_package.PackagingError):
+                        flower_package._dependency_license_bundle([package])
+
+    def test_exact_full_bodies_and_dependency_collection(self):
+        root = dictionary_root()
+        package = {
+            "name": "flower-dictionary", "version": "0.1.0",
+            "license": "MIT AND Unicode-3.0 AND CC-BY-SA-4.0",
+            "manifest_path": str(root / "Cargo.toml"),
+        }
+        payload, notices = flower_package._dependency_license_bundle([package])
+        self.assertEqual(len(notices), 1)
+        for name, term in (("UNICODE-3.0.txt", "Unicode-3.0"),
+                           ("CC-BY-SA-4.0.txt", "CC-BY-SA-4.0")):
+            data = (root / "licenses" / name).read_bytes()
+            self.assertIn(term, flower_package._classify_license_text(
+                name, data.decode("utf-8"), raw=data))
+            self.assertEqual(payload[f"licenses/flower-dictionary-0.1.0/licenses/{name}"], data)
+
+    def test_placeholders_truncation_and_changed_terms_rejected(self):
+        for name, term in (("UNICODE-3.0.txt", "Unicode-3.0"),
+                           ("CC-BY-SA-4.0.txt", "CC-BY-SA-4.0")):
+            data = (dictionary_root() / "licenses" / name).read_bytes()
+            placeholders = [
+                b"UNICODE LICENSE V3\nUNICODE-3.0",
+                b"Attribution-ShareAlike 4.0 International\n" +
+                b"\n".join(f"Section {i}".encode() for i in range(1, 9)),
+                data[:len(data) // 2],
+                data.replace(b"permission", b"restriction") if b"permission" in data
+                else data + b"\nAdditional restriction.",
+            ]
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                package = {"name": "license-fixture", "version": "1.0.0",
+                           "license": term, "manifest_path": str(root / "Cargo.toml")}
+                for bad in placeholders:
+                    with self.subTest(term=term, body=bad[:50]):
+                        self.assertNotIn(term, flower_package._classify_license_text(
+                            name, bad.decode("utf-8"), raw=bad))
+                        (root / "LICENSE").write_bytes(bad)
+                        with self.assertRaises(flower_package.PackagingError):
+                            flower_package._dependency_license_bundle([package])
 
 
 class FakeRunner:
@@ -235,6 +349,10 @@ class PackageFixture:
         self.base = base
         self.repo = base / "repo with spaces"
         self.repo.mkdir()
+        source_root = dictionary_root()
+        (self.repo / "scripts").mkdir()
+        shutil.copyfile(source_root / "scripts/build_lexicon.py",
+                        self.repo / "scripts/build_lexicon.py")
         (self.repo / "docs").mkdir()
         (self.repo / "data" / "pinyin").mkdir(parents=True)
         (self.repo / "docs" / "distribution.md").write_text(
@@ -251,7 +369,7 @@ class PackageFixture:
         ):
             destination = self.repo / "data/pinyin" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(REPO_ROOT / "data/pinyin" / name, destination)
+            shutil.copyfile(source_root / "data/pinyin" / name, destination)
         shutil.copyfile(REPO_ROOT / "LICENSE-MIT", self.repo / "LICENSE-MIT")
         for name in (
             "phrase_lexicon.tsv", "proper_lexicon.tsv", "coverage.json", "manifest.json",
@@ -260,10 +378,10 @@ class PackageFixture:
         ):
             destination = self.repo / "data/pinyin/phrases" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(REPO_ROOT / "data/pinyin/phrases" / name, destination)
+            shutil.copyfile(source_root / "data/pinyin/phrases" / name, destination)
         shutil.copyfile(REPO_ROOT / "LICENSE-APACHE", self.repo / "LICENSE-APACHE")
         for name in ("everyday_phrases.tsv", "everyday_phrases.md"):
-            shutil.copyfile(REPO_ROOT / "data/pinyin" / name,
+            shutil.copyfile(source_root / "data/pinyin" / name,
                             self.repo / "data/pinyin" / name)
         (self.repo / "Cargo.lock").write_text("# test lock\n", encoding="utf-8")
         # Explicit valid category fixture: runtime allowlist plus independent source pin.
@@ -272,7 +390,7 @@ class PackageFixture:
         }):
             destination = self.repo / name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(REPO_ROOT / name, destination)
+            shutil.copyfile(source_root / name, destination)
 
         self.target_dir = base / "custom target dir"
         self.release_dir = (
@@ -301,8 +419,8 @@ class PackageFixture:
         (rust_docs / "licenses" / "Apache-2.0.txt").write_text(
             APACHE_TEXT, encoding="utf-8"
         )
-        (rust_docs / "licenses" / "Unicode-3.0.txt").write_text(
-            UNICODE_TEXT, encoding="utf-8"
+        (rust_docs / "licenses" / "Unicode-3.0.txt").write_bytes(
+            unicode_text().encode("utf-8")
         )
 
         self.root_id = "path+file:///fixture#flower@0.4.7"
@@ -322,6 +440,17 @@ class PackageFixture:
                 file_names=("LICENSE-MIT", "LICENSE-APACHE", "LICENSE-UNICODE"),
             ),
         ]
+        dictionary = self._dependency(
+            "flower-dictionary", "0.1.0", "MIT AND Unicode-3.0 AND CC-BY-SA-4.0",
+        )
+        dictionary_dir = Path(dictionary["manifest_path"]).parent
+        # Synthetic dependency manifest lives at the fixture data root.
+        shutil.copyfile(dictionary_dir / "Cargo.toml", self.repo / "Cargo.toml")
+        dictionary["manifest_path"] = str(self.repo / "Cargo.toml")
+        (self.repo / "licenses").mkdir()
+        for name in ("UNICODE-3.0.txt", "CC-BY-SA-4.0.txt"):
+            shutil.copyfile(source_root / "licenses" / name, self.repo / "licenses" / name)
+        self.dependencies.append(dictionary)
         self.metadata = self._metadata("0.4.7")
 
     def _dependency(
@@ -342,11 +471,11 @@ class PackageFixture:
             "LICENSE-MIT": MIT_TEXT,
             "LICENSE-APACHE": APACHE_TEXT,
             "UNLICENSE": UNLICENSE_TEXT,
-            "LICENSE-UNICODE": UNICODE_TEXT,
+            "LICENSE-UNICODE": unicode_text(),
         }
         for file_name in file_names:
-            (directory / file_name).write_text(
-                texts[file_name], encoding="utf-8"
+            (directory / file_name).write_bytes(
+                texts[file_name].encode("utf-8")
             )
         package_id = f"registry+fixture#{name}@{version}"
         return {
@@ -578,16 +707,17 @@ class IscLicenseTests(unittest.TestCase):
 
 class CategoryBundleTests(unittest.TestCase):
     def setUp(self):
-        self.payload, self.record = flower_package._category_bundle(REPO_ROOT)
+        self.dictionary_root = dictionary_root()
+        self.payload, self.record = flower_package._category_bundle(self.dictionary_root)
         for name in ("data/pinyin/base_lexicon.tsv", "data/pinyin/everyday_phrases.tsv",
                      "data/pinyin/phrases/phrase_lexicon.tsv"):
-            self.payload[name] = (REPO_ROOT / name).read_bytes()
+            self.payload[name] = (self.dictionary_root / name).read_bytes()
 
     def test_exact_runtime_allowlist_and_unique_union(self):
         self.assertEqual(len(flower_package.CATEGORY_TABLES), 13)
         self.assertEqual(len(flower_package.CATEGORY_FILES), 22)
-        self.assertEqual(self.record["global_unique_pairs"], 91458)
-        self.assertEqual(self.record["additional_to_default"], 80722)
+        self.assertEqual(self.record["global_unique_pairs"], 91409)
+        self.assertEqual(self.record["additional_to_default"], 80667)
         self.assertFalse(any("provenance" in p or "rejected" in p for p in self.record["paths"]))
         self.assertEqual(self.record["paths"], sorted(flower_package.CATEGORY_FILES))
 
@@ -596,10 +726,10 @@ class CategoryBundleTests(unittest.TestCase):
             with self.subTest(path=path):
                 original = self.payload.pop(path)
                 with self.assertRaises(flower_package.PackagingError):
-                    flower_package._verify_category_payload(self.payload, REPO_ROOT)
+                    flower_package._verify_category_payload(self.payload, REPO_ROOT, dictionary_root=self.dictionary_root)
                 self.payload[path] = original + b"tamper"
                 with self.assertRaises(flower_package.PackagingError):
-                    flower_package._verify_category_payload(self.payload, REPO_ROOT)
+                    flower_package._verify_category_payload(self.payload, REPO_ROOT, dictionary_root=self.dictionary_root)
                 self.payload[path] = original
 
     def test_rehashed_noncanonical_records_fail(self):
@@ -619,7 +749,7 @@ class CategoryBundleTests(unittest.TestCase):
                     bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
                 self.payload[manifest_path] = json.dumps(manifest).encode()
                 with self.assertRaisesRegex(flower_package.PackagingError, "可信快照"):
-                    flower_package._verify_category_payload(self.payload, REPO_ROOT)
+                    flower_package._verify_category_payload(self.payload, REPO_ROOT, dictionary_root=self.dictionary_root)
 
     def test_rehashed_empty_tables_and_zero_statistics_cannot_self_authorize(self):
         prefix = flower_package.CATEGORY_PREFIX
@@ -637,7 +767,7 @@ class CategoryBundleTests(unittest.TestCase):
             bytes=len(data), lines=len(data.splitlines()), sha256=hashlib.sha256(data).hexdigest())
         self.payload[prefix + "manifest.json"] = json.dumps(manifest).encode()
         with self.assertRaisesRegex(flower_package.PackagingError, "可信快照"):
-            flower_package._verify_category_payload(self.payload, REPO_ROOT)
+            flower_package._verify_category_payload(self.payload, REPO_ROOT, dictionary_root=self.dictionary_root)
 
     def test_rehashed_unsupported_syllables_fail_pin_and_syllable_guard(self):
         prefix = flower_package.CATEGORY_PREFIX
@@ -650,17 +780,17 @@ class CategoryBundleTests(unittest.TestCase):
         manifest_bytes = json.dumps(manifest).encode()
         self.payload[prefix + "manifest.json"] = manifest_bytes
         with self.assertRaisesRegex(flower_package.PackagingError, "可信快照"):
-            flower_package._verify_category_payload(self.payload, REPO_ROOT)
+            flower_package._verify_category_payload(self.payload, REPO_ROOT, dictionary_root=self.dictionary_root)
         # Even an explicitly repinned future snapshot must pass the syllable guard.
         with mock.patch.object(flower_package, "CATEGORY_MANIFEST_SHA256",
                                hashlib.sha256(manifest_bytes).hexdigest()):
             with self.assertRaisesRegex(flower_package.PackagingError, "不规范"):
-                flower_package._verify_category_payload(self.payload, REPO_ROOT)
+                flower_package._verify_category_payload(self.payload, REPO_ROOT, dictionary_root=self.dictionary_root)
 
     def test_base_syllable_keys_require_pinned_bytes(self):
         self.payload["data/pinyin/base_lexicon.tsv"] += b"zzzz\t" + "字".encode() + b"\t1\n"
         with self.assertRaisesRegex(flower_package.PackagingError, "base 音节来源摘要"):
-            flower_package._verify_category_payload(self.payload, REPO_ROOT)
+            flower_package._verify_category_payload(self.payload, REPO_ROOT, dictionary_root=self.dictionary_root)
 
     def test_forged_manifest_paths_sources_and_statistics_fail(self):
         path = flower_package.CATEGORY_PREFIX + "manifest.json"
@@ -675,7 +805,7 @@ class CategoryBundleTests(unittest.TestCase):
             mutate(manifest)
             self.payload[path] = json.dumps(manifest).encode()
             with self.assertRaises(flower_package.PackagingError):
-                flower_package._verify_category_payload(self.payload, REPO_ROOT)
+                flower_package._verify_category_payload(self.payload, REPO_ROOT, dictionary_root=self.dictionary_root)
 
 
 class PackageTests(unittest.TestCase):
@@ -902,7 +1032,7 @@ class PackageTests(unittest.TestCase):
                     flower_package._everyday_bundle(self.fixture.repo)
         path.write_bytes(original)
         payload, record = flower_package._everyday_bundle(self.fixture.repo)
-        self.assertEqual(record["pairs"], 155)
+        self.assertEqual(record["pairs"], 803)
         self.assertEqual(record["sha256"], hashlib.sha256(original).hexdigest())
         self.assertIn(record["notice_path"], payload)
         path.unlink()
@@ -994,6 +1124,7 @@ class PackageTests(unittest.TestCase):
                 "cargo",
                 "metadata",
                 "--locked",
+                "--offline",
                 "--format-version",
                 "1",
                 "--filter-platform",

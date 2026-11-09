@@ -48,8 +48,9 @@ dependencies = [
 
 [[package]]
 name = "flower"
-version = "0.4.19"
+version = "0.4.20"
 dependencies = [
+ "flower-dictionary",
  "ort",
  "ort-sys",
  "serde",
@@ -59,6 +60,12 @@ dependencies = [
  "windows",
  "windows-core",
 ]
+
+[[package]]
+name = "flower-dictionary"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b7e0eed72e32737ed72ddc83d57b69128f141d71d932edd210d4d9e6b9fc634"
 
 [[package]]
 name = "generic-array"

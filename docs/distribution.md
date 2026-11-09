@@ -1,13 +1,13 @@
 # Flower Windows x64 分发与使用
 
-Flower 支持 Windows 10/11 x64。当前源码版本为 0.4.19，提供离线 EXE 测试安装器与
+Flower 支持 Windows 10/11 x64。当前源码版本为 0.4.20，提供离线 EXE 测试安装器与
 ZIP 包；测试包尚未签名，校验哈希不等于验证发布者身份。不支持 x86 或 ARM64 宿主。
 
 ## 安装、启用与升级
 
 1. 校验下载文件旁的 `.sha256`。例如：
    ```powershell
-    Get-FileHash .\flower-0.4.19-windows-x64-setup.exe -Algorithm SHA256
+    Get-FileHash .\flower-0.4.20-windows-x64-setup.exe -Algorithm SHA256
    ```
 2. EXE 安装器请求管理员权限，仅进行机器级安装与注册，不更改默认输入法。
 3. 在普通用户桌面从开始菜单运行“启动 Flower”，再按 `Win + Space`
@@ -106,7 +106,7 @@ ZIP 本身不提权。校验外部哈希和包内 `SHA256SUMS` 后，将文件�
 包含失败与控制用例，不把可达率当成自动纠正率。
 
 0.4.7起只提供内置模型的完整版本，文件名不再带ai：
-`flower-0.4.19-windows-x64-setup.exe` 或 `flower-0.4.19-windows-x64.zip`。
+`flower-0.4.20-windows-x64-setup.exe` 或 `flower-0.4.20-windows-x64.zip`。
 包中固定附带约115 MB的模型、运行库和说明，不再另生成普通轻量版。
 升级仍需先安全卸载旧版，不要覆盖正在使用的DLL；旧版归档保持不变。
 
@@ -114,7 +114,7 @@ ZIP 本身不提权。校验外部哈希和包内 `SHA256SUMS` 后，将文件�
 旧配置中明确保存的关闭值仍会保留；旧版未见建议时请先确认该开关，
 修改并保存后重新切换到Flower生效。模型缺失、校验失败或推理未就绪时，
 继续使用原有词库输入，不回退到联网服务，也不在后台下载组件。
-开启步骤：开始菜单打开“Flower 设置”，确认标题版本为0.4.19；
+开启步骤：开始菜单打开“Flower 设置”，确认标题版本为0.4.20；
 勾选“离线 AI 纠错”，点击保存，
 再用Win+Space切走并切回Flower。设置版本仅代表设置程序，不单独证明宿主已换用新DLL。
 已交付0.4.15包曾在候选窗状态前显示DLL版本；0.4.16按用户要求取消此前缀，
@@ -291,18 +291,27 @@ Edge、记事本和自建测试文件的重命名可用同一句比较；不要�
 默认核心词组为 66,893 条词音映射，另有 12,165 条默认不加载的专名扩展。
 0.4.13另默认内置13张分类表：THUOCL的IT、动物、财经、汽车、成语、地名、
 饮食、法律、历史名人、医学、诗词11类，以及CC-CEDICT词级补充和儿化表。
-这些表合并去重为91,458个词对，相对原默认净增80,722个；各分类有重合，不能相加。
+本版这些表合并去重为91,409个词对，相对新的基础/核心/人工短语基线补充80,667个；
+各分类有重合，不能相加。0.4.20人工表扩充后，生成器将补充表内49个重合词对去重，
+这些词仍由人工表提供，没有丢失词对；默认全部字词读音对从200,591增至201,109。
 “法拉利、麦当劳、微信”等不再依赖手工开启旧专名文件；新增表也补入其中已有的来源词。
 儿化表627个词对使用来源明确的末尾 `r`，如 `yidianr → 一点儿`、`wanr → 玩儿`。
 原DF、读音来源和未获可靠读音的记录保留在源码审计报告；缺多音词读音时不猜测。
 运行目录 `data/pinyin/categories/` 提供分类表、manifest、coverage及NOTICE。
 THUOCL保留MIT，CEDICT派生部分保留CC BY-SA 4.0，Unihan和其他来源各自许可随包。
 新增排名值有明确人工映射，不能将跨语料DF视为全局词频；个人选择顺序仍优先。
-0.4.4 另附 155 条项目人工常用短语（其中20对与核心重合，净新增135对），
-独立采用 MIT 许可，统一人工权重不代表语料统计，不计入上述 CC-CEDICT 数字。
+0.4.20将独立项目人工短语从155条扩至803条，新增648条，其中518条此前未在
+默认词库的任何表中收录。覆盖网络用语、社交回复、视频游戏、数字生活、
+口头沟通、工作学习及日常办事；例如“情绪价值、搭子、显眼包、绷不住、
+绝绝子、社恐、嘴替、能举个例子吗、别给自己压力”。
+独立采用 MIT 许可，统一人工权重100不代表语料统计，不计入上述 CC-CEDICT 数字；
+不改变普通选词每次相邻前移一位，也不保证所有同音或缩写词都排首项。
 全部接入全拼、首字母及混输索引，例如 `wan → 我爱你`、`bzd → 不知道`、
 `wsh → 晚上好`。`wan` 同时是合法全拼，仍优先显示“晚、万”等全拼候选，
 “我爱你”可继续翻页查找，不以缩写删除或替换正常全拼结果。
+新版品牌PNG与多尺寸ICO同步更新，DLL、两个工具和安装器均使用新图标。
+Windows可能缓存旧快捷方式图标；包内资源已更新不等于现有桌面缓存立即刷新，
+不为刷新图标而自动删除缓存或重启Explorer。
 0.4.0 使用固定 jieba 字典的文字频率改善读音档内排序，保留优先读音与全部生僻候选；
 文字频率不是多音字各个读音的真实使用频率，不将次读音因文字高频提升至常用读音之前。
 原 MVP 演示词条仍随源码/包供审计，但不再覆盖运行表的真实数据权重。
@@ -320,25 +329,76 @@ THUOCL保留MIT，CEDICT派生部分保留CC BY-SA 4.0，Unihan和其他来源�
 
 无参数运行 `flower-settings` 打开窗口，可调整候选页大小、主题、专业词库和学习开关。
 用户词典位于 `%LOCALAPPDATA%\Flower\dictionary.json`，不写入安装目录。
+导入、导出目前使用命令行；设置窗口的专业词库下拉框和“启用选中专业词库”
+用于启停已导入的词库，不是导入按钮。无需管理员权限，也不需要重新安装。
+
+### 准备词条文件
+
 词条 TSV 为 UTF-8 三列：规范分音拼音、文字、正整数权重；一字一音节，例如：
 
 ```text
 ni'hao	你好	1000
 ```
 
+列之间必须是真正的 Tab，不是空格，也不是两个字符`\t`；不要添加表头。
+拼音小写、去声调、用英文单引号分音，`ü`写作`v`。权重影响候选排序，但不保证置顶，
+已有个人选词顺序仍优先。搜狗`.scel`、其他输入法专用格式和普通散文不能直接导入，
+需要先转换成上述格式，不要只改扩展名。
+
+在PowerShell中可生成一个UTF-8无BOM示例（`$words`应指向尚不存在的新文件）：
+
 ```powershell
-flower-settings dictionary status
-flower-settings dictionary import "$env:USERPROFILE\Documents\words.tsv"
-flower-settings dictionary export "$env:USERPROFILE\Documents\words-export.tsv"
-flower-settings dictionary remove "ni'hao" "你好"
-flower-settings dictionary import "$env:USERPROFILE\Documents\terms.tsv" --domain "专业词"
-flower-settings dictionary domain "专业词" on
-flower-settings dictionary domain "专业词" off
-flower-settings dictionary export "$env:USERPROFILE\Documents\terms-export.tsv" --domain "专业词"
-flower-settings dictionary learning on
-flower-settings dictionary learning off
-flower-settings dictionary clear-learning
-flower-settings unicode U+20BB7
+$words = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'flower-words.tsv'
+if (Test-Path -LiteralPath $words) { throw '示例文件已存在，请换一个文件名' }
+$rows = @("qing'xu'jia'zhi`t情绪价值`t1000", "da'zi`t搭子`t1000")
+[IO.File]::WriteAllText($words, ($rows -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+```
+
+### 导入、导出个人词条
+
+找到`flower-settings.exe`所在的实际安装版本文件夹，在该文件夹打开PowerShell。
+可从“Flower 设置”开始菜单快捷方式的属性查看目标位置；程序没有默认加入PATH，
+所以下面使用`.\flower-settings.exe`，不要假定它在Program Files根目录。
+文件路径可替换为自己的TSV，包含空格时保留引号。
+
+```powershell
+$words = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'flower-words.tsv'
+.\flower-settings.exe dictionary status
+.\flower-settings.exe dictionary import "$words"
+.\flower-settings.exe dictionary export "$env:USERPROFILE\Documents\words-export.tsv"
+.\flower-settings.exe dictionary remove "qing'xu'jia'zhi" "情绪价值"
+```
+
+不带`--domain`导入的是始终参与查词的手工个人词条；重复导入按相同拼音与文字合并，
+新文件中的权重替换该手工词对的旧值，不替换整份词典。
+不带`--domain`导出的是当前可用的用户词库快照：手工个人词条、自动记忆词及已启用专业词库，
+同拼音与文字保留最高权重；不包含内置词库、停用专业词库、启停状态或排序历史。
+重新作为个人词条导入会合并成手工词条，不会恢复原来的专业分组或学习历史，
+因此TSV导出不等于整份用户数据备份；需要分别保留某个专业库时使用下面的`--domain`导出。
+
+### 导入专业词库并按需启用
+
+专业词库与个人词条使用相同TSV格式。以下假定已准备好`terms.tsv`：
+
+```powershell
+.\flower-settings.exe dictionary import "$env:USERPROFILE\Documents\terms.tsv" --domain "专业词"
+.\flower-settings.exe dictionary domain "专业词" on
+.\flower-settings.exe dictionary domain "专业词" off
+.\flower-settings.exe dictionary export "$env:USERPROFILE\Documents\terms-export.tsv" --domain "专业词"
+```
+
+新专业词库默认停用；同名再次导入合并词条，并保留其原启停状态。
+也可打开“Flower 设置”，在专业词库下拉框选中“专业词”，勾选或取消
+“启用选中专业词库（立即保存）”。停用不删除数据，之后仍可导出或重新启用。
+命令完成或修改启停后，用`Win + Space`切走再切回Flower以载入新快照。
+
+### 本地记忆与其他命令
+
+```powershell
+.\flower-settings.exe dictionary learning on
+.\flower-settings.exe dictionary learning off
+.\flower-settings.exe dictionary clear-learning
+.\flower-settings.exe unicode U+20BB7
 ```
 
 导入错行整体拒绝；专业词库新导入默认停用，必须明确启用。导出使用新文件，不覆盖
@@ -388,11 +448,18 @@ Unicode 入口仅向标准输出打印一个合法非控制字符，无换行，
 EXE 另需 Inno Setup 6；这些是开发依赖，目标机器不需要 Rust/Python。
 
 ```powershell
-python scripts/build_lexicon.py --check
-python scripts/build_phrases.py --check
-python scripts/package.py
-python scripts/installer.py --package dist/flower-0.4.3-windows-x64.zip
+python -m unittest scripts.test_package scripts.test_installer
+python scripts/package.py --ai-assets "<固定完整AI资产目录>" --output-dir "<新输出目录>"
+python scripts/installer.py --package "<新ZIP路径>" --output-dir "<新输出目录>"
 ```
+
+公开字词数据现在来自精确锁定的`flower-dictionary`依赖，不在Flower仓库重复维护。
+组包通过Cargo metadata的直接依赖package ID找到实际manifest目录，支持registry及明确的开发path，
+不会扫描缓存、猜兄弟目录或在缺依赖时回退旧数据树。`Cargo.lock`和原数据可信摘要仍须匹配。
+公开原料、重建和词库生成测试位于独立的`flower-dictionary`仓库；
+在该仓库执行`python scripts/build_lexicon.py --check`、`build_phrases.py --check`
+和`build_categories.py --check`，本输入法保留真实引擎查词、提交和分发验证。
+crate发布归档提供消费/验包所需数据及许可，不含私人词典、AI模型或所有重建大原料。
 
 可以用 `--output-dir` 指定新的输出目录、`--iscc` 指定 Inno 编译器。
 组包使用 `--locked`、真实 release Cargo artifact，检查 AMD64 PE32+、DLL 导出、

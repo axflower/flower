@@ -5,6 +5,14 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 
 # Flower 词库数据流程
 
+## 独立词库权威边界
+
+公开词表、来源许可、覆盖、生成器及其测试已迁至独立的 `flower-dictionary` crate/repository；本技能下方 `data/pinyin/`、`scripts/build_lexicon.py`、`build_phrases.py`、`build_categories.py` 与对应生成测试路径现在相对于词库仓库，不应在Flower重建第二份。Flower保留引擎、排序、TSF、用户数据和分发消费者，详见 `design/dictionary-crate-extraction.md`、`docs/dictionary-crate.md`。
+
+Flower通过锁定版本的直接依赖消费；Python资产根应由Cargo metadata根manifest身份及直接依赖package ID定位，支持rename，缺失/歧义/错误版本拒绝，不猜兄弟路径或扫描缓存。开发path不等于registry发布完成；实际上传须正常认证并核验返回及registry来源，不读取/打印令牌，不以dry-run冒充发布。crate只带消费/验包子集，但原jieba频次校验需要dict.txt与固定生成器，不能因移动来源而删门禁。完整许可按实际标准正文校验，新增合法变体先读全文再窄增可信摘要，标题或章节占位不得算完整许可。
+
+静态数据crate不应依赖Flower候选类型、Windows、私有词典或AI模型。all/default表明确区分可选专名/MVP，原拼接字节与词对并集、人工prior的可选性分别核对。公开包只包含明确白名单，完整重建大原料留源码仓库；检查真实 `.crate` 而非仅Cargo清单，改文档或源后应重固定归档并比源码身份，publish dry-run不保证已保存 `.crate` 文件被更新。
+
 先读当前 `design/adaptive-candidates.md`、`docs/distribution.md` 及 `data/pinyin/sources/manifest.json`，旧基础排序约定见 `design/input-and-installation.md`。历史设计若已不存在，不依据旧摘要恢复。以实际阶段和共享行为契约为准，不因数据量扩大就宣称整句输入或用户学习已实现。
 
 ## 来源与许可
@@ -64,7 +72,9 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 
 ## 项目人工常用短语
 
-- `data/pinyin/everyday_phrases.tsv` 是独立项目人工表，MIT、人工权重，不冒称上游语料统计或扩大CC-CEDICT core/proper数字。当前155条，与core重合20净增135，新增规范词对归日常层；重合项保留最高权重不累加。
+- `data/pinyin/everyday_phrases.tsv` 是独立项目人工表，MIT、人工权重，不冒称上游语料统计或扩大CC-CEDICT core/proper数字。当前数量及字节锁定以同目录说明和打包可信常量为准；新增规范词对归日常层，重合项保留最高权重不累加。
+- 扩人工表还会改变分类生成器的baseline：运行官方离线生成入口更新coverage/manifest、补充表去重及provenance，不能只改EVERYDAY_COUNT/HASH或放宽分类摘要校验。部分CEDICT补充词会因已在人工表而从派生表移出；按所有默认表的并集比较增减，确认没有丢失旧词对，区分人工新增数、相对旧默认净新增数与相对新baseline的分类增量。同步可信category manifest摘要与相应边界测试。
+- 人工拼音不能只靠“音节合法、字数相等”证明对应正确；对地名谐音网络词、多音字和易错字另做独立词义读音核对。代表项须以规范reading和真实raw完整消费串全拼/简拼/混拼普通选择，排除AI/SP标记；扩词可能产生新的合法组合，使固定普通排名变化，先记录具体竞争词和数据原因再更新测量基线，不为守旧位次篡改词频。
 - 修改人工表须同步说明、打包固定数量/hash及manifest record，TSV以 `.gitattributes -text` 锁定字节。所有上游base/core/proper保持不可变；builtin、initial、mixed索引一致，自定义fixture不污染。
 - 包新增文件必须同步 `scripts/installer.py` 固定白名单与必需项，不只更新package生成器；不放宽任意路径。来源、MIT正文路径、独立数量/hash、SHA256SUMS和实际DLL嵌入均核验。
 - 全部条目exact lookup和initial session翻页提交与代表项full-session提交是不同证据，不扩大表述。缩写与合法全拼碰撞如wan，保留全拼层并验证后续页的我爱你，不把可达冒称首屏。
