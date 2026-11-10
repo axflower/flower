@@ -3,6 +3,7 @@ data/pinyin/sources/* -text
 data/pinyin/base_lexicon.tsv -text
 data/pinyin/everyday_phrases.tsv -text
 data/ai/** -text
+data/chinese_conversion/** -text
 data/pinyin/coverage.json -text
 data/pinyin/phrases/** -text
 data/pinyin/categories/** -text

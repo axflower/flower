@@ -28,6 +28,8 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 ## 包与安装
 
+- Git词库改用`license-file`时，先核对真实Cargo source/版本与完整通知；仅对已审定固定身份、路径和正文摘要做窄支持，manifest保留真实空SPDX及NOASSERTION/本地测试状态，不伪造MIT或泛化接受任意文件。扩充词库须同步构建器与安装器的精确资产白名单、可信大小/SHA和版本化必需记录，旧包携带新资产时也须完整验证；不能信包内自签摘要。载荷上限依据实际展开量有界调整，AI子载荷上限独立保留，勿为新大表向所有历史小fixture复制巨量数据。
+
 - 校验外层 `.zip.sha256`、单顶层结构、包内 `SHA256SUMS`、manifest、三个真实 PE/导出、许可和两个 EXE 的 `--help`。
 - 图标由 `build.rs` 调用 Windows SDK `rc.exe` 嵌入。运行 `scripts/verify_windows_icons.ps1 -BinaryRoot <解压目录>`，以资源方式加载三个 PE，对照 `assets/flower.ico` 检查组图标和各尺寸图像；不得执行 DLL 导出来验证资源。
 - 品牌名称更新保持 CLSID/profile GUID 不变。旧名称安装应使用旧稳定目录的注册工具先注销，不通过放宽所有权检查或直接覆盖 registry 来改名。
@@ -147,6 +149,9 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - `tests/user_dictionary_process.rs` 的 `killed_writer_before_atomic_publish_preserves_old_bytes_and_allows_recovery` 是定向入口。此类证据只覆盖同步完成但尚未发布时的进程结束，不证明写入中途、真实磁盘满、系统崩溃或掉电耐久性；不要为扩大表述而自动执行危险注入。
 
 ## 运行期路径与原生设置视觉
+
+- 设置黑框先分清PE控制台子系统与真正cmd进程；GUI入口可用GUI子系统，CLI仅附着已有父控制台且保留重定向stdout/stderr，不AllocConsole；AI/登录静默路径仍不附着。发布验GUI PE子系统及重定向help/错误退出码，不自动启动真实用户GUI作探针。
+- 设置响应慢按点击回调、安全检查、spawn、首屏、词典加载分阶段取证；整树ACL检查是元数据成本，不等于哈希103MB模型。可把完整校验移到activation拥有的单worker，owner以非阻塞poll复核token/focus后启动，coalesce、取消/join及DLL存活守卫不可少；关闭AI也要处理完成事件。GUI初次词典读取可在首屏绘制后后台进行，加载/失败期间写控件与handler双重拒绝，保留坏文件，晚结果不作用于复用窗口。模拟延迟证明响应边界，不冒充真实用户耗时；join仍可能等待在途I/O。
 
 - Windows PowerShell 5.1的 `Split-Path`/`Join-Path` 也不能直接消费COM注册里的 `\\?\C:\...`，可能报drive为空。诊断工具须在provider操作前仅适配精确的verbatim本地盘符表示；保留原注册值用于报告，IPC身份仍取文件句柄返回的canonical路径。验证自动注册定位与显式helper两条入口，不能只用普通路径的 `-Helper` 探针替代自动定位；请求列表为空的初始化错误不算后台模型已测。
 

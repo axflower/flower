@@ -156,7 +156,18 @@ fn sentence_promotion_is_one_complete_identity_and_active_order_is_stable() {
 #[test]
 fn expanded_homophones_can_all_be_reached_and_the_last_candidate_selected() {
     let lexicon = Lexicon::builtin().unwrap();
-    let expected = lexicon.lookup("yi");
+    let mut seen = std::collections::HashSet::new();
+    // The source retains both scripts. The input surface must expose every
+    // distinct simplified output exactly once, in stable source order.
+    let expected: Vec<_> = lexicon
+        .lookup("yi")
+        .into_iter()
+        .filter_map(|mut candidate| {
+            candidate.text = flower::ChineseScript::Simplified.convert(&candidate.text);
+            seen.insert((candidate.text.clone(), candidate.comment.clone()))
+                .then_some(candidate)
+        })
+        .collect();
     assert!(expected.len() > DEFAULT_PAGE_SIZE);
     let mut session = PinyinSession::from_lexicon(lexicon, DEFAULT_PAGE_SIZE).unwrap();
     type_text(&mut session, "yi");

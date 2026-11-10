@@ -374,6 +374,139 @@ class InstallerTests(unittest.TestCase):
                 with self.assertRaises(installer.InstallerError):
                     installer.verify_package(self.archive)
 
+    def test_vocabulary_presence_and_record_fail_closed(self):
+        original = self.archive.read_bytes()
+        root = "flower-0.4.7-windows-x64/"
+        mutations = [
+            lambda data: data.update({root + installer.pack.VOCABULARY_PREFIX + "words.txt": b"x"}),
+            lambda data: data.update({root + installer.pack.VOCABULARY_PREFIX + "expanded.tsv": b"x"}),
+        ]
+        def forged_record(data):
+            manifest = json.loads(data[root + "manifest.json"])
+            manifest["expanded_vocabulary"] = {}
+            data[root + "manifest.json"] = json.dumps(manifest).encode()
+        mutations.append(forged_record)
+        for mutate in mutations:
+            self.archive.write_bytes(original)
+            self.rewrite(mutate, rehash_payload=True)
+            with self.subTest(mutate=mutate), self.assertRaises(installer.InstallerError):
+                installer.verify_package(self.archive)
+
+    def test_complete_vocabulary_verified_and_record_tampering_rejected(self):
+        from scripts.test_package import dictionary_root
+        payload, record = flower_package._vocabulary_bundle(dictionary_root())
+        root = "flower-0.4.7-windows-x64/"
+        def attach(data):
+            data.update({root + path: value for path, value in payload.items()})
+            manifest = json.loads(data[root + "manifest.json"])
+            manifest["expanded_vocabulary"] = record
+            data[root + "manifest.json"] = json.dumps(manifest).encode()
+        self.rewrite(attach, rehash_payload=True)
+        verified = installer.verify_package(self.archive)
+        self.assertTrue(installer.pack.VOCABULARY_FILES.issubset(verified.payload))
+        def tamper(data):
+            manifest = json.loads(data[root + "manifest.json"])
+            manifest["expanded_vocabulary"]["unique_entries"] = 1
+            data[root + "manifest.json"] = json.dumps(manifest).encode()
+        self.rewrite(tamper, rehash_payload=True)
+        with self.assertRaisesRegex(installer.InstallerError, "记录"):
+            installer.verify_package(self.archive)
+
+    def test_new_release_requires_vocabulary(self):
+        old_root = "flower-0.4.7-windows-x64/"
+        new_root = "flower-0.4.21-windows-x64/"
+        new_path = self.archive.with_name(self.archive.name.replace("0.4.7", "0.4.21"))
+        self.archive.rename(new_path)
+        self.archive = new_path
+        def upgrade(data):
+            manifest = json.loads(data[old_root + "manifest.json"])
+            manifest["version"] = "0.4.21"
+            data[old_root + "manifest.json"] = json.dumps(manifest).encode()
+            renamed = {name.replace(old_root, new_root, 1): value for name, value in data.items()}
+            data.clear()
+            data.update(renamed)
+        self.rewrite(upgrade, rehash_payload=True)
+        with self.assertRaisesRegex(installer.InstallerError, "扩充词库"):
+            installer.verify_package(self.archive)
+
+    def test_audit_release_integrity_and_manifest_cannot_self_sign(self):
+        import io
+        pack = installer.pack
+        values = {name: b"trusted" for name in pack.VOCABULARY_IDENTITIES}
+        identities = {name: (len(value), hashlib.sha256(value).hexdigest()) for name, value in values.items()}
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as target:
+            for name, value in values.items():
+                target.writestr(name, value)
+        conversion = {p: (installer.REPO / p).read_bytes() for p in pack.CONVERSION_FILES}
+        old_root = "flower-0.4.7-windows-x64/"
+        root = "flower-0.4.22-windows-x64/"
+        new_path = self.archive.with_name(self.archive.name.replace("0.4.7", "0.4.22"))
+        self.archive.rename(new_path)
+        self.archive = new_path
+        with mock.patch.object(pack, "VOCABULARY_IDENTITIES", identities):
+            audit = {pack.VOCABULARY_ARCHIVE: buffer.getvalue()}
+            record = pack._verify_vocabulary_archive(audit)
+            conversion_record = pack._verify_conversion_payload(conversion)
+            def upgrade(data):
+                manifest = json.loads(data[old_root + "manifest.json"])
+                manifest.update(version="0.4.22", expanded_vocabulary=record,
+                                chinese_conversion=conversion_record)
+                data[old_root + "manifest.json"] = json.dumps(manifest).encode()
+                renamed = {name.replace(old_root, root, 1): value for name, value in data.items()}
+                data.clear()
+                data.update(renamed)
+                data.update({root + p: v for p, v in {**audit, **conversion}.items()})
+            self.rewrite(upgrade, rehash_payload=True)
+            verified = installer.verify_package(self.archive)
+            self.assertEqual(verified.payload[pack.VOCABULARY_ARCHIVE], buffer.getvalue())
+            self.assertFalse(pack.VOCABULARY_FILES & verified.payload.keys())
+            original = self.archive.read_bytes()
+            def manifest_change(data, key):
+                manifest = json.loads(data[root + "manifest.json"])
+                manifest[key] = {}
+                data[root + "manifest.json"] = json.dumps(manifest).encode()
+            mutations = [
+                lambda data: data.pop(root + pack.VOCABULARY_ARCHIVE),
+                lambda data: data.update({root + pack.VOCABULARY_PREFIX + "expanded.tsv": b"trusted"}),
+                lambda data: manifest_change(data, "expanded_vocabulary"),
+                lambda data: manifest_change(data, "chinese_conversion"),
+                lambda data: data.update({root + pack.CONVERSION_PREFIX + "STCharacters.txt": b"changed"}),
+                lambda data: data.pop(root + pack.CONVERSION_PREFIX + "NOTICE.md"),
+                lambda data: data.update({root + pack.CONVERSION_PREFIX + "extra.txt": b"x"}),
+                lambda data: data.update({root + pack.VOCABULARY_ARCHIVE: buffer.getvalue()[:-30]}),
+            ]
+            for mutate in mutations:
+                self.archive.write_bytes(original)
+                self.rewrite(mutate, rehash_payload=True)
+                with self.subTest(mutate=mutate), self.assertRaises(installer.InstallerError):
+                    installer.verify_package(self.archive)
+            self.archive.write_bytes(original)
+            def raw_only(data):
+                data.pop(root + pack.VOCABULARY_ARCHIVE)
+                data.update({root + pack.VOCABULARY_PREFIX + name: value for name, value in values.items()})
+                manifest = json.loads(data[root + "manifest.json"])
+                manifest["expanded_vocabulary"] = pack._verify_vocabulary_payload({
+                    pack.VOCABULARY_PREFIX + name: value for name, value in values.items()
+                })
+                data[root + "manifest.json"] = json.dumps(manifest).encode()
+            self.rewrite(raw_only, rehash_payload=True)
+            with self.assertRaises(installer.InstallerError):
+                installer.verify_package(self.archive)
+            legacy_root = "flower-0.4.21-windows-x64/"
+            legacy_path = self.archive.with_name(self.archive.name.replace("0.4.22", "0.4.21"))
+            self.archive.rename(legacy_path)
+            self.archive = legacy_path
+            def legacy(data):
+                manifest = json.loads(data[root + "manifest.json"])
+                manifest["version"] = "0.4.21"
+                data[root + "manifest.json"] = json.dumps(manifest).encode()
+                renamed = {name.replace(root, legacy_root, 1): value for name, value in data.items()}
+                data.clear()
+                data.update(renamed)
+            self.rewrite(legacy, rehash_payload=True)
+            self.assertTrue(pack.VOCABULARY_FILES <= installer.verify_package(self.archive).payload.keys())
+
     def test_case_insensitive_collision_is_rejected(self):
         self.rewrite(lambda data: data.update({
             "flower-0.4.7-windows-x64/readme.MD": b"duplicate",

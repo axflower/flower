@@ -36,7 +36,8 @@ pub fn map_windows_virtual_key(virtual_key: u32, modifiers: Modifiers) -> Option
         0xDC => Key::Char(if modifiers.shift { '|' } else { '\\' }),
         0xDD => Key::Char(if modifiers.shift { '}' } else { ']' }),
         0xBD if modifiers.shift => Key::Char('_'),
-        0xBB | 0x6B => Key::PageDown,            // =/+ and numpad +
+        0xBB if modifiers.shift => Key::Char('+'),
+        0xBB | 0x6B => Key::PageDown,            // = and numpad +
         0xBD if !modifiers.shift => Key::PageUp, // - but not _
         0x6D => Key::PageUp,                     // numpad -
         VK_BACK => Key::Backspace,

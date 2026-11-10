@@ -3,6 +3,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // Store the exact source dictionary once in a compact representation in
+    // each consumer. The runtime restores and verifies it before using the
+    // unchanged parser; this never removes words or changes ranking inputs.
+    use sha2::{Digest, Sha256};
+    let source = flower_dict::DEFAULT_TSV.as_bytes();
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(source, 9);
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("builtin-dictionary.zlib"), &compressed)
+        .expect("write compressed builtin dictionary");
+    std::fs::write(
+        output.join("builtin-dictionary.rs"),
+        format!(
+            "const BUILTIN_SIZE: usize = {};\nconst BUILTIN_SHA256: [u8; 32] = {:?};\n",
+            source.len(),
+            <[u8; 32]>::from(Sha256::digest(source))
+        ),
+    )
+    .expect("write builtin dictionary identity");
     for file in [
         "assets/flower.rc",
         "assets/flower.ico",

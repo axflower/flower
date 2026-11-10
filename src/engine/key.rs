@@ -107,6 +107,14 @@ pub struct KeyEvent {
 }
 
 impl KeyEvent {
+    pub const fn is_script_toggle(self) -> bool {
+        matches!(self.key, Key::Char('f') | Key::Char('F'))
+            && self.modifiers.control
+            && self.modifiers.shift
+            && !self.modifiers.alt
+            && !self.modifiers.meta
+    }
+
     pub const fn new(key: Key, modifiers: Modifiers) -> Self {
         Self { key, modifiers }
     }
@@ -115,8 +123,8 @@ impl KeyEvent {
         Self::new(key, Modifiers::NONE)
     }
 
-    /// Control, Alt, Windows/meta, and similar shortcuts remain host-owned.
+    /// Command shortcuts remain host-owned except the exact script toggle.
     pub const fn is_passthrough(self) -> bool {
-        self.modifiers.is_command()
+        self.modifiers.is_command() && !self.is_script_toggle()
     }
 }

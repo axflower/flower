@@ -207,20 +207,29 @@ fn custom_fixture_and_overlay_do_not_pollute_builtin_project_phrases() {
 }
 
 #[test]
-fn builtin_mixed_sentence_is_on_the_first_page_without_a_sentence_entry() {
-    let lexicon = Lexicon::builtin().unwrap();
-    assert!(!lexicon
+fn builtin_and_composed_fixture_mixed_sentence_are_on_the_first_page() {
+    let builtin = Lexicon::builtin().unwrap();
+    // The expanded dictionary now contains the whole phrase. Keep a separate
+    // two-word fixture to prove composition without deleting real source data.
+    assert!(builtin
         .lookup("shenmeyisi")
         .iter()
         .any(|c| c.text == "什么意思"));
-    let mut session = PinyinSession::from_lexicon(lexicon, 9).unwrap();
-    for c in "shenmeys".chars() {
-        session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
-    }
-    assert!(session
-        .candidates_on_current_page()
+    let composed = Lexicon::from_tsv("shen'me\t什么\t1000\nyi'si\t意思\t1000").unwrap();
+    assert!(!composed
+        .lookup("shenmeyisi")
         .iter()
-        .any(|c| c.text == "什么意思" && c.comment == "shen'me'yi'si"));
+        .any(|c| c.text == "什么意思"));
+    for lexicon in [builtin, composed] {
+        let mut session = PinyinSession::from_lexicon(lexicon, 9).unwrap();
+        for c in "shenmeys".chars() {
+            session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        assert!(session
+            .candidates_on_current_page()
+            .iter()
+            .any(|c| c.text == "什么意思" && c.comment == "shen'me'yi'si"));
+    }
 }
 
 #[test]

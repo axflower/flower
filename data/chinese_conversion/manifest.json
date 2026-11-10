@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/ByVoid/OpenCC",
+  "snapshot_package": "ferrous-opencc 0.4.0",
+  "package_vcs": {
+    "git": {
+      "sha1": "bd557afbf2fd07f0bc55371159d7006629dfd935"
+    },
+    "path_in_vcs": ""
+  },
+  "license": "Apache-2.0",
+  "algorithm": "maximum-forward-match; phrases before characters; first declared value; no regional terminology",
+  "files": [
+    {
+      "path": "STCharacters.txt",
+      "size": 38602,
+      "sha256": "ab3eda5e4e7c2eec9074213d5cf7acf6da93dd0ecd2a182ef716af7c8af4f949"
+    },
+    {
+      "path": "STPhrases.txt",
+      "size": 1056281,
+      "sha256": "b17bbee4442b8a7f9f2678baa93baaccca5afffba14874b8cf3d129d5a6a0add"
+    },
+    {
+      "path": "TSCharacters.txt",
+      "size": 39009,
+      "sha256": "9d148f979257bdf51f2bf69bf5005a5e3876d89233a8a0f525246cb540e2f6fc"
+    },
+    {
+      "path": "TSPhrases.txt",
+      "size": 5710,
+      "sha256": "3b381aa65de657de807136f00d008a00697c6723ac90002170332c7b3add8ce5"
+    }
+  ]
+}

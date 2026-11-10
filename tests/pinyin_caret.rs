@@ -92,7 +92,6 @@ fn candidate_navigation_and_aliases_restore_end_even_when_saturated() {
         Key::PageUp,
         Key::PageDown,
         Key::Char('-'),
-        Key::Char('+'),
         Key::Char('='),
     ] {
         let mut s = session();
@@ -100,6 +99,15 @@ fn candidate_navigation_and_aliases_restore_end_even_when_saturated() {
         press(&mut s, Key::Left);
         assert_eq!(press(&mut s, key).preedit_caret_utf16, Some(2));
     }
+    // '+' is a literal symbol now, not a paging alias. It commits once even
+    // when the raw caret is internal, and leaves no active composition.
+    let mut symbol = session();
+    type_text(&mut symbol, "ni");
+    press(&mut symbol, Key::Left);
+    let update = press(&mut symbol, Key::Char('+'));
+    assert_eq!(update.commit.as_deref(), Some("你+"));
+    assert!(!update.is_composing());
+    assert_eq!(update.preedit_caret_utf16, Some(0));
     let mut s = session();
     type_text(&mut s, "ni");
     press(&mut s, Key::Left);

@@ -93,7 +93,7 @@ fn quotes_are_independent_survive_clear_and_preview_is_pure() {
 }
 
 #[test]
-fn shortcuts_and_undefined_symbols_do_not_change_state() {
+fn shortcuts_stay_host_owned_and_ascii_symbols_commit() {
     let mut r = router();
     type_text(&mut r, "ni");
     for modifiers in [Modifiers::CONTROL, Modifiers::ALT, Modifiers::META] {
@@ -107,8 +107,16 @@ fn shortcuts_and_undefined_symbols_do_not_change_state() {
         }
     }
     for c in ['@', '#', '$', '%', '&', '*', '{', '}', '|', '`'] {
-        assert!(!press(&mut r, c).handled);
-        assert_eq!(r.preedit(), "ni");
+        let mut symbols = router();
+        type_text(&mut symbols, "ni");
+        let update = press(&mut symbols, c);
+        assert!(update.handled);
+        assert_eq!(update.commit, Some(format!("你{c}")));
+        assert!(!symbols.session().is_composing());
+        assert!(symbols
+            .pending_learning()
+            .iter()
+            .all(|event| event.text == "你"));
     }
     assert_eq!(press(&mut r, '"').commit.as_deref(), Some("你“"));
 }
@@ -122,17 +130,28 @@ fn shifted_digits_map_before_candidate_selection() {
         let mut direct = router();
         type_text(&mut actual, "nihao");
         type_text(&mut direct, "nihao");
+        let actual_update = actual.process_key(event).unwrap();
+        let direct_update = direct
+            .process_key(KeyEvent::new(Key::Char(digit), Modifiers::SHIFT))
+            .unwrap();
+        assert_eq!(actual_update, direct_update);
+        let output = match symbol {
+            ')' => "）".to_owned(),
+            '!' => "！".to_owned(),
+            '^' => "……".to_owned(),
+            '(' => "（".to_owned(),
+            symbol => symbol.to_string(),
+        };
+        assert!(!actual.session().is_composing());
+        assert_eq!(actual_update.commit, Some(format!("你好{output}")));
         assert_eq!(
-            actual.process_key(event).unwrap(),
             direct
-                .process_key(KeyEvent::new(Key::Char(digit), Modifiers::SHIFT))
-                .unwrap()
+                .pending_learning()
+                .iter()
+                .map(|event| event.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["你好"]
         );
-        if "@#$%&*".contains(symbol) {
-            assert_eq!(actual.preedit(), "nihao");
-        } else {
-            assert!(!actual.session().is_composing());
-        }
     }
 }
 
@@ -173,7 +192,7 @@ fn oem_shift_branches_and_existing_paging_keys() {
     }
     assert_eq!(
         map_windows_virtual_key(0xBB, Modifiers::SHIFT).unwrap().key,
-        Key::PageDown
+        Key::Char('+')
     );
 }
 

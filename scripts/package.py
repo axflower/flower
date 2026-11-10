@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import errno
 import hashlib
+import io
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -31,7 +33,7 @@ EXPECTED_ROOT_LICENSE = "MIT OR Apache-2.0"
 EXPECTED_DLL_EXPORTS = frozenset({"DllGetClassObject", "DllCanUnloadNow"})
 SAFE_FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 SUPPORTED_LICENSE_IDS = frozenset(
-    {"MIT", "Apache-2.0", "Unlicense", "Unicode-3.0", "ISC", "CC-BY-SA-4.0"}
+    {"MIT", "Apache-2.0", "Unlicense", "Unicode-3.0", "ISC", "CC-BY-SA-4.0", "Zlib", "0BSD"}
 )
 LICENSE_FILE_PREFIXES = (
     "LICENSE",
@@ -395,6 +397,10 @@ def _classify_license_text(name: str, text: str, *, raw: bytes | None = None) ->
     classes: set[str] = set()
     # Exact original bytes: dictionary source manifests and audited unicode-ident 1.0.27.
     digest = _sha256(text.encode("utf-8") if raw is None else raw)
+    if digest == "0a54e647fe54104658b5e563c04c6f9edf251710e47bce692e0bd990a4ddaa39":
+        classes.add("Zlib")
+    if digest == "861399f8c21c042b110517e76dc6b63a2b334276c8cf17412fc3c8908ca8dc17":
+        classes.add("0BSD")
     if digest == "28a9529c7d0bb4dc51f4bf5c116a3d16ef247a052f7591466768ddf563fd1cf5":
         classes.add("CC-BY-SA-4.0")
     if digest in {
@@ -514,6 +520,143 @@ def _license_files_for_package(package: dict) -> list[Path]:
     return sorted(candidates, key=lambda path: (path.name.casefold(), path.name))
 
 
+DICTIONARY_SOURCE = "git+https://github.com/axflower/flower-dict.git?branch=main#d01e9ac5f6309e05344017ebce4680cf537854a9"
+DICTIONARY_NOTICE_SHA256 = "689de482c01fb308d0f04b9accc6875452070e2f645907f94f82609d35c82447"
+MAX_PAYLOAD = 512 * 1024 * 1024
+VOCABULARY_PREFIX = "data/pinyin/vocabulary/"
+VOCABULARY_IDENTITIES = {
+    "expanded.tsv": (59302671, "12669ecc1bda04813d5fdb9bd8196972ccbdca022f1b03050e217ae477043c34"),
+    "catalog.tsv": (31158596, "17a0aceedb52fbf2c671073178ba91befdb21927a3309d33f90f6c0f04220e9b"),
+    "coverage.json": (2900, "e9b410e6751f39d69720d67b73e9acf24962ac658e7d219db57c4fe7fc5f9b12"),
+    "unresolved.txt": (225804, "c3b1dfce035f061f4a8d7c93e8c582e31f4d537fbbbbf99d79dc2acc40ff8ac0"),
+}
+VOCABULARY_FILES = frozenset(VOCABULARY_PREFIX + name for name in VOCABULARY_IDENTITIES)
+VOCABULARY_ARCHIVE = "data/pinyin/vocabulary-audit.zip"
+CONVERSION_PREFIX = "data/chinese_conversion/"
+CONVERSION_IDENTITIES = {
+    "STCharacters.txt": (38602, "ab3eda5e4e7c2eec9074213d5cf7acf6da93dd0ecd2a182ef716af7c8af4f949"),
+    "STPhrases.txt": (1056281, "b17bbee4442b8a7f9f2678baa93baaccca5afffba14874b8cf3d129d5a6a0add"),
+    "TSCharacters.txt": (39009, "9d148f979257bdf51f2bf69bf5005a5e3876d89233a8a0f525246cb540e2f6fc"),
+    "TSPhrases.txt": (5710, "3b381aa65de657de807136f00d008a00697c6723ac90002170332c7b3add8ce5"),
+    "manifest.json": (1037, "75b251a2f216685b3fa98fd6a11339ee0318bd7984a1ab35b32f528b1a2ac343"),
+    "NOTICE.md": (804, "84cdaa9f93c1e6c354c147a59c0debf55b4080f85d46fce4d35b5690e615ad1f"),
+    "LICENSE-APACHE-2.0.txt": (11558, "1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6"),
+}
+CONVERSION_FILES = frozenset(CONVERSION_PREFIX + name for name in CONVERSION_IDENTITIES)
+
+
+def _verify_conversion_payload(payload: Mapping[str, bytes]) -> dict:
+    if {p for p in payload if p.startswith(CONVERSION_PREFIX)} != CONVERSION_FILES:
+        raise PackagingError("简繁转换文件集合不完整或包含未知路径")
+    files = {}
+    for name, (size, digest) in CONVERSION_IDENTITIES.items():
+        path = CONVERSION_PREFIX + name
+        if len(payload[path]) != size or _sha256(payload[path]) != digest:
+            raise PackagingError(f"简繁转换可信长度或摘要不匹配：{path}")
+        files[path] = {"size": size, "sha256": digest}
+    return {"files": files, "license": "Apache-2.0"}
+
+
+def _verify_vocabulary_archive(payload: Mapping[str, bytes]) -> dict:
+    if VOCABULARY_ARCHIVE not in payload or any(p.startswith(VOCABULARY_PREFIX) for p in payload):
+        raise PackagingError("审计 ZIP 缺失或同时携带原始词库")
+    data = payload[VOCABULARY_ARCHIVE]
+    limit = sum(size for size, _ in VOCABULARY_IDENTITIES.values())
+    if len(data) > limit + 65536:
+        raise PackagingError("审计 ZIP 超过固定上界")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as source:
+            entries = source.infolist()
+            if len(entries) != len(VOCABULARY_IDENTITIES):
+                raise PackagingError("审计 ZIP 成员数量不匹配")
+            seen = set()
+            for entry in entries:
+                name = entry.filename
+                if (name != entry.orig_filename or name not in VOCABULARY_IDENTITIES
+                        or name in seen or entry.is_dir() or entry.flag_bits & 1
+                        or entry.compress_type != zipfile.ZIP_DEFLATED
+                        or stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG)
+                        or entry.external_attr & 0x400
+                        or entry.file_size != VOCABULARY_IDENTITIES[name][0]):
+                    raise PackagingError("审计 ZIP 成员元数据无效")
+                seen.add(name)
+            # Validate every central-directory record before any decompression.
+            original = {}
+            for entry in entries:
+                size = VOCABULARY_IDENTITIES[entry.filename][0]
+                with source.open(entry) as stream:
+                    value = stream.read(size + 1)
+                if len(value) != size:
+                    raise PackagingError("审计 ZIP 成员长度无效")
+                original[VOCABULARY_PREFIX + entry.filename] = value
+        record = _verify_vocabulary_payload(original)
+    except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, EOFError, zlib.error) as error:
+        raise PackagingError(f"审计 ZIP 损坏：{error}") from error
+    record["representation"] = "audit-zip"
+    record["archive"] = {"path": VOCABULARY_ARCHIVE, "size": len(data), "sha256": _sha256(data)}
+    return record
+
+
+def _vocabulary_archive_bundle(root: Path) -> tuple[dict[str, bytes], dict]:
+    original, _ = _vocabulary_bundle(root)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as target:
+        for name in VOCABULARY_IDENTITIES:
+            entry = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            entry.external_attr = (stat.S_IFREG | 0o644) << 16
+            target.writestr(entry, original[VOCABULARY_PREFIX + name], compresslevel=9)
+    payload = {VOCABULARY_ARCHIVE: buffer.getvalue()}
+    return payload, _verify_vocabulary_archive(payload)
+
+
+def _verify_vocabulary_payload(payload: Mapping[str, bytes]) -> dict:
+    paths = {path for path in payload if path.startswith(VOCABULARY_PREFIX)}
+    if paths != VOCABULARY_FILES:
+        raise PackagingError("扩充词库文件集合不完整或包含未知路径")
+    files = {}
+    for name, (size, digest) in VOCABULARY_IDENTITIES.items():
+        path = VOCABULARY_PREFIX + name
+        data = payload[path]
+        if len(data) != size or _sha256(data) != digest:
+            raise PackagingError(f"扩充词库可信长度或摘要不匹配：{path}")
+        files[path] = {"size": size, "sha256": digest}
+    return {
+        "files": files, "unique_entries": 2168043, "default_pinyin_pairs": 2088650,
+        "automatic_pronunciations": 1887541, "unresolved_entries": 45313,
+        "non_pinyin_entries": 42662, "existing_pronunciation_entries": 192527,
+        "automatic_pronunciations_manually_reviewed": False,
+        "license_status": "NOASSERTION", "distribution_status": "local-test-only",
+    }
+
+
+def _vocabulary_bundle(root: Path) -> tuple[dict[str, bytes], dict]:
+    payload = {path: _read_bytes(root / path, "扩充词库") for path in sorted(VOCABULARY_FILES)}
+    return payload, _verify_vocabulary_payload(payload)
+
+
+def _file_license_dictionary(package: dict) -> bool:
+    if package.get("license") is not None:
+        return False
+    if (package.get("name"), package.get("version"), package.get("source")) != (
+        "flower-dict", "0.2.0", DICTIONARY_SOURCE
+    ):
+        return False
+    root = Path(package["manifest_path"]).parent.resolve()
+    declared = package.get("license_file")
+    if not isinstance(declared, str) or not declared:
+        raise PackagingError("字典缺少 NOTICE.md 许可声明")
+    path = Path(declared)
+    if not path.is_absolute():
+        path = root / path
+    if path.resolve() != root / "NOTICE.md":
+        raise PackagingError("字典许可声明必须解析为包根 NOTICE.md")
+    data = _read_bytes(path, "字典 NOTICE.md")
+    if len(data) != 2370 or _sha256(data) != DICTIONARY_NOTICE_SHA256:
+        raise PackagingError("字典 NOTICE.md 长度或可信摘要不匹配")
+    return True
+
+
 def _dependency_license_bundle(
     dependencies: Sequence[dict],
 ) -> tuple[dict[str, bytes], list[dict]]:
@@ -526,7 +669,9 @@ def _dependency_license_bundle(
         version = _safe_component(package.get("version"), "依赖版本")
         label = f"依赖 {name} {version}"
         expression = package.get("license")
-        terms = _license_expression_terms(expression, label)
+        file_license = _file_license_dictionary(package)
+        terms = ({"MIT", "Unicode-3.0", "CC-BY-SA-4.0"} if file_license
+                 else _license_expression_terms(expression, label))
         files = _license_files_for_package(package)
         if not files:
             raise PackagingError(
@@ -552,6 +697,14 @@ def _dependency_license_bundle(
             license_paths.append(destination)
 
         missing = terms - classes
+        if file_license:
+            root = Path(package["manifest_path"]).parent.resolve()
+            for relative, digest in {
+                "LICENSE-MIT": "1f048536437e3a32817a4dc0590c6ebac203d60e15fee9aa7db3df32eada2752",
+                "licenses/LICENSE-pypinyin.txt": "1e6c90014b4912815c296ee64bb6f6280af47e6d4c5d80e86232dfc5defe764c",
+            }.items():
+                if _sha256(_read_bytes(root / relative, label)) != digest:
+                    raise PackagingError(f"字典 MIT 完整正文不匹配：{relative}")
         if missing:
             names = "、".join(sorted(missing))
             raise PackagingError(
@@ -564,6 +717,8 @@ def _dependency_license_bundle(
                 "name": name,
                 "version": version,
                 "spdx": expression,
+                **({"license_file": "NOTICE.md", "license_status": "NOASSERTION",
+                    "distribution_status": "local-test-only"} if file_license else {}),
                 "source": package.get("source") or "path dependency",
                 "repository": package.get("repository") or "not declared",
                 "license_paths": license_paths,
@@ -1116,7 +1271,10 @@ def _notices_text(dependencies: Sequence[dict], rust_std: dict) -> bytes:
             [
                 f"### {dependency['name']} {dependency['version']}",
                 "",
-                f"- SPDX 标识：`{dependency['spdx']}`",
+                (f"- 文件许可：`{dependency['license_file']}`；NOASSERTION；"
+                 "新增数据再分发条件未核定，仅本地测试。"
+                 if dependency.get("license_status") == "NOASSERTION"
+                 else f"- SPDX 标识：`{dependency['spdx']}`"),
                 f"- 来源：`{dependency['source']}`",
                 f"- 仓库：`{dependency['repository']}`",
                 "- 许可证正文：",
@@ -1530,6 +1688,17 @@ def _build_payloads(
     phrase_payload, phrase_record = _phrase_bundle(dictionary_root)
     everyday_payload, everyday_record = _everyday_bundle(dictionary_root)
     category_payload, category_record = _category_bundle(dictionary_root)
+    vocabulary_payload = {}
+    vocabulary_record = None
+    release = tuple(int(part) for part in re.split(r"[-+]", version, maxsplit=1)[0].split("."))
+    conversion_payload = {}
+    conversion_record = None
+    if release >= (0, 4, 22):
+        vocabulary_payload, vocabulary_record = _vocabulary_archive_bundle(dictionary_root)
+        conversion_payload = {p: _read_bytes(repo_root / p, "简繁转换数据") for p in sorted(CONVERSION_FILES)}
+        conversion_record = _verify_conversion_payload(conversion_payload)
+    elif release >= (0, 4, 21):
+        vocabulary_payload, vocabulary_record = _vocabulary_bundle(dictionary_root)
     cargo_lock = _read_bytes(repo_root / "Cargo.lock", "Cargo.lock")
     root_mit = _read_bytes(repo_root / "LICENSE-MIT", "MIT 许可证")
     root_apache = _read_bytes(repo_root / "LICENSE-APACHE", "Apache 许可证")
@@ -1560,7 +1729,7 @@ def _build_payloads(
         "Cargo.lock": cargo_lock,
     }
     for source in (dependency_payload, rust_payload, dictionary_payload, phrase_payload,
-                   everyday_payload, category_payload):
+                   everyday_payload, category_payload, vocabulary_payload, conversion_payload):
         for relative, data in source.items():
             if relative in payload:
                 raise PackagingError(f"分发文件路径重复：{relative}")
@@ -1601,6 +1770,10 @@ def _build_payloads(
             "windows_desktop_verified": False,
         },
     }
+    if vocabulary_record is not None:
+        manifest["expanded_vocabulary"] = vocabulary_record
+    if conversion_record is not None:
+        manifest["chinese_conversion"] = conversion_record
     manifest_bytes = (
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
@@ -1610,8 +1783,8 @@ def _build_payloads(
     for relative, data in sorted(payload.items()):
         checksum_lines.append(f"{_sha256(data)}  {relative}")
     payload["SHA256SUMS"] = ("\n".join(checksum_lines) + "\n").encode("utf-8")
-    if sum(map(len, payload.values())) > package_ai_assets.MAX_PAYLOAD:
-        raise PackagingError("包内 payload 超过 256 MiB，拒绝扩大安装器边界")
+    if any(len(data) > MAX_PAYLOAD for data in payload.values()) or sum(map(len, payload.values())) > MAX_PAYLOAD:
+        raise PackagingError("包内 payload 超过 512 MiB")
     return payload, top_level
 
 

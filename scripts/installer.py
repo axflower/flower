@@ -36,7 +36,7 @@ ROOT_FILES = pack.CATEGORY_FILES | frozenset({
     "data/pinyin/phrases/quality-cases.json",
 })
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?\Z")
-MAX_PAYLOAD = 256 * 1024 * 1024
+MAX_PAYLOAD = 512 * 1024 * 1024
 Runner = Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]]
 InstallerError = pack.PackagingError
 
@@ -119,6 +119,9 @@ def verify_package(archive: Path) -> VerifiedPackage:
             seen.add(name.casefold())
             relative = components[1]
             if (relative not in ROOT_FILES
+                    and relative not in pack.VOCABULARY_FILES
+                    and relative != pack.VOCABULARY_ARCHIVE
+                    and relative not in pack.CONVERSION_FILES
                     and relative not in {"ai/" + name for name in pack.package_ai_assets.BUNDLE_FILES}
                     and not relative.startswith("licenses/")):
                 raise InstallerError(f"ZIP 存在白名单之外的文件：{relative}")
@@ -149,6 +152,25 @@ def verify_package(archive: Path) -> VerifiedPackage:
         raise InstallerError("manifest 身份、目标或顶层目录不匹配")
     variant = manifest.get("variant", "base")
     release = tuple(int(part) for part in re.split(r"[-+]", version, maxsplit=1)[0].split("."))
+    if (release >= (0, 4, 21) or "expanded_vocabulary" in manifest
+            or pack.VOCABULARY_ARCHIVE in payload
+            or any(path.startswith(pack.VOCABULARY_PREFIX) for path in payload)):
+        try:
+            if release >= (0, 4, 22):
+                vocabulary_record = pack._verify_vocabulary_archive(payload)
+            else:
+                if pack.VOCABULARY_ARCHIVE in payload:
+                    raise InstallerError("旧版本不能携带审计 ZIP")
+                vocabulary_record = pack._verify_vocabulary_payload(payload)
+        except pack.PackagingError as error:
+            raise InstallerError(f"扩充词库校验失败：{error}") from error
+        if manifest.get("expanded_vocabulary") != vocabulary_record:
+            raise InstallerError("manifest 扩充词库记录不匹配")
+    if (release >= (0, 4, 22) or "chinese_conversion" in manifest
+            or any(p.startswith(pack.CONVERSION_PREFIX) for p in payload)):
+        conversion_record = pack._verify_conversion_payload(payload)
+        if manifest.get("chinese_conversion") != conversion_record:
+            raise InstallerError("manifest 简繁转换记录不匹配")
     if release >= (0, 4, 7) and variant != "ai":
         raise InstallerError("0.4.7 起必须提供完整 AI 分发包")
     ai_payload = {name[3:]: value for name, value in payload.items() if name.startswith("ai/")}

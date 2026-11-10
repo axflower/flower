@@ -1640,5 +1640,142 @@ class PackageTests(unittest.TestCase):
         self.assertTrue(flower_package._exists_even_dangling(link))
 
 
+class ExpandedVocabularyTests(unittest.TestCase):
+    def test_real_bundle_and_fixed_record(self):
+        payload, record = flower_package._vocabulary_bundle(dictionary_root())
+        self.assertEqual(set(payload), flower_package.VOCABULARY_FILES)
+        self.assertEqual(record["unique_entries"], 2168043)
+        self.assertFalse(record["automatic_pronunciations_manually_reviewed"])
+        for path in payload:
+            broken = dict(payload)
+            broken[path] = broken[path][:-1]
+            with self.subTest(path=path), self.assertRaises(flower_package.PackagingError):
+                flower_package._verify_vocabulary_payload(broken)
+        for broken in ({}, {**payload, flower_package.VOCABULARY_PREFIX + "words.txt": b"x"}):
+            with self.assertRaises(flower_package.PackagingError):
+                flower_package._verify_vocabulary_payload(broken)
+
+    def test_exact_file_license_and_rejections(self):
+        root = dictionary_root()
+        package = {
+            "name": "flower-dict", "version": "0.2.0", "license": None,
+            "source": flower_package.DICTIONARY_SOURCE, "license_file": str(root / "NOTICE.md"),
+            "manifest_path": str(root / "Cargo.toml"),
+        }
+        _, notices = flower_package._dependency_license_bundle([package])
+        self.assertIsNone(notices[0]["spdx"])
+        self.assertEqual(notices[0]["license_status"], "NOASSERTION")
+        for key, value in (("name", "other"), ("version", "0.2.1"),
+                           ("source", flower_package.DICTIONARY_SOURCE + "x"),
+                           ("license_file", "licenses/NOTICE.md"),
+                           ("license_file", "../NOTICE.md")):
+            with self.subTest(key=key, value=value), self.assertRaises(flower_package.PackagingError):
+                flower_package._dependency_license_bundle([{**package, key: value}])
+        with mock.patch.object(flower_package, "_read_bytes", return_value=b"x" * 2370):
+            with self.assertRaises(flower_package.PackagingError):
+                flower_package._dependency_license_bundle([package])
+
+    def test_payload_limits_are_separate(self):
+        self.assertEqual(flower_package.MAX_PAYLOAD, 512 * 1024 * 1024)
+        self.assertEqual(flower_package.package_ai_assets.MAX_PAYLOAD, 256 * 1024 * 1024)
+
+
+class AuditArchiveTests(unittest.TestCase):
+    def test_real_archive_roundtrip_and_conversion(self):
+        payload, record = flower_package._vocabulary_archive_bundle(dictionary_root())
+        self.assertEqual(record["representation"], "audit-zip")
+        self.assertEqual(set(payload), {flower_package.VOCABULARY_ARCHIVE})
+        with zipfile.ZipFile(io.BytesIO(payload[flower_package.VOCABULARY_ARCHIVE])) as source:
+            self.assertEqual(set(source.namelist()), set(flower_package.VOCABULARY_IDENTITIES))
+            for name, (size, digest) in flower_package.VOCABULARY_IDENTITIES.items():
+                value = source.read(name)
+                self.assertEqual((len(value), hashlib.sha256(value).hexdigest()), (size, digest))
+        conversion = {p: (REPO_ROOT / p).read_bytes() for p in flower_package.CONVERSION_FILES}
+        flower_package._verify_conversion_payload(conversion)
+        for path in conversion:
+            for value in (None, conversion[path][:-1], b"x" + conversion[path][1:]):
+                broken = dict(conversion)
+                if value is None:
+                    del broken[path]
+                else:
+                    broken[path] = value
+                with self.subTest(path=path), self.assertRaises(flower_package.PackagingError):
+                    flower_package._verify_conversion_payload(broken)
+        with self.assertRaises(flower_package.PackagingError):
+            flower_package._verify_conversion_payload({**conversion, flower_package.CONVERSION_PREFIX + "extra": b""})
+
+    def test_metadata_preflight_and_bounded_content_validation(self):
+        import stat
+        import warnings
+        names = tuple(flower_package.VOCABULARY_IDENTITIES)
+        values = {name: b"trusted" for name in names}
+        identities = {name: (7, hashlib.sha256(value).hexdigest()) for name, value in values.items()}
+        def archive(rows):
+            buffer = io.BytesIO()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as target:
+                    for name, value, mode in rows:
+                        entry = zipfile.ZipInfo(name)
+                        entry.compress_type = zipfile.ZIP_DEFLATED
+                        entry.external_attr = mode << 16
+                        target.writestr(entry, value)
+            return buffer.getvalue()
+        rows = [(name, value, stat.S_IFREG | 0o644) for name, value in values.items()]
+        valid = archive(rows)
+        encrypted = bytearray(valid)
+        offset = 0
+        while True:
+            offset = encrypted.find(b"PK\x01\x02", offset)
+            if offset < 0:
+                break
+            encrypted[offset + 8] |= 1
+            offset += 4
+        cases = [
+            valid[:-30], bytes(encrypted),
+            archive(rows + [rows[0]]),
+            archive(rows + [("extra", b"x", stat.S_IFREG)]),
+            archive([("../expanded.tsv", b"trusted", stat.S_IFREG)] + rows[1:]),
+            archive([(names[0], b"trusted", stat.S_IFLNK)] + rows[1:]),
+            archive([(names[0], b"short", stat.S_IFREG)] + rows[1:]),
+            archive([(names[0], b"changed", stat.S_IFREG)] + rows[1:]),
+        ]
+        with mock.patch.object(flower_package, "VOCABULARY_IDENTITIES", identities):
+            flower_package._verify_vocabulary_archive({flower_package.VOCABULARY_ARCHIVE: valid})
+            for value in cases:
+                with self.subTest(size=len(value)), self.assertRaises(flower_package.PackagingError):
+                    flower_package._verify_vocabulary_archive({flower_package.VOCABULARY_ARCHIVE: value})
+            with self.assertRaises(flower_package.PackagingError):
+                flower_package._verify_vocabulary_archive({
+                    flower_package.VOCABULARY_ARCHIVE: valid,
+                    flower_package.VOCABULARY_PREFIX + names[0]: b"trusted",
+                })
+
+
+class CompressionLicenseTests(unittest.TestCase):
+    def test_exact_full_text_and_all_or_terms_required(self):
+        registry = Path("C:/Users/baiqi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f")
+        for directory, name, spdx in (
+            ("miniz_oxide-0.8.9", "LICENSE-ZLIB.md", "Zlib"),
+            ("adler2-2.0.1", "LICENSE-0BSD", "0BSD"),
+        ):
+            root = registry / directory
+            original = (root / name).read_bytes()
+            package = {"name": directory.rsplit("-", 1)[0], "version": directory.rsplit("-", 1)[1],
+                       "license": "MIT OR Zlib OR Apache-2.0" if spdx == "Zlib" else "0BSD OR MIT OR Apache-2.0",
+                       "manifest_path": str(root / "Cargo.toml")}
+            payload, notices = flower_package._dependency_license_bundle([package])
+            self.assertIn(original, payload.values())
+            self.assertEqual(notices[0]["spdx"], package["license"])
+            for value in (original[:-1], original.replace(b"permission", b"prohibition") if b"permission" in original else original + b"changed"):
+                self.assertNotIn(spdx, flower_package._classify_license_text(name, value.decode(), raw=value))
+                read = flower_package._read_bytes
+                def altered(path, label):
+                    return value if Path(path).name == name else read(path, label)
+                with mock.patch.object(flower_package, "_read_bytes", side_effect=altered):
+                    with self.assertRaises(flower_package.PackagingError):
+                        flower_package._dependency_license_bundle([package])
+
+
 if __name__ == "__main__":
     unittest.main()

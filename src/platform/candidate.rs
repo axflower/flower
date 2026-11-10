@@ -92,6 +92,8 @@ pub struct CandidatePopupLayout {
     pub candidates: Vec<PopupRect>,
     /// 兼容保留的页脚区域，始终为 `None`。
     pub footer: Option<PopupRect>,
+    /// 独立设置入口，不参与候选动作协议。
+    pub settings_button: Option<PopupRect>,
     /// 兼容保留的上一页区域，始终为 `None`。
     pub previous_page: Option<PopupRect>,
     /// 兼容保留的下一页区域，始终为 `None`。
@@ -180,6 +182,7 @@ impl CandidatePopupLayout {
             preedit: PopupRect::new(0, 0, 0, 0),
             candidates,
             footer: None,
+            settings_button: None,
             previous_page: None,
             next_page: None,
             page_label: None,

@@ -45,10 +45,10 @@ pub(crate) fn popup_palette(theme: Theme, system: PopupPalette) -> PopupPalette 
 #[cfg(any(target_os = "windows", test))]
 fn target_candidate_width_budget(work_width: i32, target_dpi: u32) -> u32 {
     if work_width <= 0 || target_dpi == 0 {
-        return 544;
+        return 512;
     }
     let logical = (work_width as u64 * 96 / u64::from(target_dpi)).min(560);
-    logical.saturating_sub(16).clamp(1, 544) as u32
+    logical.saturating_sub(48).clamp(1, 512) as u32
 }
 
 #[cfg(target_os = "windows")]
@@ -110,6 +110,7 @@ mod windows_impl {
 
     const BASE_DPI: u32 = 96;
     const WM_FLOWER_DISPATCH_ACTION: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+    const WM_FLOWER_SETTINGS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
     const AI_IDLE_TIMER: usize = 0x4641;
 
     #[cfg(test)]
@@ -140,6 +141,9 @@ mod windows_impl {
             status: Option<AiStatus>,
         ) -> Self {
             let height = bounds.height.max(1);
+            let total_width = bounds.width.max(1).min(scaled(560, dpi));
+            let settings_width = scaled(32, dpi).min((total_width - 1).max(0));
+            let content_width = (total_width - settings_width).max(1);
             let status_height = if status.is_some() {
                 scaled(22, dpi).max(1).min(height)
             } else {
@@ -148,7 +152,7 @@ mod windows_impl {
             let mut candidates = CandidatePopupLayout::new(
                 snapshot,
                 dpi,
-                PopupSize::new(bounds.width, (height - status_height).max(1)),
+                PopupSize::new(content_width, (height - status_height).max(1)),
             );
             let line_height = scaled(30, dpi).max(1);
             let padding = scaled(8, dpi);
@@ -174,7 +178,7 @@ mod windows_impl {
                         measure(text).map_or(true, |w| w > row.width() - scaled(6, dpi))
                     });
             if vertical && font.is_some() {
-                let width = bounds.width.max(1).min(scaled(560, dpi));
+                let width = content_width;
                 let available = (width - padding * 2 - scaled(6, dpi)).max(0);
                 candidates.candidates.clear();
                 let mut top = padding;
@@ -213,20 +217,34 @@ mod windows_impl {
                 candidates.size.height = 0;
             }
             let size = PopupSize::new(
-                candidates.size.width,
+                candidates.size.width + settings_width,
                 candidates
                     .size
                     .height
                     .saturating_add(status_height)
                     .min(height),
             );
-            let status =
-                status.map(|_| PopupRect::new(0, candidates.size.height, size.width, size.height));
+            let status = status.map(|_| {
+                PopupRect::new(
+                    0,
+                    candidates.size.height,
+                    candidates.size.width,
+                    size.height,
+                )
+            });
+            if settings_width >= scaled(32, dpi) && size.height >= scaled(28, dpi) {
+                candidates.settings_button = Some(PopupRect::new(
+                    candidates.size.width + scaled(4, dpi),
+                    0,
+                    size.width,
+                    scaled(28, dpi),
+                ));
+            }
             let full_rows = candidates.candidates.clone();
             let viewport = PopupRect::new(
                 0,
                 padding.min(candidates.size.height),
-                size.width,
+                candidates.size.width,
                 (candidates.size.height - padding).max(padding.min(candidates.size.height)),
             );
             let max_scroll = full_rows
@@ -388,6 +406,8 @@ mod windows_impl {
         theme: Theme,
         pending_actions: VecDeque<CandidatePopupAction>,
         action_sink: Option<PopupActionSink>,
+        settings_sink: Option<Rc<dyn Fn()>>,
+        pending_settings: Option<(PopupPoint, CandidatePopupSnapshot)>,
         idle_sink: Option<Rc<dyn Fn()>>,
     }
 
@@ -554,6 +574,8 @@ mod windows_impl {
                 theme: Theme::System,
                 pending_actions: VecDeque::new(),
                 action_sink: None,
+                settings_sink: None,
+                pending_settings: None,
                 idle_sink: None,
             }));
             let state_pointer: *const c_void =
@@ -651,6 +673,23 @@ mod windows_impl {
             Ok(())
         }
 
+        /// 设置入口独立于候选选择，回调不得强持有窗口。
+        pub(crate) fn set_settings_action_sink(
+            &mut self,
+            sink: Option<Rc<dyn Fn()>>,
+        ) -> Result<(), PopupError> {
+            self.ensure_alive()?;
+            let mut state = self
+                .state
+                .as_deref()
+                .ok_or(PopupError::Destroyed)?
+                .try_borrow_mut()
+                .map_err(|_| state_busy_error())?;
+            state.settings_sink = sink;
+            state.pending_settings = None;
+            Ok(())
+        }
+
         /// 注册或解除鼠标动作回调。
         ///
         /// 回调只接收纯数据动作。窗口销毁、隐藏和失焦都会清除尚未派发的动作；
@@ -669,6 +708,7 @@ mod windows_impl {
             state.action_sink = sink;
             if state.action_sink.is_none() {
                 state.pending_actions.clear();
+                state.pending_settings = None;
             }
             Ok(())
         }
@@ -680,6 +720,7 @@ mod windows_impl {
             };
             if let Ok(mut state) = state.try_borrow_mut() {
                 state.pending_actions.clear();
+                state.pending_settings = None;
             }
         }
 
@@ -814,6 +855,7 @@ mod windows_impl {
             state.snapshot = Some(snapshot.clone());
             state.presented = None;
             state.pending_actions.clear();
+            state.pending_settings = None;
             Ok(())
         }
 
@@ -922,6 +964,7 @@ mod windows_impl {
                     .try_borrow_mut()
                     .map_err(|_| state_busy_error())?;
                 state.pending_actions.clear();
+                state.pending_settings = None;
                 state.presented = None;
             }
             let native_caret = RECT {
@@ -1069,6 +1112,7 @@ mod windows_impl {
             };
             if let Ok(mut state) = state.try_borrow_mut() {
                 state.pending_actions.clear();
+                state.pending_settings = None;
                 state.presented = None;
             }
             if self.ensure_alive().is_err() {
@@ -1310,8 +1354,50 @@ mod windows_impl {
             }
             WM_LBUTTONUP => {
                 let point = point_from_lparam(lparam);
-                if let Some(action) = popup_action_at(hwnd, point) {
+                if settings_at(hwnd, point) {
+                    let queued = unsafe { popup_state_pointer(hwnd).as_ref() }
+                        .and_then(|s| s.try_borrow_mut().ok())
+                        .map(|mut s| {
+                            s.pending_settings =
+                                s.snapshot.clone().map(|snapshot| (point, snapshot));
+                        })
+                        .is_some();
+                    if queued
+                        && unsafe {
+                            PostMessageW(
+                                hwnd,
+                                WM_FLOWER_SETTINGS,
+                                WPARAM::default(),
+                                LPARAM::default(),
+                            )
+                        }
+                        .is_err()
+                    {
+                        if let Some(s) = unsafe { popup_state_pointer(hwnd).as_ref() } {
+                            if let Ok(mut s) = s.try_borrow_mut() {
+                                s.pending_settings = None;
+                            }
+                        }
+                    }
+                } else if let Some(action) = popup_action_at(hwnd, point) {
                     let _ = queue_popup_action(hwnd, action);
+                }
+                LRESULT(0)
+            }
+            WM_FLOWER_SETTINGS => {
+                let pending = unsafe { popup_state_pointer(hwnd).as_ref() }
+                    .and_then(|s| s.try_borrow_mut().ok())
+                    .and_then(|mut s| s.pending_settings.take());
+                if let Some((point, snapshot)) = pending {
+                    if settings_at(hwnd, point) {
+                        let sink = unsafe { popup_state_pointer(hwnd).as_ref() }
+                            .and_then(|s| s.try_borrow().ok())
+                            .filter(|s| s.snapshot.as_ref() == Some(&snapshot))
+                            .and_then(|s| s.settings_sink.clone());
+                        if let Some(sink) = sink {
+                            sink();
+                        }
+                    }
                 }
                 LRESULT(0)
             }
@@ -1415,6 +1501,7 @@ mod windows_impl {
                 if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
                     if let Ok(mut state) = state.try_borrow_mut() {
                         state.pending_actions.clear();
+                        state.pending_settings = None;
                         state.action_sink = None;
                         state.idle_sink = None;
                     }
@@ -1480,6 +1567,28 @@ mod windows_impl {
     }
 
     fn popup_action_at(hwnd: HWND, point: PopupPoint) -> Option<CandidatePopupAction> {
+        validated_frame_at(hwnd, |frame| {
+            frame.candidates.hit_test(&frame.snapshot, point)
+        })
+    }
+
+    fn settings_at(hwnd: HWND, point: PopupPoint) -> bool {
+        if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) }.as_bool() {
+            return false;
+        }
+        validated_frame_at(hwnd, |frame| {
+            frame
+                .candidates
+                .settings_button
+                .filter(|r| r.contains(point))
+        })
+        .is_some()
+    }
+
+    fn validated_frame_at<T>(
+        hwnd: HWND,
+        hit: impl FnOnce(&PresentedCandidates) -> Option<T>,
+    ) -> Option<T> {
         let mut client = RECT::default();
         let mut window = RECT::default();
         // SAFETY: `hwnd` is live and `client` is valid writable storage.
@@ -1507,7 +1616,7 @@ mod windows_impl {
             return None;
         }
         // Only geometry from an actually presented frame authorizes mouse input.
-        frame.candidates.hit_test(&frame.snapshot, point)
+        hit(frame)
     }
 
     fn queue_popup_action(hwnd: HWND, action: CandidatePopupAction) -> bool {
@@ -1650,7 +1759,61 @@ mod windows_impl {
         if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
             if let Ok(mut state) = state.try_borrow_mut() {
                 state.presented = None;
+                state.pending_settings = None;
             }
+        }
+    }
+
+    /// A bounded eight-tooth vector silhouette with a genuinely empty hub.
+    /// Regions need no selected GDI objects or font and never touch adjacent rows.
+    fn paint_settings_gear(hdc: HDC, rect: PopupRect, dpi: u32, palette: PopupPalette) -> bool {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{
+            CombineRgn, CreateEllipticRgn, CreatePolygonRgn, FillRgn, ALTERNATE, ERROR, RGN_DIFF,
+        };
+        let size = scaled(18, dpi);
+        if size < 8 || rect.width() < size + 2 || rect.height() < size + 2 {
+            return false;
+        }
+        let left = rect.left + (rect.width() - size) / 2;
+        let top = rect.top + (rect.height() - size) / 2;
+        let radius = f64::from(size) / 2.0;
+        let points: Vec<POINT> = (0..64)
+            .map(|i| {
+                let angle = (f64::from(i) - 0.5) * std::f64::consts::TAU / 64.0;
+                let r = radius * if i % 8 < 4 { 1.0 } else { 0.76 };
+                POINT {
+                    x: (f64::from(left) + radius + angle.cos() * r).round() as i32,
+                    y: (f64::from(top) + radius + angle.sin() * r).round() as i32,
+                }
+            })
+            .collect();
+        // Every handle is owned locally; even failed construction/combination is cleaned up.
+        unsafe {
+            let gear = CreatePolygonRgn(&points, ALTERNATE);
+            let inset = (size * 5 / 16).max(1);
+            let hub = CreateEllipticRgn(
+                left + inset,
+                top + inset,
+                left + size - inset,
+                top + size - inset,
+            );
+            let brush = CreateSolidBrush(COLORREF(palette.text));
+            let painted = !gear.is_invalid()
+                && !hub.is_invalid()
+                && !brush.is_invalid()
+                && CombineRgn(gear, gear, hub, RGN_DIFF).0 != ERROR
+                && FillRgn(hdc, gear, brush).as_bool();
+            if !brush.is_invalid() {
+                let _ = DeleteObject(brush);
+            }
+            if !hub.is_invalid() {
+                let _ = DeleteObject(hub);
+            }
+            if !gear.is_invalid() {
+                let _ = DeleteObject(gear);
+            }
+            painted
         }
     }
 
@@ -1698,6 +1861,11 @@ mod windows_impl {
         }
         let presented =
             font.is_some() && paint_candidate_body(hdc, snapshot, dpi, palette, &layout);
+        let settings_painted = presented
+            && layout
+                .candidates
+                .settings_button
+                .map_or(true, |rect| paint_settings_gear(hdc, rect, dpi, palette));
 
         if let (Some(status), Some(rect)) = (status, layout.status) {
             let padding = scaled(8, dpi).min(rect.width() / 2).max(0);
@@ -1717,7 +1885,7 @@ mod windows_impl {
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
             );
         }
-        if presented {
+        if presented && settings_painted {
             if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
                 if let Ok(mut state) = state.try_borrow_mut() {
                     if state.snapshot.as_ref() == Some(snapshot)
@@ -1823,9 +1991,9 @@ mod windows_impl {
         if layout.max_scroll > 0 {
             // A slim track and thumb advertise internal scrolling without engine paging.
             let track = PopupRect::new(
-                (layout.size.width - scaled(3, dpi)).max(0),
+                (layout.viewport.right - scaled(3, dpi)).max(0),
                 layout.viewport.top,
-                layout.size.width,
+                layout.viewport.right,
                 layout.viewport.bottom,
             );
             fill_rect(hdc, &windows_rect(track), COLORREF(palette.background));
@@ -2081,11 +2249,15 @@ mod windows_impl {
 
     impl PaintFont {
         fn new(hdc: HDC, dpi: u32) -> Option<Self> {
+            Self::with_height(hdc, dpi, 18)
+        }
+
+        fn with_height(hdc: HDC, dpi: u32, height: i32) -> Option<Self> {
             // SAFETY: CreateFontW has no pointer parameters beyond the static
             // null-terminated face name, which remains valid for the call.
             let font = unsafe {
                 CreateFontW(
-                    -scaled(18, dpi),
+                    -scaled(height, dpi),
                     0,
                     0,
                     0,
@@ -2251,6 +2423,201 @@ mod windows_impl {
 
         fn paint_native_test_frame(hwnd: HWND) {
             FrameSurface::new(hwnd).paint(hwnd);
+        }
+
+        #[test]
+        fn settings_button_gear_pixels_dpi_themes_and_failure() {
+            for dpi in [96, 144, 192] {
+                for palette in [super::super::LIGHT_PALETTE, super::super::DARK_PALETTE] {
+                    let popup = CandidatePopupWindow::new().unwrap();
+                    unsafe {
+                        SetWindowPos(
+                            popup.hwnd,
+                            HWND::default(),
+                            0,
+                            0,
+                            96,
+                            96,
+                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        )
+                        .unwrap();
+                    }
+                    let surface = FrameSurface::new(popup.hwnd);
+                    fill_rect(surface.dc, &surface.client, COLORREF(palette.background));
+                    let button = PopupRect::new(8, 8, 8 + scaled(28, dpi), 8 + scaled(28, dpi));
+                    assert!(paint_settings_gear(surface.dc, button, dpi, palette));
+                    unsafe {
+                        windows::Win32::Graphics::Gdi::GdiFlush().unwrap();
+                    }
+                    let mut ink = 0;
+                    for y in 0..96 {
+                        for x in 0..96 {
+                            let color = unsafe { GetPixel(surface.dc, x, y) }.0;
+                            if color != palette.background {
+                                assert_eq!(color, palette.text);
+                                assert!(x > button.left && x < button.right - 1);
+                                assert!(y > button.top && y < button.bottom - 1);
+                                ink += 1;
+                            }
+                        }
+                    }
+                    assert!(ink > scaled(40, dpi));
+                    let cx = (button.left + button.right) / 2;
+                    let cy = (button.top + button.bottom) / 2;
+                    assert_eq!(
+                        unsafe { GetPixel(surface.dc, cx, cy) }.0,
+                        palette.background
+                    );
+                    assert!(!paint_settings_gear(HDC::default(), button, dpi, palette));
+                    fill_rect(surface.dc, &surface.client, COLORREF(palette.background));
+                    assert!(!paint_settings_gear(
+                        surface.dc,
+                        PopupRect::new(0, 0, 1, 1),
+                        dpi,
+                        palette,
+                    ));
+                    assert_eq!(unsafe { GetPixel(surface.dc, 0, 0) }.0, palette.background);
+                }
+            }
+        }
+
+        #[test]
+        fn settings_button_native_deferred_callback_and_stale_frames() {
+            use std::cell::Cell;
+            use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let mut snapshot = long_snapshot();
+            popup.update(&snapshot).unwrap();
+            let calls = Rc::new(Cell::new(0));
+            let seen = calls.clone();
+            popup
+                .set_settings_action_sink(Some(Rc::new(move || seen.set(seen.get() + 1))))
+                .unwrap();
+            let actions = Rc::new(Cell::new(0));
+            let seen = actions.clone();
+            popup
+                .set_action_sink(Some(Rc::new(move |_| seen.set(seen.get() + 1))))
+                .unwrap();
+            unsafe {
+                SetWindowPos(
+                    popup.hwnd,
+                    HWND::default(),
+                    0,
+                    0,
+                    240,
+                    160,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+                .unwrap();
+            }
+            paint_native_test_frame(popup.hwnd);
+            let button = popup
+                .state
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .presented
+                .as_ref()
+                .unwrap()
+                .candidates
+                .settings_button
+                .unwrap();
+            let point = PopupPoint {
+                x: button.left + 2,
+                y: button.top + 2,
+            };
+            let position = LPARAM(((point.y as u32) << 16 | point.x as u32) as isize);
+            assert!(settings_at(popup.hwnd, point));
+            assert_eq!(popup_action_at(popup.hwnd, point), None);
+            unsafe {
+                SendMessageW(popup.hwnd, WM_LBUTTONUP, WPARAM(0), position);
+            }
+            assert_eq!(calls.get(), 0);
+            unsafe {
+                SendMessageW(popup.hwnd, WM_FLOWER_SETTINGS, WPARAM(0), LPARAM(0));
+            }
+            assert_eq!(calls.get(), 1);
+            unsafe {
+                SendMessageW(popup.hwnd, WM_FLOWER_SETTINGS, WPARAM(0), LPARAM(0));
+            }
+            assert_eq!(calls.get(), 1);
+            assert_eq!(actions.get(), 0);
+            snapshot.revision += 1;
+            popup.update(&snapshot).unwrap();
+            assert!(!settings_at(popup.hwnd, point));
+            paint_native_test_frame(popup.hwnd);
+            assert!(settings_at(popup.hwnd, point));
+            // Scroll identity and window dimensions invalidate even a previously painted button.
+            popup.state.as_ref().unwrap().borrow_mut().scroll_offset = Some(1);
+            assert!(!settings_at(popup.hwnd, point));
+            paint_native_test_frame(popup.hwnd);
+            assert!(settings_at(popup.hwnd, point));
+            unsafe {
+                SetWindowPos(
+                    popup.hwnd,
+                    HWND::default(),
+                    0,
+                    0,
+                    241,
+                    160,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .unwrap();
+            }
+            assert!(!settings_at(popup.hwnd, point));
+            paint_native_test_frame(popup.hwnd);
+            CANDIDATE_CLIP_FAULT.with(|fault| fault.set(1));
+            paint_native_test_frame(popup.hwnd);
+            CANDIDATE_CLIP_FAULT.with(|fault| fault.set(0));
+            assert!(!settings_at(popup.hwnd, point));
+            paint_native_test_frame(popup.hwnd);
+            unsafe {
+                SendMessageW(popup.hwnd, WM_LBUTTONUP, WPARAM(0), position);
+            }
+            popup.hide();
+            assert!(!settings_at(popup.hwnd, point));
+            unsafe {
+                SendMessageW(popup.hwnd, WM_FLOWER_SETTINGS, WPARAM(0), LPARAM(0));
+            }
+            assert_eq!(calls.get(), 1);
+            assert_eq!(actions.get(), 0);
+        }
+
+        #[test]
+        fn settings_button_layout_dpi_narrow_and_candidate_boundaries() {
+            let snapshot = long_snapshot();
+            for dpi in [96, 144, 192, 288] {
+                for width in [1, 20, 40, 120, 240, 1120] {
+                    let layout = PopupLayout::new(
+                        &snapshot,
+                        dpi,
+                        PopupSize::new(width, 400),
+                        Some(AiStatus::Waiting),
+                    );
+                    assert!(layout.size.width <= width);
+                    assert!(layout.size.width <= scaled(560, dpi));
+                    assert_eq!(layout.candidates.footer, None);
+                    if let Some(button) = layout.candidates.settings_button {
+                        assert_eq!(button.width(), scaled(28, dpi));
+                        assert!(button.right <= layout.size.width);
+                        assert!(layout.viewport.right <= button.left);
+                        assert!(layout.status.unwrap().right <= button.left);
+                        for row in &layout.candidates.candidates {
+                            assert!(row.right <= button.left);
+                        }
+                        assert_eq!(
+                            layout.candidates.hit_test(
+                                &snapshot,
+                                PopupPoint {
+                                    x: button.left,
+                                    y: button.top
+                                }
+                            ),
+                            None
+                        );
+                    }
+                }
+            }
         }
 
         #[test]
@@ -2906,8 +3273,12 @@ mod windows_impl {
                 let bounds = PopupSize::new(4000, 4000);
                 let plain = PopupLayout::new(&snapshot, dpi, bounds, None);
                 let original = CandidatePopupLayout::new(&snapshot, dpi, bounds);
-                assert_eq!(plain.candidates, original);
-                assert_eq!(plain.size, original.size);
+                assert_eq!(plain.candidates.candidates, original.candidates);
+                assert_eq!(plain.candidates.size, original.size);
+                assert_eq!(plain.size.width, original.size.width + scaled(32, dpi));
+                assert_eq!(plain.size.height, original.size.height);
+                assert_eq!(plain.candidates.footer, None);
+                assert!(plain.candidates.settings_button.is_some());
                 assert!(plain.status.is_none());
                 let status = PopupLayout::new(&snapshot, dpi, bounds, Some(AiStatus::Waiting));
                 assert_eq!(status.candidates, plain.candidates);
@@ -3207,18 +3578,18 @@ mod tests {
     fn target_budget_uses_target_dpi_and_clamps_or_falls_back() {
         use super::target_candidate_width_budget as budget;
         // Same physical work area, two possible destination screens.
-        assert_eq!(budget(800, 96), 544);
-        assert_eq!(budget(800, 192), 384);
+        assert_eq!(budget(800, 96), 512);
+        assert_eq!(budget(800, 192), 352);
         // There is deliberately no old-window DPI input: going in either
         // direction must produce the destination's budget.
-        for (target_dpi, expected) in [(192, 384), (96, 544), (192, 384)] {
+        for (target_dpi, expected) in [(192, 352), (96, 512), (192, 352)] {
             assert_eq!(budget(800, target_dpi), expected);
         }
-        assert_eq!(budget(1120, 192), 544);
+        assert_eq!(budget(1120, 192), 512);
         assert_eq!(budget(1, 192), 1);
-        assert_eq!(budget(0, 192), 544);
-        assert_eq!(budget(800, 0), 544);
-        assert_eq!(budget(i32::MAX, 96), 544);
+        assert_eq!(budget(0, 192), 512);
+        assert_eq!(budget(800, 0), 512);
+        assert_eq!(budget(i32::MAX, 96), 512);
     }
 
     fn system_palette() -> PopupPalette {

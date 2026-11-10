@@ -312,6 +312,7 @@ mod windows_exports {
         fn new(context: &ITfContext, settings: &Settings, lexicon: &Lexicon) -> Option<Self> {
             let mut router =
                 EngineRouter::from_lexicon(lexicon.clone(), settings.candidate_page_size).ok()?;
+            router.set_chinese_script(settings.chinese_script);
             router.set_candidate_width(Some(crate::engine::paging::DEFAULT_CANDIDATE_WIDTH));
             Some(Self {
                 context: context.clone(),
@@ -345,9 +346,10 @@ mod windows_exports {
         processing: bool,
         english: bool,
         shift: ShiftGesture,
+        settings_worker: Option<SettingsLaunchWorker>,
         context_generation: Rc<Cell<u64>>,
         _thread_events: Option<ThreadEvents>,
-        /// Immutable settings captured when this activation started.
+        /// Activation snapshot; script override is never written to disk.
         settings: Settings,
         lexicon: Lexicon,
         rankings: Arc<Vec<RankingOrder>>,
@@ -362,6 +364,171 @@ mod windows_exports {
     }
 
     type SharedActivation = Rc<RefCell<Option<Activation>>>;
+
+    /// Owns both the worker and its DLL lifetime. Cancellation cannot interrupt
+    /// an ACL syscall; drop waits for the bounded local validator to return.
+    struct SettingsLaunchWorker {
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        result: std::sync::mpsc::Receiver<std::result::Result<std::path::PathBuf, AiStatus>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        epoch: u64,
+        generation: u64,
+        context: Option<ContextKey>,
+        _registration: ObjectRegistration,
+    }
+
+    impl SettingsLaunchWorker {
+        fn start(
+            epoch: u64,
+            generation: u64,
+            context: Option<ContextKey>,
+            validate: impl FnOnce() -> std::result::Result<std::path::PathBuf, AiStatus>
+                + Send
+                + 'static,
+        ) -> std::io::Result<Self> {
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancelled = Arc::clone(&cancel);
+            let (sender, result) = std::sync::mpsc::channel();
+            let registration = ObjectRegistration::new();
+            let thread = std::thread::Builder::new()
+                .name("flower-settings-check".into())
+                .spawn(move || {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    let result = validate();
+                    if !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = sender.send(result);
+                    }
+                })?;
+            Ok(Self {
+                cancel,
+                result,
+                thread: Some(thread),
+                epoch,
+                generation,
+                context,
+                _registration: registration,
+            })
+        }
+    }
+
+    impl Drop for SettingsLaunchWorker {
+        fn drop(&mut self) {
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn queue_settings_check(
+        active: &mut Activation,
+        context: ContextKey,
+        validate: impl FnOnce() -> std::result::Result<std::path::PathBuf, AiStatus> + Send + 'static,
+    ) -> std::io::Result<()> {
+        if active.settings_worker.is_none() {
+            active.settings_worker = Some(SettingsLaunchWorker::start(
+                active.focus_epoch,
+                active.context_generation.get(),
+                Some(context),
+                validate,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn settings_launch_error() {
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                windows::core::w!("无法打开 Flower 设置。请检查安装是否完整。"),
+                windows::core::w!("Flower"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+
+    fn settings_idle(shared: &SharedActivation, token: ActivationToken, owner: ThreadId) {
+        settings_idle_with(shared, token, owner, |result| {
+            use std::os::windows::process::CommandExt;
+            if result
+                .and_then(|helper| {
+                    std::process::Command::new(helper)
+                        .creation_flags(0x08000000) // CREATE_NO_WINDOW; exact helper, no arguments.
+                        .spawn()
+                        .map(|_| ())
+                        .map_err(|_| AiStatus::ClientFailed)
+                })
+                .is_err()
+            {
+                settings_launch_error();
+            }
+        });
+    }
+
+    fn settings_idle_with(
+        shared: &SharedActivation,
+        token: ActivationToken,
+        owner: ThreadId,
+        publish: impl FnOnce(std::result::Result<std::path::PathBuf, AiStatus>),
+    ) {
+        if let Some(result) = poll_settings_result(shared, token, owner) {
+            publish(result);
+        }
+    }
+
+    fn poll_settings_result(
+        shared: &SharedActivation,
+        token: ActivationToken,
+        owner: ThreadId,
+    ) -> Option<std::result::Result<std::path::PathBuf, AiStatus>> {
+        if std::thread::current().id() != owner {
+            return None;
+        }
+        let manager = shared.try_borrow().ok().and_then(|s| {
+            s.as_ref()
+                .filter(|a| a.token == token)
+                .map(|a| a.thread_manager.clone())
+        });
+        let manager = manager?;
+        let focused = focused_context_key(&manager);
+        let completed = {
+            let mut state = shared.try_borrow_mut().ok()?;
+            let active = state.as_mut().filter(|a| a.token == token)?;
+            let worker = active.settings_worker.as_ref()?;
+            let valid = active.foreground
+                && !active.processing
+                && !worker.cancel.load(std::sync::atomic::Ordering::Acquire)
+                && worker.epoch == active.focus_epoch
+                && worker.generation == active.context_generation.get()
+                && focused.is_some()
+                && focused == worker.context;
+            if !valid {
+                worker
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            // Receiving may precede thread exit. Never join until is_finished:
+            // polling on the TSF owner remains nonblocking.
+            if !worker.thread.as_ref().is_some_and(|t| t.is_finished()) {
+                return None;
+            }
+            let result = worker
+                .result
+                .try_recv()
+                .unwrap_or(Err(AiStatus::ClientFailed));
+            let worker = active.settings_worker.take();
+            drop(worker);
+            valid.then_some(result)
+        };
+        if !ui_allows(shared, token) {
+            return None;
+        }
+        completed
+    }
 
     include!("ui_element.rs");
 
@@ -493,6 +660,17 @@ mod windows_exports {
 
     /// Resolve our DLL by an address in this module, never the host executable.
     fn protected_ai_helper() -> std::result::Result<std::path::PathBuf, AiStatus> {
+        let helper = protected_settings_helper()?;
+        if !helper
+            .parent()
+            .is_some_and(|parent| parent.join("ai").is_dir())
+        {
+            return Err(AiStatus::MissingAssets);
+        }
+        Ok(helper)
+    }
+
+    fn protected_settings_helper() -> std::result::Result<std::path::PathBuf, AiStatus> {
         use std::os::windows::ffi::OsStringExt;
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::HMODULE;
@@ -518,10 +696,24 @@ mod windows_exports {
             path.truncate(len);
         }
         let dll = std::path::PathBuf::from(std::ffi::OsString::from_wide(&path));
-        ai_helper_at_module_path(&dll)
+        settings_helper_at_module_path(&dll)
     }
 
+    #[cfg(test)]
     fn ai_helper_at_module_path(
+        dll: &std::path::Path,
+    ) -> std::result::Result<std::path::PathBuf, AiStatus> {
+        let helper = settings_helper_at_module_path(dll)?;
+        if !helper
+            .parent()
+            .is_some_and(|parent| parent.join("ai").is_dir())
+        {
+            return Err(AiStatus::MissingAssets);
+        }
+        Ok(helper)
+    }
+
+    fn settings_helper_at_module_path(
         dll: &std::path::Path,
     ) -> std::result::Result<std::path::PathBuf, AiStatus> {
         let parent = dll.parent().ok_or(AiStatus::UnsupportedPath)?;
@@ -532,9 +724,6 @@ mod windows_exports {
         let helper = directory.join("flower-settings.exe");
         if !helper.is_file() {
             return Err(AiStatus::MissingHelper);
-        }
-        if !directory.join("ai").is_dir() {
-            return Err(AiStatus::MissingAssets);
         }
         Ok(helper)
     }
@@ -796,6 +985,7 @@ mod windows_exports {
 
     /// Timer callback only queues read sessions. It never writes host text.
     fn ai_idle(shared: &SharedActivation, token: ActivationToken, owner: ThreadId) {
+        settings_idle(shared, token, owner);
         if std::thread::current().id() != owner {
             return;
         }
@@ -1204,7 +1394,10 @@ mod windows_exports {
             meta: virtual_key_is_down(VK_LWIN) || virtual_key_is_down(VK_RWIN),
         };
 
-        if modifiers.is_command() {
+        if modifiers.is_command()
+            && !map_windows_virtual_key(wparam.0 as u32, modifiers)
+                .is_some_and(KeyEvent::is_script_toggle)
+        {
             return None;
         }
 
@@ -3010,7 +3203,7 @@ mod windows_exports {
             let token = next_activation_token();
             let owner_thread = std::thread::current().id();
             let mut ai_unavailable = AiStatus::Unavailable;
-            let mut ai = if settings.ai_correction_enabled {
+            let ai = if settings.ai_correction_enabled {
                 match protected_ai_helper().and_then(|helper| {
                     crate::ai::ipc::AiClient::start(helper).map_err(|_| AiStatus::ClientFailed)
                 }) {
@@ -3023,7 +3216,7 @@ mod windows_exports {
             } else {
                 None
             };
-            if ai.is_some() {
+            {
                 let weak = Rc::downgrade(&self.get_impl().activation);
                 let sink: Rc<dyn Fn()> = Rc::new(move || {
                     if let Some(shared) = weak.upgrade() {
@@ -3031,9 +3224,7 @@ mod windows_exports {
                     }
                 });
                 if popup.set_idle_sink(Some(sink)).is_err() {
-                    ai = None;
-                    ai_unavailable = AiStatus::TimerFailed;
-                    let _ = popup.set_idle_sink(None);
+                    return Err(E_UNEXPECTED.into());
                 }
             }
             let _ = popup.set_ai_status(if !settings.ai_correction_enabled {
@@ -3049,6 +3240,49 @@ mod windows_exports {
             });
             if let Err(error) = popup.set_action_sink(Some(action_sink)) {
                 record(Stage::PopupActionSink, popup_activation_hresult(&error));
+                return Err(popup_activation_hresult(&error).into());
+            }
+            let weak = Rc::downgrade(&self.get_impl().activation);
+            let settings_sink: Rc<dyn Fn()> = Rc::new(move || {
+                let Some(shared) = weak.upgrade() else { return };
+                if std::thread::current().id() != owner_thread || !ui_allows(&shared, token) {
+                    return;
+                }
+                let allowed = shared.try_borrow().ok().is_some_and(|state| {
+                    state.as_ref().is_some_and(|active| {
+                        active.token == token && active.foreground && !active.processing
+                    })
+                });
+                if !allowed {
+                    return;
+                }
+                let manager = shared
+                    .try_borrow()
+                    .ok()
+                    .and_then(|s| s.as_ref().map(|a| a.thread_manager.clone()));
+                let Some(manager) = manager else { return };
+                let context = focused_context_key(&manager);
+                if context.is_none() {
+                    return;
+                }
+                let failed = {
+                    let Ok(mut state) = shared.try_borrow_mut() else {
+                        return;
+                    };
+                    let Some(active) = state
+                        .as_mut()
+                        .filter(|a| a.token == token && a.foreground && !a.processing)
+                    else {
+                        return;
+                    };
+                    queue_settings_check(active, context.unwrap(), protected_settings_helper)
+                        .is_err()
+                };
+                if failed {
+                    settings_launch_error();
+                }
+            });
+            if let Err(error) = popup.set_settings_action_sink(Some(settings_sink)) {
                 return Err(popup_activation_hresult(&error).into());
             }
             if !register_thread_popup(token, popup) {
@@ -3078,6 +3312,7 @@ mod windows_exports {
                         processing: false,
                         english: false,
                         shift: ShiftGesture::default(),
+                        settings_worker: None,
                         context_generation: Rc::clone(&context_generation),
                         _thread_events: Some(thread_events),
                         settings,
@@ -3294,6 +3529,7 @@ mod windows_exports {
                     return Ok(FALSE);
                 };
                 entry.router = router;
+                entry.router.set_chinese_script(settings.chinese_script);
                 entry
                     .router
                     .set_candidate_width(Some(crate::engine::paging::DEFAULT_CANDIDATE_WIDTH));
@@ -3305,6 +3541,9 @@ mod windows_exports {
 
             sync_idle_rankings(&self.get_impl().activation, token, &mut entry.router);
             let update = match match event {
+                Some(event) if event.is_script_toggle() => {
+                    Ok(entry.router.project_chinese_script(settings.chinese_script))
+                }
                 Some(event) => entry.router.process_key(event),
                 None => Ok(entry.router.commit_raw()),
             } {
@@ -3436,6 +3675,9 @@ mod windows_exports {
             let Some((_, english)) = self.key_mode(context) else {
                 return Ok(FALSE);
             };
+            if map_key_event(wparam).is_some_and(KeyEvent::is_script_toggle) {
+                return Ok(TRUE);
+            }
             // Route real chord keys through OnKeyDown so they can disarm Shift
             // even when they ultimately pass through in English mode.
             let pending = self
@@ -3459,7 +3701,7 @@ mod windows_exports {
             };
             let key = context_key(context)?;
 
-            let (router, page_size, lexicon, rankings, auto_phrase_lexicon) = {
+            let (router, page_size, lexicon, rankings, auto_phrase_lexicon, script) = {
                 let Ok(activation) = self.get_impl().activation.try_borrow() else {
                     return Ok(FALSE);
                 };
@@ -3479,6 +3721,7 @@ mod windows_exports {
                     active.lexicon.clone(),
                     Arc::clone(&active.rankings),
                     active.auto_phrase_lexicon.clone(),
+                    active.settings.chinese_script,
                 )
             };
             let mut router = match router {
@@ -3494,6 +3737,7 @@ mod windows_exports {
                 },
             };
             if !router.is_composing() {
+                router.set_chinese_script(script);
                 router.set_ranking_orders(rankings);
                 router.set_auto_phrase_lexicon(auto_phrase_lexicon);
             }
@@ -3547,6 +3791,8 @@ mod windows_exports {
                 return Ok(FALSE);
             };
             let key = context_key(context)?;
+            let script_toggle = map_key_event(wparam).is_some_and(KeyEvent::is_script_toggle);
+            let repeat = lparam.0 as usize & (1 << 30) != 0;
             {
                 let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
                     return Ok(FALSE);
@@ -3571,6 +3817,30 @@ mod windows_exports {
                 if !was_pressed && active.shift.pressed.is_some() {
                     active.shift.context_generation = active.context_generation.get();
                 }
+                if script_toggle {
+                    active.shift.pressed = None;
+                    if !repeat {
+                        // This is activation-local state, never persisted to Settings.
+                        active.settings.chinese_script = match active.settings.chinese_script {
+                            crate::ChineseScript::Simplified => crate::ChineseScript::Traditional,
+                            crate::ChineseScript::Traditional => crate::ChineseScript::Simplified,
+                        };
+                        for (context, entry) in active.contexts.iter_mut() {
+                            entry.popup_model.hide();
+                            if *context != key {
+                                entry
+                                    .router
+                                    .project_chinese_script(active.settings.chinese_script);
+                            }
+                        }
+                    }
+                }
+            }
+            if script_toggle {
+                if repeat {
+                    return Ok(TRUE);
+                }
+                return self.apply_engine_key(context, map_key_event(wparam));
             }
             // Let native Shift reach the host so normal Shift shortcuts keep working.
             if shift.is_some() || english {
@@ -3741,6 +4011,7 @@ mod windows_exports {
                 processing: false,
                 english: false,
                 shift: ShiftGesture::default(),
+                settings_worker: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
                 settings: Settings::default(),
@@ -5493,6 +5764,7 @@ mod windows_exports {
                     processing: false,
                     english: false,
                     shift: ShiftGesture::default(),
+                    settings_worker: None,
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
                     settings: Settings {
@@ -5876,6 +6148,7 @@ mod windows_exports {
                     processing: false,
                     english: false,
                     shift: ShiftGesture::default(),
+                    settings_worker: None,
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
                     settings: Settings {
@@ -6200,6 +6473,7 @@ mod windows_exports {
                 processing: false,
                 english: false,
                 shift: ShiftGesture::default(),
+                settings_worker: None,
                 context_generation: generation,
                 _thread_events: Some(events),
                 settings: Settings::default(),
@@ -6231,6 +6505,388 @@ mod windows_exports {
                 assert!(!ai.attempted);
             }
             (service, shared)
+        }
+
+        /// Changes only this test thread's keyboard table; never injects input.
+        struct LocalKeyboard([u8; 256]);
+        impl LocalKeyboard {
+            fn set(modifiers: Modifiers) -> Self {
+                #[link(name = "user32")]
+                extern "system" {
+                    fn SetKeyboardState(state: *const u8) -> BOOL;
+                }
+                let mut old = [0; 256];
+                unsafe {
+                    GetKeyboardState(&mut old).unwrap();
+                }
+                let mut keys = [0; 256];
+                for (vk, down) in [
+                    (0x10, modifiers.shift),
+                    (0x11, modifiers.control),
+                    (0x12, modifiers.alt),
+                    (0x5B, modifiers.meta),
+                ] {
+                    if down {
+                        keys[vk] = 0x80;
+                    }
+                }
+                assert!(unsafe { SetKeyboardState(keys.as_ptr()) }.as_bool());
+                Self(old)
+            }
+        }
+        impl Drop for LocalKeyboard {
+            fn drop(&mut self) {
+                #[link(name = "user32")]
+                extern "system" {
+                    fn SetKeyboardState(state: *const u8) -> BOOL;
+                }
+                assert!(unsafe { SetKeyboardState(self.0.as_ptr()) }.as_bool());
+            }
+        }
+
+        #[test]
+        fn native_keyboard_symbols_and_script_toggle() {
+            unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            }
+            let _apartment = Apartment;
+            let _keyboard = LocalKeyboard::set(Modifiers::NONE);
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = ai_fixture(
+                &host,
+                &Rc::new(CapturedAi::default()),
+                &Rc::new(Cell::new(0)),
+            );
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            send_key(&sink, &host.context, 0x1B);
+            shared.borrow_mut().as_mut().unwrap().lexicon =
+                Lexicon::from_tsv("zhong'guo\t中国\t100").unwrap();
+            // Start fresh so its router uses this small fixed lexicon.
+            shared.borrow_mut().as_mut().unwrap().contexts.clear();
+            for key in b"ZHONGGUO" {
+                send_key(&sink, &host.context, *key);
+            }
+            let context = context_key(&host.context);
+            let old = shared.borrow().as_ref().unwrap().contexts[&context]
+                .popup_model
+                .snapshot()
+                .unwrap()
+                .clone();
+            let stale_ai = {
+                let mut state = shared.borrow_mut();
+                let active = state.as_mut().unwrap();
+                let ticket = AiTicket {
+                    id: 700,
+                    token: active.token,
+                    owner: active.owner_thread,
+                    epoch: active.focus_epoch,
+                    generation: active.context_generation.get(),
+                    key: context,
+                    revision: old.revision,
+                };
+                active.ai.as_mut().unwrap().pending = Some(AiPending {
+                    ticket: ticket.clone(),
+                    queued: Instant::now(),
+                    dispatched: Some(Instant::now()),
+                    input: None,
+                    reading: false,
+                });
+                ticket
+            };
+            {
+                let _keys = LocalKeyboard::set(Modifiers::CONTROL.with_shift());
+                for _ in 0..3 {
+                    assert!(
+                        unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x46), LPARAM(0)) }
+                            .unwrap()
+                            .as_bool()
+                    );
+                }
+                assert_eq!(
+                    shared.borrow().as_ref().unwrap().settings.chinese_script,
+                    crate::ChineseScript::Simplified
+                );
+                assert!(shared
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .ai
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .is_some());
+                assert!(
+                    unsafe { sink.OnKeyDown(&host.context, WPARAM(0x46), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+                assert!(
+                    unsafe { sink.OnKeyDown(&host.context, WPARAM(0x46), LPARAM(1 << 30)) }
+                        .unwrap()
+                        .as_bool()
+                );
+                let state = shared.borrow();
+                let active = state.as_ref().unwrap();
+                assert_eq!(
+                    active.settings.chinese_script,
+                    crate::ChineseScript::Traditional
+                );
+                assert!(active.shift.pressed.is_none());
+                assert!(active.ai.as_ref().unwrap().pending.is_none());
+                assert!(!ai_ticket_valid(active, &stale_ai));
+                let entry = &active.contexts[&context];
+                assert_eq!(entry.router.pending_input(), "zhongguo");
+                assert_eq!(
+                    entry.router.session().candidates_on_current_page()[0].text,
+                    "中國"
+                );
+                assert!(entry.popup_model.snapshot().unwrap().revision > old.revision);
+                assert!(entry
+                    .popup_model
+                    .accept_action(&CandidatePopupAction::Select {
+                        revision: old.revision,
+                        page: old.page,
+                        index: 0,
+                    })
+                    .is_err());
+                assert!(entry.router.pending_learning().is_empty());
+                assert!(entry.router.pending_promotions().is_empty());
+            }
+            let mut extra = None;
+            let mut cookie = 0;
+            unsafe {
+                host.document
+                    .CreateContext(host.client, 0, None, &mut extra, &mut cookie)
+                    .unwrap();
+                host.document.Push(extra.as_ref().unwrap()).unwrap();
+            }
+            let extra = extra.unwrap();
+            for key in b"ZHONGGUO" {
+                send_key(&sink, &extra, *key);
+            }
+            assert_eq!(
+                shared.borrow().as_ref().unwrap().contexts[&context_key(&extra)]
+                    .router
+                    .session()
+                    .candidates_on_current_page()[0]
+                    .text,
+                "中國"
+            );
+            {
+                let _keys = LocalKeyboard::set(Modifiers::CONTROL.with_shift());
+                send_key(&sink, &extra, 0x46);
+                assert_eq!(
+                    shared.borrow().as_ref().unwrap().contexts[&context]
+                        .router
+                        .session()
+                        .candidates_on_current_page()[0]
+                        .text,
+                    "中国"
+                );
+                send_key(&sink, &extra, 0x46);
+            }
+            unsafe {
+                host.document.Pop(0).unwrap();
+            }
+            assert_eq!(read_document(&host, None), "zhongguo");
+            send_key(&sink, &host.context, 0x1B);
+            let mut expected = String::new();
+            for (vk, output) in (0x30..=0x39)
+                .zip(["）", "！", "@", "#", "$", "%", "……", "&", "*", "（"])
+                .chain(std::iter::once((0xBB, "+")))
+            {
+                for composing in [false, true] {
+                    if composing {
+                        for key in b"ZHONGGUO" {
+                            send_key(&sink, &host.context, *key);
+                        }
+                        expected.push_str("中國");
+                    }
+                    {
+                        let _keys = LocalKeyboard::set(Modifiers::SHIFT);
+                        send_key(&sink, &host.context, vk);
+                    }
+                    expected.push_str(output);
+                    assert_eq!(read_document(&host, None), expected);
+                }
+            }
+            shared.borrow_mut().as_mut().unwrap().english = true;
+            {
+                let _keys = LocalKeyboard::set(Modifiers::CONTROL.with_shift());
+                send_key(&sink, &host.context, 0x46);
+            }
+            assert!(shared.borrow().as_ref().unwrap().english);
+            assert_eq!(
+                shared.borrow().as_ref().unwrap().settings.chinese_script,
+                crate::ChineseScript::Simplified
+            );
+            for modifiers in [
+                Modifiers::CONTROL,
+                Modifiers::CONTROL.with_shift().with_alt(),
+                Modifiers::CONTROL.with_shift().with_meta(),
+            ] {
+                let _keys = LocalKeyboard::set(modifiers);
+                assert!(
+                    !unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x46), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+                assert!(
+                    !unsafe { sink.OnKeyDown(&host.context, WPARAM(0x46), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+            }
+            assert_eq!(read_document(&host, None), expected);
+            shared.borrow_mut().take();
+        }
+
+        #[test]
+        fn native_settings_worker_delay_coalesce_cancel_and_ai_off() {
+            unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            }
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (_service, shared) = ai_fixture(
+                &host,
+                &Rc::new(CapturedAi::default()),
+                &Rc::new(Cell::new(0)),
+            );
+            let (token, owner) = {
+                let mut state = shared.borrow_mut();
+                let active = state.as_mut().unwrap();
+                active.ai = None;
+                active.settings.ai_correction_enabled = false;
+                (active.token, active.owner_thread)
+            };
+            for cancel in [false, true] {
+                let (release, blocked) = std::sync::mpsc::channel();
+                let (entered, started) = std::sync::mpsc::channel();
+                let started_at = Instant::now();
+                queue_settings_check(
+                    shared.borrow_mut().as_mut().unwrap(),
+                    context_key(&host.context),
+                    move || {
+                        entered.send(()).unwrap();
+                        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                        Ok(std::path::PathBuf::from("fixture-never-executed.exe"))
+                    },
+                )
+                .unwrap();
+                started.recv_timeout(Duration::from_secs(2)).unwrap();
+                queue_settings_check(
+                    shared.borrow_mut().as_mut().unwrap(),
+                    context_key(&host.context),
+                    || panic!("duplicate click must coalesce"),
+                )
+                .unwrap();
+                assert!(poll_settings_result(&shared, token, owner).is_none());
+                println!(
+                    "settings fixture queue+worker-start handshake: {:?}",
+                    started_at.elapsed()
+                );
+                assert!(started_at.elapsed() < Duration::from_millis(500));
+                if cancel {
+                    shared.borrow_mut().as_mut().unwrap().focus_epoch += 1;
+                }
+                release.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut result = None;
+                while shared.borrow().as_ref().unwrap().settings_worker.is_some() {
+                    result = poll_settings_result(&shared, token, owner).or(result);
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                assert_eq!(result.is_some(), !cancel);
+                assert!(shared.borrow().as_ref().unwrap().ai.is_none());
+            }
+            // Real 50ms popup timer, AI disabled, with a fake owner publisher.
+            // No fixture path is ever passed to Command::spawn.
+            let published = Rc::new(RefCell::new(Vec::new()));
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let weak = Rc::downgrade(&shared);
+            let results = published.clone();
+            popup
+                .set_idle_sink(Some(Rc::new(move || {
+                    if let Some(shared) = weak.upgrade() {
+                        settings_idle_with(&shared, token, owner, |result| {
+                            results.borrow_mut().push(result);
+                        });
+                    }
+                })))
+                .unwrap();
+            for fail in [false, true] {
+                let before = Instant::now();
+                queue_settings_check(
+                    shared.borrow_mut().as_mut().unwrap(),
+                    context_key(&host.context),
+                    move || {
+                        std::thread::sleep(Duration::from_millis(120));
+                        if fail {
+                            Err(AiStatus::UnsafeDirectory)
+                        } else {
+                            Ok(std::path::PathBuf::from("fixture-never-executed.exe"))
+                        }
+                    },
+                )
+                .unwrap();
+                println!(
+                    "settings fixture queue (120ms validator): {:?}",
+                    before.elapsed()
+                );
+                assert!(before.elapsed() < Duration::from_millis(100));
+                // The production idle entry itself must return while AI is off.
+                ai_idle(&shared, token, owner);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while shared.borrow().as_ref().unwrap().settings_worker.is_some() {
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+                    };
+                    let mut message = MSG::default();
+                    unsafe {
+                        while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                            let _ = TranslateMessage(&message);
+                            DispatchMessageW(&message);
+                        }
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(published.borrow().last().unwrap().is_err(), fail);
+            }
+            assert_eq!(published.borrow().len(), 2);
+            popup.set_idle_sink(None).unwrap();
+            popup.destroy().unwrap();
+            // Drop must wait for the validator and release no detached worker.
+            let (entered, started) = std::sync::mpsc::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (finished, done) = std::sync::mpsc::channel();
+            queue_settings_check(
+                shared.borrow_mut().as_mut().unwrap(),
+                context_key(&host.context),
+                move || {
+                    entered.send(()).unwrap();
+                    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                    finished.send(()).unwrap();
+                    Err(AiStatus::UnsafeDirectory)
+                },
+            )
+            .unwrap();
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                release.send(()).unwrap();
+            });
+            let before = Instant::now();
+            shared.borrow_mut().take();
+            println!(
+                "settings fixture activation drop+join (80ms release): {:?}",
+                before.elapsed()
+            );
+            assert!(before.elapsed() >= Duration::from_millis(60));
+            done.try_recv().unwrap();
+            releaser.join().unwrap();
         }
 
         fn tick_ai(shared: &SharedActivation) {
@@ -7512,6 +8168,7 @@ mod windows_exports {
                 processing: false,
                 english: false,
                 shift: ShiftGesture::default(),
+                settings_worker: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
                 settings: Settings::default(),
@@ -7754,6 +8411,7 @@ mod windows_exports {
                 processing: false,
                 english: false,
                 shift: ShiftGesture::default(),
+                settings_worker: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
                 settings: Settings::default(),

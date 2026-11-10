@@ -26,6 +26,7 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub chinese_script: crate::ChineseScript,
     pub candidate_page_size: usize,
     pub theme: Theme,
     pub ai_correction_enabled: bool,
@@ -35,6 +36,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            chinese_script: crate::ChineseScript::default(),
             candidate_page_size: DEFAULT_CANDIDATE_PAGE_SIZE,
             theme: Theme::System,
             ai_correction_enabled: true,
@@ -368,6 +370,7 @@ mod tests {
         let store = temporary_store();
         let settings = Settings {
             candidate_page_size: 7,
+            chinese_script: crate::ChineseScript::Traditional,
             theme: Theme::Dark,
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,
@@ -377,6 +380,7 @@ mod tests {
 
         let replacement = Settings {
             candidate_page_size: 19,
+            chinese_script: crate::ChineseScript::Simplified,
             theme: Theme::Light,
             ai_correction_enabled: true,
             ai_undeclared_scope_compatibility: true,
@@ -398,6 +402,7 @@ mod tests {
         let store = temporary_store();
         let original = Settings {
             candidate_page_size: 9,
+            chinese_script: crate::ChineseScript::Simplified,
             theme: Theme::System,
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,
@@ -407,6 +412,7 @@ mod tests {
 
         let settings = Settings {
             candidate_page_size: 0,
+            chinese_script: crate::ChineseScript::Simplified,
             theme: Theme::Dark,
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,
@@ -445,6 +451,7 @@ mod tests {
         let store = temporary_store();
         let settings = Settings {
             candidate_page_size: 21,
+            chinese_script: crate::ChineseScript::Traditional,
             theme: Theme::Dark,
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,

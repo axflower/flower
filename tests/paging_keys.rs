@@ -1,21 +1,37 @@
 use flower::engine::{keymap::map_windows_virtual_key, Key, KeyEvent, Modifiers, PinyinSession};
 
 #[test]
-fn plus_and_minus_page_only_during_composition_without_eating_shortcuts() {
+fn paging_keys_keep_shortcuts_while_plus_commits_symbol() {
     let mut session =
         PinyinSession::from_lexicon_tsv("shi\t是\t100\nshi\t时\t90\nshi\t事\t80", 1).unwrap();
-    for key in [Key::Char('+'), Key::Char('-'), Key::Char('=')] {
+    for key in [Key::Char('-'), Key::Char('=')] {
         assert!(!session.process_key(KeyEvent::plain(key)).unwrap().handled);
     }
+    assert_eq!(
+        session
+            .process_key(KeyEvent::plain(Key::Char('+')))
+            .unwrap()
+            .commit
+            .as_deref(),
+        Some("+")
+    );
     for letter in "shi".chars() {
         session
             .process_key(KeyEvent::plain(Key::Char(letter)))
             .unwrap();
     }
     assert_eq!(session.page(), 0);
-    session
-        .process_key(KeyEvent::plain(Key::Char('+')))
-        .unwrap();
+    let mut symbol = session.clone();
+    assert_eq!(
+        symbol
+            .process_key(KeyEvent::plain(Key::Char('+')))
+            .unwrap()
+            .commit
+            .as_deref(),
+        Some("是+")
+    );
+    assert!(!symbol.is_composing());
+    session.process_key(KeyEvent::plain(Key::PageDown)).unwrap();
     assert_eq!(session.page(), 1);
     session
         .process_key(KeyEvent::plain(Key::Char('=')))
@@ -46,7 +62,7 @@ fn plus_and_minus_page_only_during_composition_without_eating_shortcuts() {
 fn windows_punctuation_and_numpad_preserve_modifiers() {
     for (vk, modifiers, key) in [
         (0xBB, Modifiers::NONE, Key::PageDown),
-        (0xBB, Modifiers::SHIFT, Key::PageDown),
+        (0xBB, Modifiers::SHIFT, Key::Char('+')),
         (0x6B, Modifiers::NONE, Key::PageDown),
         (0xBD, Modifiers::NONE, Key::PageUp),
         (0x6D, Modifiers::NONE, Key::PageUp),

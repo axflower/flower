@@ -1,11 +1,16 @@
 //! 纯 Rust/Win32 的 Flower 设置窗口。
 //!
 //! 此模块只由独立的 `flower-settings` 可执行文件使用。窗口拥有自己的
-//! 消息循环，不创建托盘或后台线程，也不影响 DLL 中 TSF 服务的宿主消息循环。
+//! 消息循环与初始词典读取线程，不影响 DLL 中 TSF 服务的宿主消息循环。
 
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
+use std::thread::JoinHandle;
 
 use windows::core::{Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{
@@ -37,7 +42,53 @@ use crate::settings::{
     parse_candidate_page_size_input, Settings, SettingsStore, Theme, MAX_CANDIDATE_PAGE_SIZE,
     MIN_CANDIDATE_PAGE_SIZE,
 };
-use crate::user_dictionary::DictionaryStore;
+use crate::user_dictionary::{DictionaryStore, UserDictionary};
+
+const DICTIONARY_TIMER: usize = 0x4644;
+type DictionaryResult = Result<UserDictionary, String>;
+
+struct InitialDictionaryLoad {
+    cancelled: Arc<AtomicBool>,
+    result: mpsc::Receiver<DictionaryResult>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl InitialDictionaryLoad {
+    fn start(load: impl FnOnce() -> DictionaryResult + Send + 'static) -> Result<Self, String> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = cancelled.clone();
+        let (sender, result) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("settings-dictionary".into())
+            .spawn(move || {
+                if token.load(Ordering::Acquire) {
+                    return;
+                }
+                let result = catch_unwind(AssertUnwindSafe(load))
+                    .unwrap_or_else(|_| Err("词典读取线程失败".into()));
+                if !token.load(Ordering::Acquire) {
+                    let _ = sender.send(result);
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            cancelled,
+            result,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for InitialDictionaryLoad {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        // Store reads cannot be interrupted mid-I/O. Join before releasing the
+        // window-owned state; no worker ever holds an HWND or UI pointer.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 const WINDOW_CLASS_NAME: PCWSTR = windows::core::w!("Flower.SettingsWindow");
 const FONT_FACE: PCWSTR = windows::core::w!("Microsoft YaHei UI");
@@ -193,6 +244,8 @@ const AI_CORRECTION_ID: i32 = 111;
 const AI_CORRECTION_HINT_ID: i32 = 112;
 const LEARNING_HINT_ID: i32 = 113;
 const AI_SCOPE_COMPATIBILITY_ID: i32 = 114;
+const SCRIPT_LABEL_ID: i32 = 119;
+const SCRIPT_COMBO_ID: i32 = 120;
 const SAVE_BUTTON_ID: i32 = IDOK.0;
 const CANCEL_BUTTON_ID: i32 = IDCANCEL.0;
 
@@ -277,6 +330,11 @@ pub fn run_settings_app() -> Result<(), String> {
         saving: false,
         creation_error: None,
         domain_names: Vec::new(),
+        dictionary_ready: false,
+        initial_dictionary: None,
+        initial_started: false,
+        #[cfg(test)]
+        initial_loader: None,
     }));
     let state_pointer = state_pointer(state.as_ref());
     let dpi = unsafe { GetDpiForSystem() }.max(BASE_DPI);
@@ -505,16 +563,22 @@ struct SettingsUiState {
     saving: bool,
     creation_error: Option<String>,
     domain_names: Vec<String>,
+    dictionary_ready: bool,
+    initial_dictionary: Option<InitialDictionaryLoad>,
+    initial_started: bool,
+    #[cfg(test)]
+    initial_loader: Option<Box<dyn FnOnce() -> DictionaryResult + Send>>,
 }
 
 #[derive(Clone, Copy, Default)]
 struct SettingsControls {
+    script_combo: HWND,
     page_edit: HWND,
     theme_combo: HWND,
     save_button: HWND,
     cancel_button: HWND,
     notice: HWND,
-    labels: [HWND; 3],
+    labels: [HWND; 4],
     learning: HWND,
     clear_learning: HWND,
     domain_combo: HWND,
@@ -599,7 +663,9 @@ unsafe fn handle_settings_message(
                 && notification == windows::Win32::UI::WindowsAndMessaging::CBN_SELCHANGE
             {
                 if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
-                    refresh_dictionary(hwnd, state);
+                    if state.borrow().dictionary_ready {
+                        refresh_dictionary(hwnd, state);
+                    }
                 }
             }
             LRESULT(0)
@@ -610,6 +676,15 @@ unsafe fn handle_settings_message(
         }
         windows::Win32::UI::WindowsAndMessaging::WM_PAINT => {
             paint_settings(hwnd);
+            if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                start_initial_dictionary(hwnd, state);
+            }
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == DICTIONARY_TIMER => {
+            if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                poll_initial_dictionary(hwnd, state);
+            }
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_PRINTCLIENT => {
@@ -694,6 +769,14 @@ unsafe fn handle_settings_message(
             LRESULT(0)
         }
         WM_DESTROY => {
+            if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                unsafe {
+                    let _ =
+                        windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, DICTIONARY_TIMER);
+                }
+                state.borrow_mut().dictionary_ready = false;
+                state.borrow_mut().initial_dictionary.take();
+            }
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -794,6 +877,46 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
     )?;
     update_controls(state, |controls| controls.theme_combo = theme_combo)?;
 
+    let label = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("STATIC"),
+        windows::core::w!("输出字形"),
+        WS_CHILD.0 | WS_VISIBLE.0,
+        SCRIPT_LABEL_ID,
+    )?;
+    update_controls(state, |controls| controls.labels[3] = label)?;
+
+    let script_combo = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("COMBOBOX"),
+        PCWSTR::null(),
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+        SCRIPT_COMBO_ID,
+    )?;
+    update_controls(state, |controls| controls.script_combo = script_combo)?;
+    for text in ["简体", "通用繁体"] {
+        let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            SendMessageW(
+                script_combo,
+                CB_ADDSTRING,
+                WPARAM::default(),
+                LPARAM(text.as_ptr() as isize),
+            );
+        }
+    }
+    unsafe {
+        SendMessageW(
+            script_combo,
+            CB_SETCURSEL,
+            WPARAM(usize::from(
+                settings.chinese_script == crate::ChineseScript::Traditional,
+            )),
+            LPARAM::default(),
+        );
+    }
     let ai_correction = create_control(
         hwnd,
         instance,
@@ -936,7 +1059,20 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
             _ => controls.dictionary_status = control,
         })?;
     }
-    refresh_dictionary(hwnd, state);
+    for control in {
+        let c = state.borrow().controls;
+        [
+            c.learning,
+            c.clear_learning,
+            c.domain_combo,
+            c.domain_enabled,
+        ]
+    } {
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(control, FALSE);
+        }
+    }
+    set_control_text(hwnd, DICTIONARY_STATUS_ID, "正在读取用户词典…")?;
 
     set_control_text(
         hwnd,
@@ -1056,8 +1192,10 @@ fn control_layout(c: SettingsControls) -> Vec<(HWND, [i32; 4])> {
         (c.labels[0], [48, 168, 292, 24]),
         (c.page_edit, [48, 200, 80, 32]),
         (c.labels[1], [140, 204, 200, 24]),
-        (c.labels[2], [48, 252, 292, 24]),
-        (c.theme_combo, [48, 284, 292, 128]),
+        (c.labels[2], [48, 252, 136, 24]),
+        (c.theme_combo, [48, 284, 136, 128]),
+        (c.labels[3], [204, 252, 136, 24]),
+        (c.script_combo, [204, 284, 136, 100]),
         (c.ai_correction, [412, 168, 300, 28]),
         (c.ai_scope_compatibility, [412, 204, 300, 28]),
         (c.ai_correction_hint, [412, 240, 300, 108]),
@@ -1098,7 +1236,9 @@ fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), Window
         controls.page_edit,
         controls.labels[1],
         controls.labels[2],
+        controls.labels[3],
         controls.theme_combo,
+        controls.script_combo,
         controls.notice,
         controls.save_button,
         controls.cancel_button,
@@ -1234,20 +1374,24 @@ fn theme_dropdown_open(state: &RefCell<SettingsUiState>) -> bool {
     let Ok(controls) = state.try_borrow().map(|state| state.controls) else {
         return false;
     };
-    [controls.theme_combo, controls.domain_combo]
-        .iter()
-        .any(|&combo| {
-            !combo.is_invalid()
-                && unsafe {
-                    SendMessageW(
-                        combo,
-                        CB_GETDROPPEDSTATE,
-                        WPARAM::default(),
-                        LPARAM::default(),
-                    )
-                }
-                .0 != 0
-        })
+    [
+        controls.theme_combo,
+        controls.domain_combo,
+        controls.script_combo,
+    ]
+    .iter()
+    .any(|&combo| {
+        !combo.is_invalid()
+            && unsafe {
+                SendMessageW(
+                    combo,
+                    CB_GETDROPPEDSTATE,
+                    WPARAM::default(),
+                    LPARAM::default(),
+                )
+            }
+            .0 != 0
+    })
 }
 
 fn selected_domain(state: &RefCell<SettingsUiState>, combo: HWND) -> Option<String> {
@@ -1291,18 +1435,79 @@ fn is_checked(control: HWND) -> bool {
 /// Re-read rather than treating a failed load as an empty/default dictionary.
 /// No RefCell borrow is held across a Win32 call (which can re-enter WndProc).
 fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
+    let store = state.borrow().dictionary_store.clone();
+    render_dictionary(hwnd, state, store.load().map_err(|error| error.to_string()));
+}
+
+fn start_initial_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
+    if state.borrow().initial_started {
+        return;
+    }
+    state.borrow_mut().initial_started = true;
+    // Flush child controls too before allowing the worker to start disk I/O.
+    for control in {
+        let c = state.borrow().controls;
+        [c.dictionary_status, c.learning, c.clear_learning]
+    } {
+        unsafe {
+            let _ = UpdateWindow(control);
+        }
+    }
+    let timer = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, DICTIONARY_TIMER, 30, None)
+    };
+    if timer == 0 {
+        render_dictionary(hwnd, state, Err("无法创建词典读取定时器".into()));
+        return;
+    }
+    let store = state.borrow().dictionary_store.clone();
+    #[cfg(test)]
+    let injected = state.borrow_mut().initial_loader.take();
+    let load = move || {
+        #[cfg(test)]
+        if let Some(load) = injected {
+            return load();
+        }
+        store.load().map_err(|error| error.to_string())
+    };
+    match InitialDictionaryLoad::start(load) {
+        Ok(worker) => state.borrow_mut().initial_dictionary = Some(worker),
+        Err(error) => {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, DICTIONARY_TIMER);
+            }
+            render_dictionary(hwnd, state, Err(error));
+        }
+    }
+}
+
+fn poll_initial_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
+    if !window_is_owned(hwnd, state) {
+        return;
+    }
+    let result = state
+        .borrow()
+        .initial_dictionary
+        .as_ref()
+        .map(|load| load.result.try_recv());
+    let result = match result {
+        Some(Ok(result)) => result,
+        Some(Err(mpsc::TryRecvError::Disconnected)) => Err("词典读取线程已停止".into()),
+        _ => return,
+    };
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, DICTIONARY_TIMER);
+    }
+    state.borrow_mut().initial_dictionary.take();
+    render_dictionary(hwnd, state, result);
+}
+
+fn render_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>, result: DictionaryResult) {
     let Ok(controls) = state.try_borrow().map(|state| state.controls) else {
         return;
     };
     let selected = selected_domain(state, controls.domain_combo);
-    let Some(store) = state
-        .try_borrow()
-        .ok()
-        .map(|state| state.dictionary_store.clone())
-    else {
-        return;
-    };
-    let result = store.load();
+    state.borrow_mut().dictionary_ready = result.is_ok();
     match result {
         Ok(data) => {
             let names: Vec<_> = data.domains.iter().map(|item| item.name.clone()).collect();
@@ -1419,6 +1624,9 @@ fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
 }
 
 fn dictionary_action(hwnd: HWND, state: &RefCell<SettingsUiState>, id: i32) {
+    if !state.try_borrow().is_ok_and(|state| state.dictionary_ready) {
+        return;
+    }
     let Some(_guard) = SaveGuard::acquire(state) else {
         return;
     };
@@ -1552,6 +1760,20 @@ fn read_form(state: &RefCell<SettingsUiState>) -> Result<Settings, String> {
         _ => return Err("请选择候选窗主题。".to_owned()),
     };
     let settings = Settings {
+        chinese_script: match unsafe {
+            SendMessageW(
+                controls.script_combo,
+                windows::Win32::UI::WindowsAndMessaging::CB_GETCURSEL,
+                WPARAM::default(),
+                LPARAM::default(),
+            )
+        }
+        .0
+        {
+            0 => crate::ChineseScript::Simplified,
+            1 => crate::ChineseScript::Traditional,
+            _ => return Err("请选择输出字形。".to_owned()),
+        },
         candidate_page_size: page_size,
         theme,
         ai_correction_enabled: is_checked(controls.ai_correction),
@@ -1719,6 +1941,8 @@ fn cleanup_window(hwnd: HWND, state: &RefCell<SettingsUiState>) -> WindowCleanup
     if previous != expected {
         return WindowCleanup::DetachFailed;
     }
+    state.borrow_mut().dictionary_ready = false;
+    state.borrow_mut().initial_dictionary.take();
 
     match unsafe { DestroyWindow(hwnd) } {
         Ok(()) => WindowCleanup::Destroyed,
@@ -1852,7 +2076,39 @@ mod tests {
             saving: false,
             creation_error: None,
             domain_names: Vec::new(),
+            dictionary_ready: false,
+            initial_dictionary: None,
+            initial_started: false,
+            initial_loader: None,
         })
+    }
+
+    #[test]
+    fn settings_initial_loader_cancel_joins_and_discards_late_result() {
+        let (entered, ready) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let mut load = InitialDictionaryLoad::start(move || {
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+            Ok(UserDictionary::default())
+        })
+        .unwrap();
+        ready.recv().unwrap();
+        load.cancelled.store(true, Ordering::Release);
+        release.send(()).unwrap();
+        load.worker.take().unwrap().join().unwrap();
+        assert!(matches!(
+            load.result.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        drop(load);
+    }
+
+    #[test]
+    fn settings_initial_loader_reports_failure_without_default_data() {
+        let mut load = InitialDictionaryLoad::start(|| Err("fixture failure".into())).unwrap();
+        load.worker.take().unwrap().join().unwrap();
+        assert_eq!(load.result.recv().unwrap().unwrap_err(), "fixture failure");
     }
 
     #[test]
@@ -1892,12 +2148,43 @@ mod tests {
         let controls = SettingsControls {
             theme_combo: HWND(1usize as *mut c_void),
             domain_combo: HWND(2usize as *mut c_void),
+            script_combo: HWND(3usize as *mut c_void),
+            labels: [
+                HWND::default(),
+                HWND::default(),
+                HWND(4usize as *mut c_void),
+                HWND(5usize as *mut c_void),
+            ],
             ..Default::default()
         };
-        let rectangles: Vec<_> = control_layout(controls)
+        let layout = control_layout(controls);
+        let card = CARDS[0];
+        for (label, combo) in [
+            (controls.labels[2], controls.theme_combo),
+            (controls.labels[3], controls.script_combo),
+        ] {
+            let label_rect = layout.iter().find(|(hwnd, _)| *hwnd == label).unwrap().1;
+            let mut combo_rect = layout.iter().find(|(hwnd, _)| *hwnd == combo).unwrap().1;
+            combo_rect[3] = 32;
+            assert_eq!(label_rect[0], combo_rect[0]);
+            assert_eq!(label_rect[2], combo_rect[2]);
+            assert!(label_rect[1] + label_rect[3] <= combo_rect[1]);
+            for rect in [label_rect, combo_rect] {
+                assert!(rect[0] >= card[0] && rect[1] >= card[1]);
+                assert!(rect[0] + rect[2] <= card[0] + card[2]);
+                assert!(rect[1] + rect[3] <= card[1] + card[3]);
+            }
+        }
+        let rectangles: Vec<_> = layout
             .into_iter()
             .map(|(hwnd, mut rect)| {
-                if hwnd == controls.theme_combo || hwnd == controls.domain_combo {
+                if [
+                    controls.theme_combo,
+                    controls.domain_combo,
+                    controls.script_combo,
+                ]
+                .contains(&hwnd)
+                {
                     rect[3] = 32;
                 }
                 rect
@@ -2042,12 +2329,85 @@ mod tests {
             )
         }
         .unwrap();
+        let (release, blocked) = mpsc::channel();
+        let fixture_store = preview.state.borrow().dictionary_store.clone();
+        preview.state.borrow_mut().initial_loader = Some(Box::new(move || {
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            fixture_store.load().map_err(|error| error.to_string())
+        }));
+        let first_paint = std::time::Instant::now();
         unsafe {
             let _ = ShowWindow(
                 preview.hwnd,
                 windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
             );
             let _ = UpdateWindow(preview.hwnd);
+        }
+        assert!(
+            unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(preview.hwnd) }
+                .as_bool()
+        );
+        assert!(preview.state.borrow().initial_started);
+        assert!(!preview.state.borrow().dictionary_ready);
+        for control in {
+            let c = preview.state.borrow().controls;
+            [
+                c.learning,
+                c.clear_learning,
+                c.domain_combo,
+                c.domain_enabled,
+            ]
+        } {
+            assert!(!unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(control)
+            }
+            .as_bool());
+        }
+        assert!(
+            read_control_text(preview.state.borrow().controls.dictionary_status)
+                .unwrap()
+                .contains("正在读取")
+        );
+        for id in [LEARNING_ID, CLEAR_LEARNING_ID, DOMAIN_ENABLED_ID] {
+            dictionary_action(preview.hwnd, preview.state.as_ref(), id);
+        }
+        assert!(!directory.join("dictionary.json").exists());
+        write_preview_bitmap(preview.hwnd, &directory.join("settings-loading.bmp"));
+        println!(
+            "owned fixture first paint before release: {:?}",
+            first_paint.elapsed()
+        );
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !preview.state.borrow().dictionary_ready {
+            assert!(std::time::Instant::now() < deadline);
+            let mut message = MSG::default();
+            unsafe {
+                while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                    &mut message,
+                    preview.hwnd,
+                    0,
+                    0,
+                    windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+                )
+                .as_bool()
+                {
+                    let _ = DispatchMessageW(&message);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for (label, expected) in [
+            (preview.state.borrow().controls.labels[2], "候选窗主题"),
+            (preview.state.borrow().controls.labels[3], "输出字形"),
+        ] {
+            assert_eq!(read_control_text(label).unwrap(), expected);
+            assert!(
+                unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(label) }
+                    .as_bool()
+            );
         }
         if check_route {
             assert_owned_keyboard_route(preview.hwnd, preview.state.as_ref(), &directory);
@@ -2089,12 +2449,80 @@ mod tests {
         assert!(!is_checked(learning));
         std::fs::write(dictionary.path(), b"invalid fixture json").unwrap();
         refresh_dictionary(preview.hwnd, preview.state.as_ref());
+        assert!(!is_checked(learning));
+        assert!(
+            !unsafe { windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(learning) }
+                .as_bool()
+        );
+        for id in [LEARNING_ID, CLEAR_LEARNING_ID, DOMAIN_ENABLED_ID] {
+            dictionary_action(preview.hwnd, preview.state.as_ref(), id);
+        }
         write_preview_bitmap(preview.hwnd, &directory.join("settings-error.bmp"));
         assert_eq!(
             std::fs::read(dictionary.path()).unwrap(),
             b"invalid fixture json"
         );
         assert!(!directory.join("settings.json").exists());
+        // Re-enter the initial path with corrupt owned bytes. Poll the same
+        // completion channel as production, rather than treating failure as
+        // an empty dictionary.
+        preview.state.borrow_mut().initial_started = false;
+        start_initial_dictionary(preview.hwnd, preview.state.as_ref());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while preview.state.borrow().initial_dictionary.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            poll_initial_dictionary(preview.hwnd, preview.state.as_ref());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!preview.state.borrow().dictionary_ready);
+        assert_eq!(
+            std::fs::read(dictionary.path()).unwrap(),
+            b"invalid fixture json"
+        );
+
+        // Destroy while the loader is inside a simulated blocking read. The
+        // release helper owns only a channel, not the HWND or UI state.
+        let (entered, ready) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        preview.state.borrow_mut().initial_started = false;
+        preview.state.borrow_mut().initial_loader = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+            Ok(UserDictionary::default())
+        }));
+        start_initial_dictionary(preview.hwnd, preview.state.as_ref());
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let token = preview
+            .state
+            .borrow()
+            .initial_dictionary
+            .as_ref()
+            .unwrap()
+            .cancelled
+            .clone();
+        let helper = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !token.load(Ordering::Acquire) {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            release.send(()).unwrap();
+        });
+        unsafe {
+            DestroyWindow(preview.hwnd).unwrap();
+        }
+        helper.join().unwrap();
+        assert!(preview.state.borrow().initial_dictionary.is_none());
+        assert!(!preview.state.borrow().dictionary_ready);
+        // A retained old state must not apply anything after HWND detachment.
+        poll_initial_dictionary(preview.hwnd, preview.state.as_ref());
+        assert!(!preview.state.borrow().dictionary_ready);
+        assert_eq!(
+            std::fs::read(dictionary.path()).unwrap(),
+            b"invalid fixture json"
+        );
         println!("native preview: {}", directory.display());
     }
 
@@ -2149,7 +2577,11 @@ mod tests {
         assert!(!preprocess_settings_key(hwnd, state, &foreign));
         // Both combos retain native Enter/Esc while expanded. Enable the
         // fixture's empty-domain combo only for exercising its native popup.
-        for combo in [controls.theme_combo, controls.domain_combo] {
+        for combo in [
+            controls.theme_combo,
+            controls.domain_combo,
+            controls.script_combo,
+        ] {
             let _ = unsafe { EnableWindow(combo, TRUE) };
             for key in [VK_RETURN.0, VK_ESCAPE.0] {
                 unsafe {

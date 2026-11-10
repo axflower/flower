@@ -6,6 +6,8 @@
 //! settings items are also re-exported at the crate root for convenience.
 
 pub mod ai;
+pub mod chinese;
+pub use chinese::ChineseScript;
 pub mod engine;
 pub mod platform;
 pub mod registration;

@@ -3,7 +3,26 @@ use std::sync::{Arc, OnceLock};
 
 use super::{Candidate, EngineError};
 
+#[cfg(test)]
 const BUILTIN_LEXICON: &str = flower_dict::DEFAULT_TSV;
+
+include!(concat!(env!("OUT_DIR"), "/builtin-dictionary.rs"));
+const BUILTIN_COMPRESSED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/builtin-dictionary.zlib"));
+
+fn builtin_dictionary_bytes(data: &[u8]) -> Result<Vec<u8>, EngineError> {
+    use sha2::{Digest, Sha256};
+    let bytes = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(data, BUILTIN_SIZE)
+        .map_err(|_| EngineError::InvalidUtf8 {
+            message: "compressed builtin dictionary is corrupt".into(),
+        })?;
+    if bytes.len() != BUILTIN_SIZE || <[u8; 32]>::from(Sha256::digest(&bytes)) != BUILTIN_SHA256 {
+        return Err(EngineError::InvalidUtf8 {
+            message: "builtin dictionary size or digest does not match".into(),
+        });
+    }
+    Ok(bytes)
+}
 
 const EVERYDAY_PHRASES: &str = flower_dict::EVERYDAY_TSV;
 
@@ -159,7 +178,13 @@ impl Lexicon {
     pub fn builtin() -> Result<Self, EngineError> {
         BUILTIN
             .get_or_init(|| {
-                let mut lexicon = Self::from_tsv(BUILTIN_LEXICON)?;
+                let bytes = builtin_dictionary_bytes(BUILTIN_COMPRESSED)?;
+                let text =
+                    std::str::from_utf8(&bytes).map_err(|error| EngineError::InvalidUtf8 {
+                        message: error.to_string(),
+                    })?;
+                let mut lexicon = Self::from_tsv(text)?;
+                drop(bytes);
                 let words: std::collections::HashSet<_> = EVERYDAY_PAIRS
                     .split_whitespace()
                     .filter_map(|pair| pair.split_once('='))
@@ -904,6 +929,22 @@ impl Lexicon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_builtin_preserves_exact_bytes_and_rejects_corruption() {
+        let bytes = builtin_dictionary_bytes(BUILTIN_COMPRESSED).unwrap();
+        assert_eq!(bytes, BUILTIN_LEXICON.as_bytes());
+        assert!(BUILTIN_COMPRESSED.len() < bytes.len() / 2);
+        assert!(
+            builtin_dictionary_bytes(&BUILTIN_COMPRESSED[..BUILTIN_COMPRESSED.len() / 2]).is_err()
+        );
+        let wrong = miniz_oxide::deflate::compress_to_vec_zlib(b"wrong dictionary", 1);
+        assert!(builtin_dictionary_bytes(&wrong).is_err());
+        let mut corrupt = BUILTIN_COMPRESSED.to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(builtin_dictionary_bytes(&corrupt).is_err());
+    }
 
     #[test]
     fn spelling_key_budget_is_shared_and_never_reset_between_segments() {

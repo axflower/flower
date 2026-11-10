@@ -32,7 +32,12 @@ fn builtin_ambiguities_promote_only_one_step_and_keep_raw_domains_separate() {
         let selected = before[2].text.clone();
         session.select_candidate(2).unwrap();
         let event = session.pending_promotions().last().unwrap().clone();
-        assert_eq!(event.selected.text, selected);
+        // Persistence keeps the original dictionary identity; the input
+        // surface is projected to the selected script without rewriting it.
+        assert_eq!(
+            flower::ChineseScript::Simplified.convert(&event.selected.text),
+            selected
+        );
         assert_eq!(event.selected.consumed, raw.len());
         let mut orders = Vec::new();
         assert!(promote_order(&mut orders, &event));
@@ -100,7 +105,7 @@ fn selected_mapping_moves_one_position_and_survives_a_new_store_and_session() {
 
     let reopened = DictionaryStore::new(fixture.0.join("dictionary.json"));
     let persisted = reopened.load().unwrap();
-    assert_eq!(persisted.schema_version, 2);
+    assert_eq!(persisted.schema_version, 3);
     // The saved stable identity also applies when the real embedded dictionary
     // includes additional candidates not present in the original fixture.
     assert!(Lexicon::builtin()

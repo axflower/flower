@@ -22,6 +22,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 9;
 /// Mutable Pinyin composition state.
 #[derive(Debug, Clone)]
 pub struct PinyinSession {
+    chinese_script: crate::ChineseScript,
     lexicon: Lexicon,
     auto_phrase_lexicon: Option<Arc<Lexicon>>,
     page_size: usize,
@@ -74,6 +75,7 @@ impl PinyinSession {
         }
 
         Ok(Self {
+            chinese_script: crate::ChineseScript::default(),
             lexicon,
             auto_phrase_lexicon: None,
             page_size,
@@ -102,6 +104,13 @@ impl PinyinSession {
     /// candidates on the current page. Space and Enter commit the highlighted
     /// candidate, or the raw Pinyin text if no candidate exists.
     pub fn process_key(&mut self, event: KeyEvent) -> Result<CompositionUpdate, EngineError> {
+        if event.is_script_toggle() {
+            let script = match self.chinese_script {
+                crate::ChineseScript::Simplified => crate::ChineseScript::Traditional,
+                crate::ChineseScript::Traditional => crate::ChineseScript::Simplified,
+            };
+            return Ok(self.project_chinese_script(script));
+        }
         if event.is_passthrough() {
             return Ok(self.snapshot(false));
         }
@@ -313,6 +322,17 @@ impl PinyinSession {
             '~' => "～",
             '^' => "……",
             '_' => "——",
+            '@' => "@",
+            '#' => "#",
+            '$' => "$",
+            '%' => "%",
+            '&' => "&",
+            '*' => "*",
+            '+' => "+",
+            '{' => "{",
+            '}' => "}",
+            '|' => "|",
+            '`' => "`",
             '"' => {
                 let text = if self.double_quote_open { "“" } else { "”" };
                 self.double_quote_open = !self.double_quote_open;
@@ -361,7 +381,7 @@ impl PinyinSession {
             };
             self.clear_composition();
             let mut update = self.snapshot(true);
-            update.commit = Some(corrected);
+            update.commit = Some(self.chinese_script.convert(&corrected));
             return Ok(update);
         }
         let promotion = (choice.consumed == self.raw.len()).then(|| PromotionEvent {
@@ -446,6 +466,26 @@ impl PinyinSession {
         self.page_size = page_size;
         self.rebuild_pages();
         Ok(())
+    }
+
+    /// Script changes are accepted only with an empty composition.
+    /// Reprojects without changing raw input, confirmed identities or learning.
+    pub fn project_chinese_script(&mut self, script: crate::ChineseScript) -> CompositionUpdate {
+        self.chinese_script = script;
+        self.pending_learning.clear();
+        self.pending_phrase_learning.clear();
+        self.pending_promotions.clear();
+        self.refresh_candidates();
+        self.snapshot(true)
+    }
+
+    /// Initialization-only setter; active composition uses projection above.
+    pub fn set_chinese_script(&mut self, script: crate::ChineseScript) -> bool {
+        if self.is_composing() {
+            return false;
+        }
+        self.chinese_script = script;
+        true
     }
 
     /// Reflows pages, preserving the absolute highlighted candidate.
@@ -620,8 +660,10 @@ impl PinyinSession {
 
     fn insert_ai_candidate(&mut self, corrected: &str) -> CompositionUpdate {
         let prefix: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
+        let display = self.chinese_script.convert(corrected);
         self.choices.retain(|c| {
-            c.consumed != self.raw.len() || format!("{}{}", prefix, c.candidate.text) != corrected
+            c.consumed != self.raw.len()
+                || Self::candidate_output(self.chinese_script, &prefix, &c.candidate) != display
         });
         let mut choice = Choice::word(
             Candidate::new(corrected, crate::ai::AI_COMMENT),
@@ -629,8 +671,9 @@ impl PinyinSession {
             1,
         );
         choice.events.clear();
-        self.choices.insert(1, choice);
-        self.candidates = self.choices.iter().map(|c| c.candidate.clone()).collect();
+        self.choices
+            .insert(usize::from(!self.choices.is_empty()), choice);
+        self.rebuild_display_candidates();
         self.rebuild_pages();
         self.snapshot(true)
     }
@@ -652,7 +695,7 @@ impl PinyinSession {
         self.pending_learning = events;
         self.pending_phrase_learning.extend(phrase);
         let mut update = self.snapshot(true);
-        update.commit = Some(text);
+        update.commit = Some(self.chinese_script.convert(&text));
         Ok(update)
     }
 
@@ -689,12 +732,14 @@ impl PinyinSession {
     }
 
     fn refresh_candidates(&mut self) {
-        self.preedit = self
-            .confirmed
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<String>()
-            + &self.raw;
+        self.preedit = self.chinese_script.convert(
+            &(self
+                .confirmed
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>()
+                + &self.raw),
+        );
         self.choices = self
             .auto_phrase_lexicon
             .as_ref()
@@ -763,11 +808,7 @@ impl PinyinSession {
         }
         let insertion = usize::from(!self.choices.is_empty());
         self.choices.splice(insertion..insertion, spelling);
-        self.candidates = self
-            .choices
-            .iter()
-            .map(|choice| choice.candidate.clone())
-            .collect();
+        self.rebuild_display_candidates();
         self.page = 0;
         self.highlighted = if self.candidates.is_empty() {
             None
@@ -784,6 +825,61 @@ impl PinyinSession {
             text: choice.candidate.text.clone(),
             consumed: choice.consumed,
         }
+    }
+
+    /// AI candidates already contain the complete sentence; other candidates
+    /// replace only the pending suffix but must convert with its raw context.
+    fn candidate_output(
+        script: crate::ChineseScript,
+        prefix: &str,
+        candidate: &Candidate,
+    ) -> String {
+        if candidate.is_ai() {
+            script.convert(&candidate.text)
+        } else {
+            script.convert(&format!("{prefix}{}", candidate.text))
+        }
+    }
+
+    fn candidate_projection(
+        script: crate::ChineseScript,
+        prefix: &str,
+        displayed_prefix: &str,
+        candidate: &Candidate,
+    ) -> String {
+        let output = Self::candidate_output(script, prefix, candidate);
+        if candidate.is_ai() {
+            output
+        } else {
+            // Context may rewrite the confirmed (but still uncommitted) prefix.
+            // In that case show the entire replacement, never slice by length.
+            output
+                .strip_prefix(displayed_prefix)
+                .unwrap_or(&output)
+                .to_owned()
+        }
+    }
+
+    fn rebuild_display_candidates(&mut self) {
+        let script = self.chinese_script;
+        let prefix: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
+        let displayed_prefix = script.convert(&prefix);
+        let mut seen = std::collections::HashSet::new();
+        self.candidates.clear();
+        self.choices.retain(|choice| {
+            let text =
+                Self::candidate_projection(script, &prefix, &displayed_prefix, &choice.candidate);
+            if !seen.insert((
+                text.clone(),
+                choice.candidate.comment.clone(),
+                choice.consumed,
+            )) {
+                return false;
+            }
+            self.candidates
+                .push(Candidate::new(text, choice.candidate.comment.clone()));
+            true
+        });
     }
 
     fn rebuild_pages(&mut self) {
@@ -892,10 +988,16 @@ impl PinyinSession {
             handled,
             preedit: self.preedit.clone(),
             preedit_caret_utf16: Some(
-                self.confirmed
-                    .iter()
-                    .map(|segment| segment.text.encode_utf16().count())
-                    .sum::<usize>()
+                self.chinese_script
+                    .convert(
+                        &self
+                            .confirmed
+                            .iter()
+                            .map(|segment| segment.text.as_str())
+                            .collect::<String>(),
+                    )
+                    .encode_utf16()
+                    .count()
                     + self.raw_caret,
             ),
             candidates: self.current_page().to_vec(),

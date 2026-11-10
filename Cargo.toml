@@ -1,7 +1,7 @@
 [package]
 name = "flower"
 description = "Offline Pinyin input method for Windows"
-version = "0.4.20"
+version = "0.4.23"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
@@ -16,6 +16,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 sha2 = "0.10"
+miniz_oxide = "=0.8.9"
 ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic"] }
 ort-sys = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic"] }
 
@@ -27,6 +28,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_Pipes",
@@ -42,6 +44,11 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+flower-dict = { git = "https://github.com/axflower/flower-dict.git", branch = "main", version = "=0.2.0" }
+miniz_oxide = "=0.8.9"
+sha2 = "0.10"
 
 [profile.release]
 panic = "abort"

@@ -11,6 +11,12 @@ pub struct EngineRouter {
 }
 
 impl EngineRouter {
+    pub fn project_chinese_script(&mut self, script: crate::ChineseScript) -> CompositionUpdate {
+        self.session.project_chinese_script(script)
+    }
+    pub fn set_chinese_script(&mut self, script: crate::ChineseScript) -> bool {
+        self.session.set_chinese_script(script)
+    }
     /// Creates a router backed by the shared embedded lexicon.
     pub fn new() -> Result<Self, EngineError> {
         Self::with_page_size(DEFAULT_PAGE_SIZE)

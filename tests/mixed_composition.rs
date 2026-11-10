@@ -91,13 +91,15 @@ fn builtin_cross_word_pairs_commit_full_and_mixed_with_canonical_learning() {
 #[test]
 fn core_mixed_ranks_are_measured_not_assumed_first() {
     let lexicon = Lexicon::builtin().unwrap();
+    let mut measurements = Vec::new();
     for (raw, text, reading, rank) in [
-        ("zheshism", "这是什么", "zhe'shi'shen'me", 5),
-        ("zhesm", "这什么", "zhe'shen'me", 1),
-        // The added everyday word "也是" yields the valid alternative "什么也是".
-        ("shenmeys", "什么意思", "shen'me'yi'si", 3),
-        ("womensr", "我们输入", "wo'men'shu'ru", 3),
-        ("weixinxx", "微信消息", "wei'xin'xiao'xi", 4),
+        // Measured with the full 0.2.0 dictionary and simplified projection;
+        // keep exact ordinary-lane ranks rather than assuming every gold first.
+        ("zheshism", "这是什么", "zhe'shi'shen'me", 1),
+        ("zhesm", "这什么", "zhe'shen'me", 4),
+        ("shenmeys", "什么意思", "shen'me'yi'si", 2),
+        ("womensr", "我们输入", "wo'men'shu'ru", 4),
+        ("weixinxx", "微信消息", "wei'xin'xiao'xi", 2),
     ] {
         let mut session = PinyinSession::from_lexicon(lexicon.clone(), 9).unwrap();
         type_text(&mut session, raw);
@@ -124,18 +126,19 @@ fn core_mixed_ranks_are_measured_not_assumed_first() {
                 session.next_page().unwrap();
             }
         }
-        assert_eq!(
-            actual - suggestions,
-            rank,
-            "{raw}: {:?}",
-            session.candidates_on_current_page()
-        );
+        measurements.push((raw, actual - suggestions, rank));
         assert_eq!(
             session.select_candidate(index).unwrap().commit.as_deref(),
             Some(text)
         );
         assert!(session.pending_input().is_empty());
     }
+    assert!(
+        measurements
+            .iter()
+            .all(|(_, actual, expected)| actual == expected),
+        "ordinary mixed ranks (input, actual, expected): {measurements:?}"
+    );
 }
 
 #[test]

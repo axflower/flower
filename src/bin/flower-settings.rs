@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
+
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -306,11 +308,47 @@ fn execute(command: Command) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn wants_cli_console(command: &Result<Command, String>, silent: bool) -> bool {
+    !silent
+        && !matches!(
+            command,
+            Ok(Command::Gui
+                | Command::AiServer
+                | Command::StartInputMethod
+                | Command::StartupInputMethod
+                | Command::EnableStartup
+                | Command::DisableStartup)
+        )
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_command_console(command: &Result<Command, String>, silent: bool) {
+    use windows::Win32::System::Console::{
+        AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    if !wants_cli_console(command, silent) {
+        return;
+    }
+    // Keep explicitly inherited pipes/files (including CLI tests and AI probes)
+    // intact. A GUI-subsystem executable must not allocate a console just to
+    // print help; only an existing parent console may be attached.
+    let has_output = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .any(|kind| unsafe { GetStdHandle(kind) }.is_ok_and(|handle| !handle.is_invalid()));
+    if !has_output {
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let command = parse(&args);
     // Even malformed login invocations must never show UI or print user paths.
     let silent = args.iter().any(|arg| arg == "--startup-input-method");
+    #[cfg(target_os = "windows")]
+    prepare_command_console(&command, silent);
     let only_start = matches!(
         &command,
         Ok(Command::StartInputMethod | Command::EnableStartup | Command::DisableStartup)
@@ -345,6 +383,23 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_and_background_modes_never_request_a_console() {
+        for mode in [
+            Command::Gui,
+            Command::AiServer,
+            Command::StartInputMethod,
+            Command::StartupInputMethod,
+            Command::EnableStartup,
+            Command::DisableStartup,
+        ] {
+            assert!(!wants_cli_console(&Ok(mode), false));
+        }
+        assert!(wants_cli_console(&Ok(Command::Help), false));
+        assert!(wants_cli_console(&Err("invalid command".into()), false));
+        assert!(!wants_cli_console(&Err("invalid startup".into()), true));
+    }
     fn command(args: &[&str]) -> Result<Command, String> {
         parse(&args.iter().map(OsString::from).collect::<Vec<_>>())
     }

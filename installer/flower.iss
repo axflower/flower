@@ -55,6 +55,7 @@ UninstallDisplayIcon={app}\versions\{#BuildId}\flower-settings.exe
 LicenseFile={#PackageDir}\LICENSE-MIT
 InfoBeforeFile=notice.zh-CN.txt
 Compression=lzma2
+LZMADictionarySize=32768
 SolidCompression=yes
 WizardStyle=modern
 DisableWelcomePage=no
