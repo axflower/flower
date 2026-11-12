@@ -16,7 +16,7 @@ use thiserror::Error;
 #[cfg(target_os = "windows")]
 use windows::core::PWSTR;
 
-pub const DEFAULT_CANDIDATE_PAGE_SIZE: usize = 9;
+pub const DEFAULT_CANDIDATE_PAGE_SIZE: usize = 7;
 pub const MIN_CANDIDATE_PAGE_SIZE: usize = 1;
 pub const MAX_CANDIDATE_PAGE_SIZE: usize = 99;
 
@@ -28,25 +28,232 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 pub struct Settings {
     pub chinese_script: crate::ChineseScript,
     pub candidate_page_size: usize,
+    /// Zero is a legacy file whose old default page size has not been migrated.
+    #[serde(default)]
+    pub candidate_layout_version: u8,
     pub theme: Theme,
     pub ai_correction_enabled: bool,
     pub ai_undeclared_scope_compatibility: bool,
+    pub online_polish: OnlinePolishSettings,
+    /// Explicit opt-in for both online writing and selection polishing.
+    #[serde(default)]
+    pub online_ai_enabled: bool,
+    pub writing_shortcuts: WritingShortcuts,
+    pub writing_send_consent: Option<String>,
+    pub model_api: crate::writing::config::ModelApiSettings,
 }
 
+/// A context-local key chord, never a registered global hotkey.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WritingShortcut {
+    /// Zero denotes a modifier-only gesture.
+    pub key: u16,
+    #[serde(default = "legacy_shortcut_modifiers")]
+    pub modifiers: u8,
+}
+
+pub const SHORTCUT_CTRL: u8 = 1;
+pub const SHORTCUT_ALT: u8 = 2;
+pub const SHORTCUT_SHIFT: u8 = 4;
+pub const SHORTCUT_WIN: u8 = 8;
+const fn legacy_shortcut_modifiers() -> u8 {
+    SHORTCUT_CTRL | SHORTCUT_SHIFT
+}
+
+impl WritingShortcut {
+    pub const fn new(key: u16, modifiers: u8) -> Self {
+        Self { key, modifiers }
+    }
+
+    pub fn is_supported(self) -> bool {
+        if self.modifiers == 0 || self.modifiers & !15 != 0 {
+            return false;
+        }
+        if self.key == 0 {
+            return self.modifiers.count_ones() >= 2;
+        }
+        if !(0x08..=0xfe).contains(&self.key)
+            || matches!(self.key, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5)
+        {
+            return false;
+        }
+        !matches!(
+            (self.key, self.modifiers),
+            (0x46, 5) | (0x1b, 1) | (0x1b, 5) | (0x09, 2) | (0x73, 2) | (0x4c, 8) | (0x09, 8)
+        ) && !(self.key == 0x2e && self.modifiers & 3 == 3)
+    }
+
+    pub fn matches(self, key: u16, modifiers: crate::engine::Modifiers) -> bool {
+        self.is_supported()
+            && self.key != 0
+            && self.key == key
+            && self.modifiers == Self::modifier_mask(modifiers)
+    }
+
+    pub fn modifier_mask(value: crate::engine::Modifiers) -> u8 {
+        u8::from(value.control)
+            | (u8::from(value.alt) << 1)
+            | (u8::from(value.shift) << 2)
+            | (u8::from(value.meta) << 3)
+    }
+
+    pub fn label(self) -> String {
+        let mut parts = Vec::new();
+        for (bit, name) in [(1, "Ctrl"), (2, "Alt"), (4, "Shift"), (8, "Win")] {
+            if self.modifiers & bit != 0 {
+                parts.push(name.to_owned());
+            }
+        }
+        let key = match self.key {
+            0 => String::new(),
+            0x30..=0x39 | 0x41..=0x5a => char::from_u32(self.key as u32).unwrap().to_string(),
+            0x70..=0x87 => format!("F{}", self.key - 0x70 + 1),
+            0x20 => "Space".into(),
+            0x0d => "Enter".into(),
+            0x09 => "Tab".into(),
+            0x08 => "Backspace".into(),
+            0x1b => "Esc".into(),
+            0x2e => "Delete".into(),
+            0x25 => "Left".into(),
+            0x26 => "Up".into(),
+            0x27 => "Right".into(),
+            0x28 => "Down".into(),
+            0x24 => "Home".into(),
+            0x23 => "End".into(),
+            0x21 => "PageUp".into(),
+            0x22 => "PageDown".into(),
+            0xba => ";".into(),
+            0xbb => "=".into(),
+            0xbc => ",".into(),
+            0xbd => "-".into(),
+            0xbe => ".".into(),
+            0xbf => "/".into(),
+            0xc0 => "`".into(),
+            0xdb => "[".into(),
+            0xdc => "\\".into(),
+            0xdd => "]".into(),
+            0xde => "'".into(),
+            _ => format!("VK 0x{:02X}", self.key),
+        };
+        if !key.is_empty() {
+            parts.push(key);
+        }
+        parts.join("+")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WritingShortcuts {
+    pub draft: WritingShortcut,
+    pub polish: WritingShortcut,
+}
+
+impl Default for WritingShortcuts {
+    fn default() -> Self {
+        Self {
+            draft: WritingShortcut::new(0, SHORTCUT_CTRL | SHORTCUT_ALT),
+            polish: WritingShortcut::new(0x20, SHORTCUT_CTRL),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WritingShortcuts {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Raw {
+            draft: Option<RawShortcut>,
+            polish: Option<RawShortcut>,
+        }
+        #[derive(Deserialize)]
+        struct RawShortcut {
+            key: u16,
+            modifiers: Option<u8>,
+        }
+        impl RawShortcut {
+            fn shortcut(self) -> WritingShortcut {
+                WritingShortcut::new(
+                    self.key,
+                    self.modifiers.unwrap_or_else(legacy_shortcut_modifiers),
+                )
+            }
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let legacy_pair = raw.draft.as_ref().is_some_and(|s| s.modifiers.is_none())
+            && raw.polish.as_ref().is_some_and(|s| s.modifiers.is_none());
+        let defaults = Self::default();
+        let value = Self {
+            draft: raw
+                .draft
+                .map(RawShortcut::shortcut)
+                .unwrap_or(defaults.draft),
+            polish: raw
+                .polish
+                .map(RawShortcut::shortcut)
+                .unwrap_or(defaults.polish),
+        };
+        if legacy_pair
+            && value.draft == WritingShortcut::new(0x31, 5)
+            && value.polish == WritingShortcut::new(0x32, 5)
+        {
+            Ok(defaults)
+        } else {
+            Ok(value)
+        }
+    }
+}
+
+impl WritingShortcuts {
+    pub fn is_valid(self) -> bool {
+        self.draft.is_supported() && self.polish.is_supported() && self.draft != self.polish
+    }
+}
+
+/// Enabled by default; external processing still requires an explicit shortcut and safe selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OnlinePolishSettings {
+    pub enabled: bool,
+    pub style: crate::writing::PolishStyle,
+    /// None follows the activation's current script at the start of the task.
+    pub script: Option<crate::ChineseScript>,
+}
+
+impl Default for OnlinePolishSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            style: crate::writing::PolishStyle::default(),
+            script: None,
+        }
+    }
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
             chinese_script: crate::ChineseScript::default(),
             candidate_page_size: DEFAULT_CANDIDATE_PAGE_SIZE,
+            candidate_layout_version: 1,
             theme: Theme::System,
             ai_correction_enabled: true,
             ai_undeclared_scope_compatibility: true,
+            online_polish: OnlinePolishSettings::default(),
+            online_ai_enabled: false,
+            writing_shortcuts: WritingShortcuts::default(),
+            writing_send_consent: None,
+            model_api: crate::writing::config::ModelApiSettings::default(),
         }
     }
 }
 
 impl Settings {
     pub fn validate(&self) -> Result<(), SettingsError> {
+        self.model_api
+            .validate()
+            .map_err(|_| SettingsError::InvalidModelApi)?;
+        if !self.writing_shortcuts.is_valid() {
+            return Err(SettingsError::InvalidWritingShortcuts);
+        }
         if !(MIN_CANDIDATE_PAGE_SIZE..=MAX_CANDIDATE_PAGE_SIZE).contains(&self.candidate_page_size)
         {
             return Err(SettingsError::InvalidCandidatePageSize {
@@ -112,7 +319,13 @@ impl SettingsStore {
             Err(error) => return Err(error.into()),
         };
 
-        let settings: Settings = serde_json::from_str(&json)?;
+        let mut settings: Settings = serde_json::from_str(&json)?;
+        if settings.candidate_layout_version == 0 {
+            if settings.candidate_page_size == 9 {
+                settings.candidate_page_size = DEFAULT_CANDIDATE_PAGE_SIZE;
+            }
+            settings.candidate_layout_version = 1;
+        }
         settings.validate()?;
         Ok(settings)
     }
@@ -280,6 +493,10 @@ fn wide_null(path: &Path) -> Vec<u16> {
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
+    #[error("model API settings are invalid")]
+    InvalidModelApi,
+    #[error("AI快捷键必须是两个不同的有效组合；Ctrl+Shift+F保留简繁切换，系统保留组合不能使用")]
+    InvalidWritingShortcuts,
     #[error("candidate page size must be between {min} and {max}, got {actual}")]
     InvalidCandidatePageSize {
         actual: usize,
@@ -322,10 +539,14 @@ mod tests {
     #[test]
     fn defaults_match_the_mvp_contract() {
         let settings = Settings::default();
-        assert_eq!(settings.candidate_page_size, 9);
+        assert_eq!(settings.candidate_page_size, 7);
         assert_eq!(settings.theme, Theme::System);
         assert!(settings.ai_correction_enabled);
         assert!(settings.ai_undeclared_scope_compatibility);
+        assert_eq!(settings.online_polish, OnlinePolishSettings::default());
+        assert!(settings.online_polish.enabled);
+        assert!(!settings.online_ai_enabled);
+        assert_eq!(settings.candidate_layout_version, 1);
         assert!(settings.validate().is_ok());
     }
 
@@ -335,6 +556,7 @@ mod tests {
             serde_json::from_str(r#"{"candidate_page_size":7,"theme":"dark"}"#).unwrap();
         assert!(old.ai_correction_enabled);
         assert!(old.ai_undeclared_scope_compatibility);
+        assert!(old.online_polish.enabled);
         let opted_out = Settings {
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,
@@ -349,6 +571,41 @@ mod tests {
     }
 
     #[test]
+    fn old_default_page_size_migrates_once_without_rewriting_or_enabling_online() {
+        let store = temporary_store();
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        for (json, expected) in [
+            (
+                r#"{"candidate_page_size":9,"online_polish":{"enabled":true}}"#,
+                7,
+            ),
+            (r#"{"candidate_page_size":5}"#, 5),
+            (
+                r#"{"candidate_page_size":9,"candidate_layout_version":1}"#,
+                9,
+            ),
+        ] {
+            fs::write(store.path(), json).unwrap();
+            let loaded = store.load().unwrap();
+            assert_eq!(loaded.candidate_page_size, expected);
+            assert_eq!(loaded.candidate_layout_version, 1);
+            assert!(!loaded.online_ai_enabled);
+            assert_eq!(fs::read_to_string(store.path()).unwrap(), json);
+        }
+        let mut opted_in = store.load().unwrap();
+        opted_in.online_ai_enabled = true;
+        opted_in.candidate_page_size = 9;
+        store.save(&opted_in).unwrap();
+        let reloaded = store.load().unwrap();
+        assert!(reloaded.online_ai_enabled);
+        assert_eq!(reloaded.candidate_page_size, 9);
+        opted_in.online_ai_enabled = false;
+        store.save(&opted_in).unwrap();
+        assert!(!store.load().unwrap().online_ai_enabled);
+        fs::remove_dir_all(store.path().parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn candidate_page_size_input_requires_a_complete_in_range_integer() {
         assert_eq!(parse_candidate_page_size_input("1"), Some(1));
         assert_eq!(parse_candidate_page_size_input("99"), Some(99));
@@ -356,6 +613,145 @@ mod tests {
         assert_eq!(parse_candidate_page_size_input("100"), None);
         assert_eq!(parse_candidate_page_size_input(""), None);
         assert_eq!(parse_candidate_page_size_input("5abc"), None);
+    }
+
+    #[test]
+    fn online_polish_defaults_on_but_preserves_explicit_disable_and_valid_enums() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        let partial: Settings =
+            serde_json::from_str(r#"{"online_polish":{"style":"concise"}}"#).unwrap();
+        assert!(missing.online_polish.enabled);
+        assert!(partial.online_polish.enabled);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"online_polish":{"enabled":false}}"#).unwrap();
+        assert!(!disabled.online_polish.enabled);
+        assert_eq!(
+            partial.online_polish.style,
+            crate::writing::PolishStyle::Concise
+        );
+        assert_eq!(partial.online_polish.script, None);
+        let configured = OnlinePolishSettings {
+            enabled: true,
+            style: crate::writing::PolishStyle::Formal,
+            script: Some(crate::ChineseScript::Traditional),
+        };
+        let wire = serde_json::to_string(&configured).unwrap();
+        assert_eq!(
+            serde_json::from_str::<OnlinePolishSettings>(&wire).unwrap(),
+            configured
+        );
+        assert!(
+            serde_json::from_str::<Settings>(r#"{"online_polish":{"style":"unbounded"}}"#).is_err()
+        );
+        assert!(!wire.contains("key"));
+    }
+
+    #[test]
+    fn writing_shortcuts_migrate_to_custom_chords_and_round_trip() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.writing_shortcuts, WritingShortcuts::default());
+        assert_eq!(old.writing_shortcuts.draft.label(), "Ctrl+Alt");
+        assert_eq!(old.writing_shortcuts.polish.label(), "Ctrl+Space");
+        let legacy: Settings = serde_json::from_str(
+            r#"{"writing_shortcuts":{"draft":{"key":49},"polish":{"key":50}}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.writing_shortcuts, WritingShortcuts::default());
+        let explicit_old: Settings = serde_json::from_str(r#"{"writing_shortcuts":{"draft":{"key":49,"modifiers":5},"polish":{"key":50,"modifiers":5}}}"#).unwrap();
+        assert_eq!(
+            explicit_old.writing_shortcuts.draft,
+            WritingShortcut::new(0x31, 5)
+        );
+        assert_eq!(
+            explicit_old.writing_shortcuts.polish,
+            WritingShortcut::new(0x32, 5)
+        );
+        let prior_custom: Settings = serde_json::from_str(
+            r#"{"writing_shortcuts":{"draft":{"key":65},"polish":{"key":114}}}"#,
+        )
+        .unwrap();
+        assert_eq!(prior_custom.writing_shortcuts.draft.label(), "Ctrl+Shift+A");
+        let custom = Settings {
+            writing_shortcuts: WritingShortcuts {
+                draft: WritingShortcut::new(0x41, 3),
+                polish: WritingShortcut::new(0x72, 9),
+            },
+            ..Settings::default()
+        };
+        custom.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Settings>(&serde_json::to_string(&custom).unwrap()).unwrap(),
+            custom
+        );
+        assert_eq!(custom.writing_shortcuts.polish.label(), "Ctrl+Win+F3");
+    }
+
+    #[test]
+    fn custom_shortcuts_accept_named_keys_and_reject_reserved_or_bare_keys() {
+        for shortcut in [
+            WritingShortcut::new(0, 3),
+            WritingShortcut::new(0x20, 1),
+            WritingShortcut::new(0xbe, 3),
+            WritingShortcut::new(0x25, 5),
+            WritingShortcut::new(0x87, 8),
+            WritingShortcut::new(0, 6),
+        ] {
+            assert!(shortcut.is_supported(), "{shortcut:?}");
+        }
+        for shortcut in [
+            WritingShortcut::new(0, 4),
+            WritingShortcut::new(0x41, 0),
+            WritingShortcut::new(0x41, 16),
+            WritingShortcut::new(0x10, 3),
+            WritingShortcut::new(0x46, 5),
+            WritingShortcut::new(0x2e, 3),
+            WritingShortcut::new(0x09, 2),
+            WritingShortcut::new(0x4c, 8),
+        ] {
+            assert!(!shortcut.is_supported(), "{shortcut:?}");
+        }
+        let chord = WritingShortcut::new(0xbe, 3);
+        assert!(chord.matches(0xbe, crate::engine::Modifiers::CONTROL.with_alt()));
+        assert!(!chord.matches(
+            0xbe,
+            crate::engine::Modifiers::CONTROL.with_alt().with_shift()
+        ));
+        assert!(!WritingShortcuts::default()
+            .draft
+            .matches(0x12, crate::engine::Modifiers::CONTROL.with_alt()));
+        assert_eq!(chord.label(), "Ctrl+Alt+.");
+    }
+
+    #[test]
+    fn invalid_or_colliding_shortcuts_cannot_replace_existing_settings() {
+        let store = temporary_store();
+        store.save(&Settings::default()).unwrap();
+        let before = fs::read(store.path()).unwrap();
+        for pair in [
+            WritingShortcuts {
+                draft: WritingShortcut::new(0x31, 5),
+                polish: WritingShortcut::new(0x31, 5),
+            },
+            WritingShortcuts {
+                draft: WritingShortcut::new(0x46, 5),
+                ..WritingShortcuts::default()
+            },
+            WritingShortcuts {
+                polish: WritingShortcut::new(0x1b, 5),
+                ..WritingShortcuts::default()
+            },
+        ] {
+            let settings = Settings {
+                writing_shortcuts: pair,
+                ..Settings::default()
+            };
+            assert!(matches!(
+                store.save(&settings),
+                Err(SettingsError::InvalidWritingShortcuts)
+            ));
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+        }
+        let _ = fs::remove_dir_all(store.path().parent().unwrap());
     }
 
     #[test]
@@ -370,20 +766,36 @@ mod tests {
         let store = temporary_store();
         let settings = Settings {
             candidate_page_size: 7,
+            candidate_layout_version: 1,
+            online_ai_enabled: true,
             chinese_script: crate::ChineseScript::Traditional,
             theme: Theme::Dark,
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,
+            online_polish: OnlinePolishSettings {
+                enabled: true,
+                style: crate::writing::PolishStyle::Formal,
+                script: Some(crate::ChineseScript::Traditional),
+            },
+            writing_shortcuts: WritingShortcuts::default(),
+            writing_send_consent: None,
+            model_api: crate::writing::config::ModelApiSettings::default(),
         };
         store.save(&settings).expect("save settings");
         assert_eq!(store.load().expect("load settings"), settings);
 
         let replacement = Settings {
             candidate_page_size: 19,
+            candidate_layout_version: 1,
+            online_ai_enabled: false,
             chinese_script: crate::ChineseScript::Simplified,
             theme: Theme::Light,
             ai_correction_enabled: true,
             ai_undeclared_scope_compatibility: true,
+            online_polish: OnlinePolishSettings::default(),
+            writing_shortcuts: WritingShortcuts::default(),
+            writing_send_consent: None,
+            model_api: crate::writing::config::ModelApiSettings::default(),
         };
         store.save(&replacement).expect("replace settings");
         assert_eq!(store.load().expect("load replacement"), replacement);
@@ -402,20 +814,32 @@ mod tests {
         let store = temporary_store();
         let original = Settings {
             candidate_page_size: 9,
+            candidate_layout_version: 1,
+            online_ai_enabled: false,
             chinese_script: crate::ChineseScript::Simplified,
             theme: Theme::System,
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,
+            online_polish: OnlinePolishSettings::default(),
+            writing_shortcuts: WritingShortcuts::default(),
+            writing_send_consent: None,
+            model_api: crate::writing::config::ModelApiSettings::default(),
         };
         store.save(&original).expect("save original settings");
         let original_json = fs::read(store.path()).expect("read original JSON");
 
         let settings = Settings {
             candidate_page_size: 0,
+            candidate_layout_version: 1,
+            online_ai_enabled: false,
             chinese_script: crate::ChineseScript::Simplified,
             theme: Theme::Dark,
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,
+            online_polish: OnlinePolishSettings::default(),
+            writing_shortcuts: WritingShortcuts::default(),
+            writing_send_consent: None,
+            model_api: crate::writing::config::ModelApiSettings::default(),
         };
         assert!(matches!(
             settings.validate(),
@@ -451,10 +875,16 @@ mod tests {
         let store = temporary_store();
         let settings = Settings {
             candidate_page_size: 21,
+            candidate_layout_version: 1,
+            online_ai_enabled: false,
             chinese_script: crate::ChineseScript::Traditional,
             theme: Theme::Dark,
             ai_correction_enabled: false,
             ai_undeclared_scope_compatibility: false,
+            online_polish: OnlinePolishSettings::default(),
+            writing_shortcuts: WritingShortcuts::default(),
+            writing_send_consent: None,
+            model_api: crate::writing::config::ModelApiSettings::default(),
         };
         store.save(&settings).expect("create directory and save");
         assert_eq!(store.load().expect("load settings"), settings);

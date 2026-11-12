@@ -37,6 +37,10 @@ impl EngineRouter {
         PinyinSession::from_lexicon(lexicon, page_size).map(Self::from_session)
     }
 
+    pub(crate) fn initialize_dormant_lexicon(&mut self, lexicon: Lexicon) {
+        self.session.initialize_dormant_lexicon(lexicon);
+    }
+
     /// Reports whether a key would be handled without changing the session.
     pub fn test_key(&self, event: KeyEvent) -> Result<bool, EngineError> {
         let mut preview = self.session.clone();

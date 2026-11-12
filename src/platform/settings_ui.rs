@@ -39,8 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::settings::{
-    parse_candidate_page_size_input, Settings, SettingsStore, Theme, MAX_CANDIDATE_PAGE_SIZE,
-    MIN_CANDIDATE_PAGE_SIZE,
+    parse_candidate_page_size_input, Settings, SettingsStore, Theme, WritingShortcut,
+    WritingShortcuts, MAX_CANDIDATE_PAGE_SIZE, MIN_CANDIDATE_PAGE_SIZE,
 };
 use crate::user_dictionary::{DictionaryStore, UserDictionary};
 
@@ -94,7 +94,7 @@ const WINDOW_CLASS_NAME: PCWSTR = windows::core::w!("Flower.SettingsWindow");
 const FONT_FACE: PCWSTR = windows::core::w!("Microsoft YaHei UI");
 const BASE_DPI: u32 = 96;
 const CLIENT_WIDTH: i32 = 760;
-const CLIENT_HEIGHT: i32 = 680;
+const CLIENT_HEIGHT: i32 = 480;
 const BACKGROUND: COLORREF = COLORREF(0x00f8f7f4);
 const WHITE: COLORREF = COLORREF(0x00ffffff);
 const TEXT: COLORREF = COLORREF(0x003a2b17);
@@ -102,12 +102,114 @@ const MUTED: COLORREF = COLORREF(0x00756652);
 const ACCENT: COLORREF = COLORREF(0x00696b0f);
 const BORDER: COLORREF = COLORREF(0x00e9e5dc);
 const DANGER: COLORREF = COLORREF(0x003636a6);
-const CARDS: [[i32; 4]; 4] = [
-    [28, 104, 340, 248],
-    [392, 104, 340, 248],
-    [28, 368, 340, 232],
-    [392, 368, 340, 232],
-];
+const CARDS: [[i32; 4]; 1] = [[28, 72, 704, 304]];
+const CATEGORY_ID: i32 = 400;
+const DRAFT_SHORTCUT_ID: i32 = 410;
+const RESET_SHORTCUTS_ID: i32 = 412;
+
+fn select_shortcuts(c: SettingsControls, shortcuts: WritingShortcuts) {
+    for (control, value) in c
+        .shortcuts
+        .into_iter()
+        .zip([shortcuts.draft, shortcuts.polish])
+    {
+        let text = wide_null(&value.label());
+        unsafe {
+            SetWindowLongPtrW(
+                control,
+                GWLP_USERDATA,
+                value.key as isize | ((value.modifiers as isize) << 16),
+            );
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                control,
+                PCWSTR(text.as_ptr()),
+            );
+        }
+    }
+}
+
+fn category_controls(c: SettingsControls) -> [Vec<HWND>; 4] {
+    [
+        vec![
+            c.headings[2],
+            c.labels[0],
+            c.labels[1],
+            c.labels[2],
+            c.labels[3],
+            c.page_edit,
+            c.theme_combo,
+            c.script_combo,
+        ],
+        vec![
+            c.headings[3],
+            c.online_ai,
+            c.online_ai_hint,
+            c.online_settings,
+            c.model_api_settings,
+            c.ai_correction,
+            c.ai_scope_compatibility,
+            c.ai_correction_hint,
+            c.restore_send_confirmation,
+        ],
+        vec![
+            c.shortcut_labels[0],
+            c.shortcut_labels[1],
+            c.shortcuts[0],
+            c.shortcuts[1],
+            c.reset_shortcuts,
+            c.shortcut_hint,
+        ],
+        vec![
+            c.headings[4],
+            c.headings[5],
+            c.learning,
+            c.learning_hint,
+            c.clear_learning,
+            c.domain_combo,
+            c.domain_enabled,
+            c.dictionary_status,
+        ],
+    ]
+}
+
+fn show_category(state: &RefCell<SettingsUiState>, category: usize) {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOW};
+    state.borrow_mut().controls.category = category;
+    let c = state.borrow().controls;
+    for (index, controls) in category_controls(c).into_iter().enumerate() {
+        for control in controls {
+            unsafe {
+                let _ = ShowWindow(control, if index == category { SW_SHOW } else { SW_HIDE });
+            }
+        }
+    }
+    // Selection is painted separately; keep accessible captions stable.
+    for (index, caption) in ["常规", "AI功能", "快捷键", "词库与学习"]
+        .into_iter()
+        .enumerate()
+    {
+        let text = wide_null(caption);
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                c.categories[index],
+                PCWSTR(text.as_ptr()),
+            );
+        }
+    }
+    unsafe {
+        let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(c.categories[0]);
+        if let Ok(parent) = parent {
+            let _ = windows::Win32::Graphics::Gdi::RedrawWindow(
+                parent,
+                None,
+                None,
+                windows::Win32::Graphics::Gdi::RDW_INVALIDATE
+                    | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN
+                    | windows::Win32::Graphics::Gdi::RDW_UPDATENOW,
+            );
+        }
+    }
+}
 
 fn paint_settings(hwnd: HWND) {
     use windows::Win32::Graphics::Gdi::*;
@@ -132,6 +234,10 @@ fn paint_canvas(hwnd: HWND, dc: HDC, rect: &RECT) {
         SetDCBrushColor(dc, WHITE);
         SetDCPenColor(dc, BORDER);
         let dpi = GetDpiForWindow(hwnd).max(BASE_DPI);
+        if let Some(state) = settings_state_pointer(hwnd).as_ref() {
+            let c = state.borrow().controls;
+            let _ = SetViewportOrgEx(dc, -c.scroll_x, -c.scroll_y, None);
+        }
         for [x, y, width, height] in CARDS {
             let _ = RoundRect(
                 dc,
@@ -154,7 +260,19 @@ fn paint_button(item: &windows::Win32::UI::Controls::DRAWITEMSTRUCT) {
         let saved = SaveDC(item.hDC);
         SelectObject(item.hDC, GetStockObject(DC_BRUSH));
         SelectObject(item.hDC, GetStockObject(DC_PEN));
-        let primary = item.CtlID == SAVE_BUTTON_ID as u32;
+        let active_category = if (CATEGORY_ID as u32..CATEGORY_ID as u32 + 4).contains(&item.CtlID)
+        {
+            windows::Win32::UI::WindowsAndMessaging::GetParent(item.hwndItem)
+                .ok()
+                .and_then(|parent| settings_state_pointer(parent).as_ref())
+                .map(|state| {
+                    state.borrow().controls.category == (item.CtlID as i32 - CATEGORY_ID) as usize
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let primary = item.CtlID == SAVE_BUTTON_ID as u32 || active_category;
         let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
         let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
         let fill = if disabled {
@@ -338,7 +456,13 @@ pub fn run_settings_app() -> Result<(), String> {
     }));
     let state_pointer = state_pointer(state.as_ref());
     let dpi = unsafe { GetDpiForSystem() }.max(BASE_DPI);
-    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    let style = WS_OVERLAPPED
+        | WS_CAPTION
+        | WS_SYSMENU
+        | WS_MINIMIZEBOX
+        | windows::Win32::UI::WindowsAndMessaging::WS_SIZEBOX
+        | windows::Win32::UI::WindowsAndMessaging::WS_HSCROLL
+        | WS_VSCROLL;
     let mut window_rect = RECT {
         left: 0,
         top: 0,
@@ -353,10 +477,28 @@ pub fn run_settings_app() -> Result<(), String> {
         let _ = unsafe { UnregisterClassW(WINDOW_CLASS_NAME, instance) };
         return Err(format!("无法计算设置窗口尺寸：{error}"));
     }
+    let mut work_area = RECT::default();
+    if unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
+            windows::Win32::UI::WindowsAndMessaging::SPI_GETWORKAREA,
+            0,
+            Some((&mut work_area as *mut RECT).cast()),
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok()
+    {
+        window_rect.right = window_rect.left
+            + (window_rect.right - window_rect.left)
+                .min((work_area.right - work_area.left - 24).max(240));
+        window_rect.bottom = window_rect.top
+            + (window_rect.bottom - window_rect.top)
+                .min((work_area.bottom - work_area.top - 24).max(200));
+    }
 
     // SAFETY: The class is registered, the create parameter points to `state`
     // for the duration of the message loop, and the window starts hidden.
-    let window_title = wide_null(&format!("Flower 设置 · {}", env!("CARGO_PKG_VERSION")));
+    let window_title = wide_null("Flower 设置");
     let created = unsafe {
         CreateWindowExW(
             WS_EX_CONTROLPARENT,
@@ -416,17 +558,20 @@ pub fn run_settings_app() -> Result<(), String> {
         // Owner-draw buttons do not advertise DLGC_DEFPUSHBUTTON. Route
         // Enter/Esc before IsDialogMessage can synthesize the default IDOK.
         if preprocess_settings_key(hwnd, state.as_ref(), &message) {
+            ensure_settings_focus_visible(hwnd, state.as_ref());
             continue;
         }
         // SAFETY: Both the dialog and message belong to this thread.
         // Tab/Shift+Tab, Space and all remaining dialog keys stay native.
         if unsafe { IsDialogMessageW(hwnd, &message) }.as_bool() {
+            ensure_settings_focus_visible(hwnd, state.as_ref());
             continue;
         }
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        ensure_settings_focus_visible(hwnd, state.as_ref());
     };
 
     let cleanup = cleanup_window(hwnd, state.as_ref());
@@ -524,13 +669,104 @@ fn settings_key_route(
         // handle from another window may determine a settings action.
         match unsafe { GetDlgCtrlID(message.hwnd) } {
             id @ (CANCEL_BUTTON_ID | CLEAR_LEARNING_ID | LEARNING_ID | DOMAIN_ENABLED_ID) => id,
+            id @ (390 | 391 | 392 | DRAFT_SHORTCUT_ID | 411 | RESET_SHORTCUTS_ID | 400..=403) => id,
             _ => SAVE_BUTTON_ID,
         }
     };
     SettingsKeyRoute::Command(command)
 }
 
+fn capture_shortcut(hwnd: HWND, state: &RefCell<SettingsUiState>, message: &MSG) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, GetKeyState};
+    use windows::Win32::UI::WindowsAndMessaging::{WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP};
+    let c = state.borrow().controls;
+    let Some(index) = c.recording else {
+        return false;
+    };
+    if !window_is_owned(hwnd, state) {
+        return false;
+    }
+    let restore = || {
+        state.borrow_mut().controls.recording = None;
+        if let Ok(values) = read_shortcuts(c) {
+            select_shortcuts(c, values);
+        }
+    };
+    if unsafe { GetFocus() } != c.shortcuts[index] {
+        restore();
+        return false;
+    }
+    if !matches!(
+        message.message,
+        WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+    ) {
+        return false;
+    }
+    if message.hwnd != c.shortcuts[index] {
+        return false;
+    }
+    let key = message.wParam.0 as u16;
+    let down = matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN);
+    if key == 0x09 || key == 0x1b || key == 0x0d {
+        restore();
+        return key != 0x09;
+    }
+    if down && message.lParam.0 & (1 << 30) != 0 {
+        return true;
+    }
+    let mods = [(0x11, 1), (0x12, 2), (0x10, 4), (0x5b, 8), (0x5c, 8)]
+        .into_iter()
+        .fold(0, |mask, (vk, bit)| {
+            mask | if unsafe { GetKeyState(vk) } < 0 {
+                bit
+            } else {
+                0
+            }
+        });
+    let modifier = matches!(key, 0x10..=0x12 | 0x5b | 0x5c | 0xa0..=0xa5);
+    if modifier && down {
+        state.borrow_mut().controls.pending_modifiers |= mods;
+        return true;
+    }
+    let value = if modifier && !down && mods == 0 && c.pending_modifiers != 0 {
+        Some(WritingShortcut::new(0, c.pending_modifiers))
+    } else if !modifier && down {
+        Some(WritingShortcut::new(key, mods))
+    } else {
+        None
+    };
+    if let Some(value) = value {
+        let mut values = read_shortcuts(c).unwrap_or_default();
+        let other = if index == 0 {
+            values.polish
+        } else {
+            values.draft
+        };
+        restore();
+        if value.is_supported() && value != other {
+            if index == 0 {
+                values.draft = value;
+            } else {
+                values.polish = value;
+            }
+            select_shortcuts(c, values);
+        } else {
+            let text = wide_null("组合不支持、为系统保留或与另一功能冲突；原值未更改。");
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                    c.shortcut_hint,
+                    PCWSTR(text.as_ptr()),
+                );
+            }
+        }
+    }
+    true
+}
+
 fn preprocess_settings_key(hwnd: HWND, state: &RefCell<SettingsUiState>, message: &MSG) -> bool {
+    if capture_shortcut(hwnd, state, message) {
+        return true;
+    }
     match settings_key_route(hwnd, state, message) {
         SettingsKeyRoute::Dialog => false,
         SettingsKeyRoute::NativeDropdown => {
@@ -572,6 +808,21 @@ struct SettingsUiState {
 
 #[derive(Clone, Copy, Default)]
 struct SettingsControls {
+    recording: Option<usize>,
+    pending_modifiers: u8,
+    category: usize,
+    scroll_x: i32,
+    scroll_y: i32,
+    categories: [HWND; 4],
+    shortcuts: [HWND; 2],
+    shortcut_labels: [HWND; 2],
+    reset_shortcuts: HWND,
+    shortcut_hint: HWND,
+    online_settings: HWND,
+    online_ai: HWND,
+    online_ai_hint: HWND,
+    model_api_settings: HWND,
+    restore_send_confirmation: HWND,
     script_combo: HWND,
     page_edit: HWND,
     theme_combo: HWND,
@@ -619,6 +870,14 @@ unsafe fn handle_settings_message(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        windows::Win32::UI::WindowsAndMessaging::WM_SIZE
+        | windows::Win32::UI::WindowsAndMessaging::WM_HSCROLL
+        | windows::Win32::UI::WindowsAndMessaging::WM_VSCROLL => {
+            if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                scroll_settings(hwnd, state, message, wparam);
+            }
+            LRESULT(0)
+        }
         WM_NCCREATE => {
             if lparam.0 != 0 {
                 let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
@@ -645,9 +904,69 @@ unsafe fn handle_settings_message(
         WM_COMMAND => {
             let control_id = (wparam.0 & 0xffff) as i32;
             let notification = ((wparam.0 >> 16) & 0xffff) as u32;
-            if control_id == SAVE_BUTTON_ID && notification == BN_CLICKED {
+            if (CATEGORY_ID..CATEGORY_ID + 4).contains(&control_id) && notification == BN_CLICKED {
+                if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                    show_category(state, (control_id - CATEGORY_ID) as usize);
+                }
+            } else if (DRAFT_SHORTCUT_ID..DRAFT_SHORTCUT_ID + 2).contains(&control_id)
+                && notification == BN_CLICKED
+            {
+                if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                    let index = (control_id - DRAFT_SHORTCUT_ID) as usize;
+                    let c = state.borrow().controls;
+                    if let Ok(values) = read_shortcuts(c) {
+                        select_shortcuts(c, values);
+                    }
+                    state.borrow_mut().controls.recording = Some(index);
+                    state.borrow_mut().controls.pending_modifiers = 0;
+                    let text = wide_null("正在录制… Esc取消 / Tab离开");
+                    unsafe {
+                        let _ = SetFocus(c.shortcuts[index]);
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                            c.shortcuts[index],
+                            PCWSTR(text.as_ptr()),
+                        );
+                    }
+                }
+            } else if control_id == RESET_SHORTCUTS_ID && notification == BN_CLICKED {
+                if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                    state.borrow_mut().controls.recording = None;
+                    select_shortcuts(state.borrow().controls, WritingShortcuts::default());
+                }
+            } else if control_id == 392 && notification == BN_CLICKED {
+                if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                    let store = state.borrow().store.clone();
+                    if let Err(error) = super::model_api_ui::show_model_api_settings(hwnd, store) {
+                        message_box(hwnd, &error, "模型 API 设置", MB_OK | MB_ICONERROR);
+                    }
+                }
+            } else if control_id == 390 && notification == BN_CLICKED {
+                if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                    let store = state.borrow().store.clone();
+                    match super::online_settings_ui::show_online_settings(hwnd, store) {
+                        Ok(Some(saved)) => state.borrow_mut().settings.online_polish = saved,
+                        Ok(None) => {}
+                        Err(error) => {
+                            message_box(hwnd, &error, "在线 AI 设置", MB_OK | MB_ICONERROR);
+                        }
+                    }
+                }
+            } else if control_id == SAVE_BUTTON_ID && notification == BN_CLICKED {
                 if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
                     save_settings(hwnd, state);
+                }
+            } else if control_id == 391 && notification == BN_CLICKED {
+                if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                    let store = state.borrow().store.clone();
+                    match crate::writing::consent::remember(&store, false) {
+                        Ok(()) => {
+                            state.borrow_mut().settings.writing_send_consent = None;
+                            message_box(hwnd, "已恢复帮写发送确认。", "Flower 设置", MB_OK);
+                        }
+                        Err(error) => {
+                            message_box(hwnd, &error, "Flower 设置", MB_OK | MB_ICONERROR);
+                        }
+                    }
                 }
             } else if control_id == CANCEL_BUTTON_ID {
                 let _ = unsafe { DestroyWindow(hwnd) };
@@ -706,7 +1025,7 @@ unsafe fn handle_settings_message(
         WM_CTLCOLORSTATIC | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
             let hdc = HDC(wparam.0 as *mut c_void);
             let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) };
-            let background = if matches!(id, NOTICE_ID | 200 | 201) {
+            let background = if matches!(id, NOTICE_ID | 200 | 201 | 400..=403) {
                 BACKGROUND
             } else {
                 WHITE
@@ -795,22 +1114,63 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         .map(HINSTANCE::from)
         .map_err(|error| format!("无法获取设置程序模块：{error}"))?;
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(BASE_DPI);
+    let online = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("BUTTON"),
+        windows::core::w!("在线 AI 设置"),
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
+        390,
+    )?;
+    update_controls(state, |controls| controls.online_settings = online)?;
+    let model_api = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("BUTTON"),
+        windows::core::w!("模型 API…"),
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
+        392,
+    )?;
+    update_controls(state, |controls| controls.model_api_settings = model_api)?;
+    let restore = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("BUTTON"),
+        windows::core::w!("恢复帮写发送确认"),
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_PUSHBUTTON as u32,
+        391,
+    )?;
+    update_controls(state, |controls| {
+        controls.restore_send_confirmation = restore
+    })?;
     let settings = state
         .try_borrow()
         .map(|state| state.settings.clone())
         .map_err(|_| "设置窗口状态正忙，无法初始化".to_owned())?;
 
     for (index, caption) in [
-        format!("Flower  ·  {}", env!("CARGO_PKG_VERSION")),
-        "输入设置 · 让每一次表达更顺手".to_owned(),
-        "候选外观".to_owned(),
-        "离线 AI".to_owned(),
-        "本地学习".to_owned(),
+        String::new(),
+        String::new(),
+        "常规".to_owned(),
+        "AI功能".to_owned(),
+        "词库与学习".to_owned(),
         "专业词库".to_owned(),
     ]
     .iter()
     .enumerate()
     {
+        if index < 2 {
+            continue;
+        }
         let text = wide_null(caption);
         let control = create_control(
             hwnd,
@@ -917,6 +1277,28 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
             LPARAM::default(),
         );
     }
+    let online_ai = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("BUTTON"),
+        windows::core::w!("启用在线AI功能"),
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_AUTOCHECKBOX as u32,
+        423,
+    )?;
+    update_controls(state, |controls| controls.online_ai = online_ai)?;
+    set_checked(online_ai, settings.online_ai_enabled);
+    let online_ai_hint = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("STATIC"),
+        windows::core::w!("仅控制在线帮写和润色，不影响离线纠错。\n使用时会向所选模型服务外发文本，可能产生费用。"),
+        WS_CHILD.0 | WS_VISIBLE.0,
+        424,
+    )?;
+    update_controls(state, |controls| controls.online_ai_hint = online_ai_hint)?;
     let ai_correction = create_control(
         hwnd,
         instance,
@@ -972,7 +1354,7 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         hwnd,
         instance,
         windows::core::w!("STATIC"),
-        windows::core::w!("保存后，请重新切换到 Flower 输入法使设置生效。"),
+        windows::core::w!("在线AI开关保存后立即生效；其他设置需重新切换 Flower。"),
         WS_CHILD.0 | WS_VISIBLE.0,
         NOTICE_ID,
     )?;
@@ -1099,8 +1481,65 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         }
     }
 
+    for (index, caption) in ["常规", "AI功能", "快捷键", "词库与学习"]
+        .into_iter()
+        .enumerate()
+    {
+        let text = wide_null(caption);
+        let control = create_control(
+            hwnd,
+            instance,
+            windows::core::w!("BUTTON"),
+            PCWSTR(text.as_ptr()),
+            WS_CHILD.0
+                | WS_VISIBLE.0
+                | WS_TABSTOP.0
+                | windows::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
+            CATEGORY_ID + index as i32,
+        )?;
+        state.borrow_mut().controls.categories[index] = control;
+    }
+    for (index, caption) in ["帮写", "润色"].into_iter().enumerate() {
+        let text = wide_null(caption);
+        let label = create_control(
+            hwnd,
+            instance,
+            windows::core::w!("STATIC"),
+            PCWSTR(text.as_ptr()),
+            WS_CHILD.0 | WS_VISIBLE.0,
+            420 + index as i32,
+        )?;
+        let combo = create_control(
+            hwnd,
+            instance,
+            windows::core::w!("BUTTON"),
+            PCWSTR::null(),
+            WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
+            DRAFT_SHORTCUT_ID + index as i32,
+        )?;
+        state.borrow_mut().controls.shortcuts[index] = combo;
+        state.borrow_mut().controls.shortcut_labels[index] = label;
+    }
+    let reset = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("BUTTON"),
+        windows::core::w!("恢复默认快捷键"),
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
+        RESET_SHORTCUTS_ID,
+    )?;
+    state.borrow_mut().controls.reset_shortcuts = reset;
+    let hint = create_control(hwnd, instance, windows::core::w!("STATIC"),
+        windows::core::w!("仅在有效 Flower 输入上下文中使用，不是全局热键。\n点击按钮或按 Enter 录制；Esc、Enter、Tab 取消，不保存。\n系统可能截获 Win 组合或 Ctrl+Space，无法保证可录制或生效。\nCtrl+Shift+F 保留。恢复默认仍需保存，重新切换 Flower 生效。"),
+        WS_CHILD.0 | WS_VISIBLE.0, 422)?;
+    state.borrow_mut().controls.shortcut_hint = hint;
+    select_shortcuts(state.borrow().controls, settings.writing_shortcuts);
     replace_font(state, dpi).map_err(|error| format!("无法创建设置窗口字体：{error}"))?;
     layout_controls(state, dpi);
+    show_category(state, 0);
     Ok(())
 }
 
@@ -1177,38 +1616,194 @@ fn layout_controls(state: &RefCell<SettingsUiState>, dpi: u32) {
     };
     // Win32 is called only after the state borrow has ended.
     for (control, rect) in control_layout(controls) {
-        let _ = set_control_rect(control, rect[0], rect[1], rect[2], rect[3], dpi);
+        if !control.is_invalid() {
+            if controls.scroll_x == 0 && controls.scroll_y == 0 {
+                let _ = set_control_rect(control, rect[0], rect[1], rect[2], rect[3], dpi);
+            } else {
+                let _ = unsafe {
+                    MoveWindow(
+                        control,
+                        scaled(rect[0], dpi) - controls.scroll_x,
+                        scaled(rect[1], dpi) - controls.scroll_y,
+                        scaled(rect[2], dpi),
+                        scaled(rect[3], dpi),
+                        TRUE,
+                    )
+                };
+            }
+        }
+    }
+}
+
+fn ensure_settings_focus_visible(hwnd: HWND, state: &RefCell<SettingsUiState>) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetWindowRect, IsChild, IsWindowVisible, WM_SIZE,
+    };
+    if !window_is_owned(hwnd, state) {
+        return;
+    }
+    let focused = unsafe { GetFocus() };
+    if !unsafe { IsChild(hwnd, focused) }.as_bool()
+        || !unsafe { IsWindowVisible(focused) }.as_bool()
+    {
+        return;
+    }
+    let mut rect = RECT::default();
+    let mut client = RECT::default();
+    if unsafe { GetWindowRect(focused, &mut rect) }.is_err()
+        || unsafe { GetClientRect(hwnd, &mut client) }.is_err()
+    {
+        return;
+    }
+    let mut origin = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    if !unsafe { ScreenToClient(hwnd, &mut origin) }.as_bool() {
+        return;
+    }
+    let margin = scaled(8, unsafe { GetDpiForWindow(hwnd) }.max(BASE_DPI));
+    let delta = |start: i32, length: i32, extent: i32| {
+        if start < margin {
+            start - margin
+        } else if start + length > extent - margin {
+            start + length - extent + margin
+        } else {
+            0
+        }
+    };
+    let dx = delta(origin.x, rect.right - rect.left, client.right);
+    let dy = delta(origin.y, rect.bottom - rect.top, client.bottom);
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    {
+        let Ok(mut state) = state.try_borrow_mut() else {
+            return;
+        };
+        state.controls.scroll_x = state.controls.scroll_x.saturating_add(dx);
+        state.controls.scroll_y = state.controls.scroll_y.saturating_add(dy);
+    }
+    // Clamp/update both scrollbars and move children only after releasing state.
+    scroll_settings(hwnd, state, WM_SIZE, WPARAM(0));
+}
+
+fn scroll_settings(hwnd: HWND, state: &RefCell<SettingsUiState>, message: u32, wparam: WPARAM) {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut client);
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(BASE_DPI);
+    for (bar, extent, page, horizontal) in [
+        (SB_HORZ, scaled(CLIENT_WIDTH, dpi), client.right, true),
+        (SB_VERT, scaled(CLIENT_HEIGHT, dpi), client.bottom, false),
+    ] {
+        let old = state.borrow().controls;
+        let mut position = if horizontal {
+            old.scroll_x
+        } else {
+            old.scroll_y
+        };
+        let relevant = if horizontal { WM_HSCROLL } else { WM_VSCROLL };
+        if message == relevant {
+            let mut info = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_TRACKPOS,
+                ..Default::default()
+            };
+            unsafe {
+                let _ = GetScrollInfo(hwnd, bar, &mut info);
+            }
+            position = match (wparam.0 & 0xffff) as u32 {
+                0 => position - scaled(32, dpi),
+                1 => position + scaled(32, dpi),
+                2 => position - page,
+                3 => position + page,
+                4 | 5 => info.nTrackPos,
+                6 => 0,
+                7 => extent,
+                _ => position,
+            };
+        }
+        position = position.clamp(0, (extent - page).max(0));
+        {
+            let mut s = state.borrow_mut();
+            if horizontal {
+                s.controls.scroll_x = position;
+            } else {
+                s.controls.scroll_y = position;
+            }
+        }
+        let info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: extent - 1,
+            nPage: page.max(1) as u32,
+            nPos: position,
+            ..Default::default()
+        };
+        unsafe {
+            windows::Win32::UI::Controls::SetScrollInfo(hwnd, bar, &info, TRUE);
+        }
+    }
+    layout_controls(state, dpi);
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, TRUE);
     }
 }
 
 fn control_layout(c: SettingsControls) -> Vec<(HWND, [i32; 4])> {
     vec![
-        (c.headings[0], [28, 24, 704, 36]),
-        (c.headings[1], [28, 64, 704, 24]),
-        (c.headings[2], [48, 124, 292, 28]),
-        (c.headings[3], [412, 124, 300, 28]),
-        (c.headings[4], [48, 388, 300, 28]),
-        (c.headings[5], [412, 388, 300, 28]),
-        (c.labels[0], [48, 168, 292, 24]),
-        (c.page_edit, [48, 200, 80, 32]),
-        (c.labels[1], [140, 204, 200, 24]),
-        (c.labels[2], [48, 252, 136, 24]),
-        (c.theme_combo, [48, 284, 136, 128]),
-        (c.labels[3], [204, 252, 136, 24]),
-        (c.script_combo, [204, 284, 136, 100]),
-        (c.ai_correction, [412, 168, 300, 28]),
-        (c.ai_scope_compatibility, [412, 204, 300, 28]),
-        (c.ai_correction_hint, [412, 240, 300, 108]),
-        (c.learning, [48, 432, 300, 28]),
-        (c.learning_hint, [48, 472, 300, 64]),
-        (c.clear_learning, [48, 548, 180, 36]),
-        (c.domain_combo, [412, 424, 300, 144]),
-        (c.domain_enabled, [412, 464, 300, 28]),
-        (c.dictionary_status, [412, 500, 300, 88]),
-        (c.notice, [28, 616, 456, 40]),
-        (c.cancel_button, [508, 616, 104, 40]),
-        (c.save_button, [628, 616, 104, 40]),
+        (c.categories[0], [28, 104, 176, 32]),
+        (c.categories[1], [212, 104, 152, 32]),
+        (c.categories[2], [392, 104, 152, 32]),
+        (c.categories[3], [556, 104, 176, 32]),
+        (c.shortcut_labels[0], [48, 176, 100, 28]),
+        (c.shortcut_labels[1], [48, 224, 100, 28]),
+        (c.shortcuts[0], [164, 172, 280, 36]),
+        (c.shortcuts[1], [164, 220, 280, 36]),
+        (c.reset_shortcuts, [480, 220, 224, 36]),
+        (c.shortcut_hint, [48, 296, 656, 112]),
+        (c.online_settings, [364, 264, 300, 40]),
+        (c.model_api_settings, [48, 264, 280, 40]),
+        (c.headings[2], [48, 172, 292, 28]),
+        (c.headings[3], [48, 172, 300, 28]),
+        (c.headings[4], [48, 172, 300, 28]),
+        (c.headings[5], [412, 172, 300, 28]),
+        (c.labels[0], [48, 224, 292, 24]),
+        (c.page_edit, [48, 256, 80, 32]),
+        (c.labels[1], [140, 260, 200, 24]),
+        (c.labels[2], [48, 320, 280, 24]),
+        (c.theme_combo, [48, 352, 280, 100]),
+        (c.labels[3], [412, 320, 280, 24]),
+        (c.script_combo, [412, 352, 280, 100]),
+        (c.online_ai, [48, 216, 280, 28]),
+        (c.online_ai_hint, [348, 212, 356, 44]),
+        (c.ai_correction, [48, 324, 300, 28]),
+        (c.ai_scope_compatibility, [48, 360, 300, 28]),
+        (c.ai_correction_hint, [364, 324, 348, 72]),
+        (c.restore_send_confirmation, [364, 404, 300, 40]),
+        (c.learning, [48, 216, 320, 28]),
+        (c.learning_hint, [48, 260, 320, 80]),
+        (c.clear_learning, [48, 380, 224, 36]),
+        (c.domain_combo, [412, 216, 300, 144]),
+        (c.domain_enabled, [412, 260, 300, 28]),
+        (c.dictionary_status, [412, 304, 300, 120]),
+        (c.notice, [28, 480, 456, 56]),
+        (c.cancel_button, [508, 480, 104, 40]),
+        (c.save_button, [628, 480, 104, 40]),
     ]
+    .into_iter()
+    .map(|(hwnd, mut rect)| {
+        rect[1] -= 80;
+        (hwnd, rect)
+    })
+    .collect()
 }
 
 fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), WindowsError> {
@@ -1232,6 +1827,21 @@ fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), Window
         }
     };
     for control in [
+        controls.categories[0],
+        controls.categories[1],
+        controls.categories[2],
+        controls.categories[3],
+        controls.shortcuts[0],
+        controls.shortcuts[1],
+        controls.shortcut_labels[0],
+        controls.shortcut_labels[1],
+        controls.reset_shortcuts,
+        controls.shortcut_hint,
+        controls.online_settings,
+        controls.online_ai,
+        controls.online_ai_hint,
+        controls.model_api_settings,
+        controls.restore_send_confirmation,
         controls.labels[0],
         controls.page_edit,
         controls.labels[1],
@@ -1375,6 +1985,8 @@ fn theme_dropdown_open(state: &RefCell<SettingsUiState>) -> bool {
         return false;
     };
     [
+        controls.shortcuts[0],
+        controls.shortcuts[1],
         controls.theme_combo,
         controls.domain_combo,
         controls.script_combo,
@@ -1440,7 +2052,7 @@ fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
 }
 
 fn start_initial_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
-    if state.borrow().initial_started {
+    if state.borrow().initial_started || state.borrow().controls.category != 3 {
         return;
     }
     state.borrow_mut().initial_started = true;
@@ -1689,7 +2301,7 @@ fn save_settings(hwnd: HWND, state: &RefCell<SettingsUiState>) {
         return;
     };
 
-    let settings = match read_form(state) {
+    let mut settings = match read_form(state) {
         Ok(settings) => settings,
         Err(error) => {
             message_box(hwnd, &error, "Flower 设置", MB_OK | MB_ICONERROR);
@@ -1705,7 +2317,8 @@ fn save_settings(hwnd: HWND, state: &RefCell<SettingsUiState>) {
     let Some(store) = state.try_borrow().ok().map(|state| state.store.clone()) else {
         return;
     };
-    if let Err(error) = store.save(&settings) {
+    let saved = save_with_latest_consent(&store, &mut settings);
+    if let Err(error) = saved {
         let message = format!(
             "保存设置失败：{error}\n\n路径：{}\n\n原设置文件未被替换，\
              请检查目录权限后重试。",
@@ -1721,7 +2334,7 @@ fn save_settings(hwnd: HWND, state: &RefCell<SettingsUiState>) {
     if window_is_owned(hwnd, state) {
         message_box(
             hwnd,
-            "设置已保存。\n\n请重新切换到 Flower 输入法后生效。",
+            "设置已保存。\n\n在线AI总开关立即生效，无需切换输入法。\n模型、快捷键及其他设置仍需重新切换 Flower。",
             "Flower 设置",
             MB_OK,
         );
@@ -1731,6 +2344,53 @@ fn save_settings(hwnd: HWND, state: &RefCell<SettingsUiState>) {
             let _ = unsafe { DestroyWindow(hwnd) };
         }
     }
+}
+
+fn save_with_latest_consent(
+    store: &SettingsStore,
+    settings: &mut Settings,
+) -> Result<(), crate::settings::SettingsError> {
+    let latest = store.load()?;
+    settings.writing_send_consent = latest.writing_send_consent;
+    settings.model_api = latest.model_api;
+    settings.online_polish = latest.online_polish;
+    store.save(settings)
+}
+
+#[test]
+#[ignore = "isolated file store; explicit session scratch directory required"]
+fn save_form_preserves_latest_send_consent() {
+    let directory = std::path::PathBuf::from(std::env::var_os("FLOWER_CONSENT_TEST_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    let store = SettingsStore::new(directory.join("stale-form.json"));
+    let mut stale = Settings::default();
+    store.save(&stale).unwrap();
+    crate::writing::consent::remember(&store, true).unwrap();
+    let mut latest = store.load().unwrap();
+    latest.model_api.profiles[0].model = "owned-model".into();
+    latest.online_polish.style = crate::writing::PolishStyle::Formal;
+    store.save(&latest).unwrap();
+    stale.writing_shortcuts.draft.key = 0x34;
+    stale.online_polish.enabled = true;
+    stale.online_ai_enabled = true;
+    save_with_latest_consent(&store, &mut stale).unwrap();
+    let actual = store.load().unwrap();
+    assert_eq!(actual, stale);
+    assert_eq!(actual.model_api, latest.model_api);
+    assert_eq!(actual.online_polish, latest.online_polish);
+    assert!(actual.online_ai_enabled);
+    assert_eq!(
+        actual.writing_send_consent.as_deref(),
+        Some(crate::writing::consent::SCOPE)
+    );
+    crate::writing::consent::remember(&store, false).unwrap();
+    stale.online_ai_enabled = false;
+    save_with_latest_consent(&store, &mut stale).unwrap();
+    let actual = store.load().unwrap();
+    assert_eq!(actual.writing_send_consent, None);
+    assert!(!actual.online_ai_enabled);
+    assert_eq!(actual.model_api, latest.model_api);
+    assert_eq!(actual.online_polish, latest.online_polish);
 }
 
 fn read_form(state: &RefCell<SettingsUiState>) -> Result<Settings, String> {
@@ -1760,6 +2420,12 @@ fn read_form(state: &RefCell<SettingsUiState>) -> Result<Settings, String> {
         _ => return Err("请选择候选窗主题。".to_owned()),
     };
     let settings = Settings {
+        online_ai_enabled: is_checked(controls.online_ai),
+        candidate_layout_version: 1,
+        writing_send_consent: state.borrow().settings.writing_send_consent.clone(),
+        writing_shortcuts: read_shortcuts(controls)?,
+        online_polish: state.borrow().settings.online_polish.clone(),
+        model_api: state.borrow().settings.model_api.clone(),
         chinese_script: match unsafe {
             SendMessageW(
                 controls.script_combo,
@@ -1783,6 +2449,25 @@ fn read_form(state: &RefCell<SettingsUiState>) -> Result<Settings, String> {
         .validate()
         .map_err(|error| format!("设置值无效：{error}"))?;
     Ok(settings)
+}
+
+fn read_shortcuts(controls: SettingsControls) -> Result<WritingShortcuts, String> {
+    let selected: Vec<_> = controls
+        .shortcuts
+        .into_iter()
+        .map(|control| {
+            let raw = unsafe { GetWindowLongPtrW(control, GWLP_USERDATA) };
+            WritingShortcut::new((raw & 0xffff) as u16, ((raw >> 16) & 0xff) as u8)
+        })
+        .collect();
+    let shortcuts = WritingShortcuts {
+        draft: selected[0],
+        polish: selected[1],
+    };
+    if !shortcuts.is_valid() {
+        return Err("帮写与润色不能使用相同快捷键，且不能使用保留组合。".into());
+    }
+    Ok(shortcuts)
 }
 
 fn read_control_text(control: HWND) -> Result<String, String> {
@@ -2128,81 +2813,20 @@ mod tests {
     }
 
     #[test]
-    fn settings_cards_have_separate_rows_and_columns() {
-        assert_eq!(CARDS[1][0] - (CARDS[0][0] + CARDS[0][2]), 24);
-        assert_eq!(CARDS[2][1] - (CARDS[0][1] + CARDS[0][3]), 16);
-        assert_eq!(CARDS[3][0], CARDS[1][0]);
+    fn settings_categories_have_consistent_card_and_spacing() {
+        assert_eq!(CARDS, [[28, 72, 704, 304]]);
+        // control_layout translates its authored y coordinates by -80.
+        // Keep the online description inside the card and a clear footer gap.
+        let card_bottom = CARDS[0][1] + CARDS[0][3];
+        assert!(404 - 80 + 40 <= card_bottom - 12);
+        assert!(card_bottom + 24 <= 480 - 80);
         assert_eq!(scaled(24, 144), 36);
         assert_eq!(scaled(24, 0), 24);
         assert_eq!(scaled(24, 960), 120);
-        let hint = control_layout(SettingsControls::default())
-            .into_iter()
-            .map(|(_, rect)| rect)
-            .find(|rect| rect[0] == 412 && rect[1] == 240)
-            .unwrap();
-        assert!(hint[1] + hint[3] <= CARDS[1][1] + CARDS[1][3] - 4);
+        let c = SettingsControls::default();
+        assert_eq!(category_controls(c).len(), 4);
+        assert!(!WritingShortcut::new(0x46, 5).is_supported());
     }
-
-    #[test]
-    fn settings_closed_controls_do_not_overlap() {
-        let controls = SettingsControls {
-            theme_combo: HWND(1usize as *mut c_void),
-            domain_combo: HWND(2usize as *mut c_void),
-            script_combo: HWND(3usize as *mut c_void),
-            labels: [
-                HWND::default(),
-                HWND::default(),
-                HWND(4usize as *mut c_void),
-                HWND(5usize as *mut c_void),
-            ],
-            ..Default::default()
-        };
-        let layout = control_layout(controls);
-        let card = CARDS[0];
-        for (label, combo) in [
-            (controls.labels[2], controls.theme_combo),
-            (controls.labels[3], controls.script_combo),
-        ] {
-            let label_rect = layout.iter().find(|(hwnd, _)| *hwnd == label).unwrap().1;
-            let mut combo_rect = layout.iter().find(|(hwnd, _)| *hwnd == combo).unwrap().1;
-            combo_rect[3] = 32;
-            assert_eq!(label_rect[0], combo_rect[0]);
-            assert_eq!(label_rect[2], combo_rect[2]);
-            assert!(label_rect[1] + label_rect[3] <= combo_rect[1]);
-            for rect in [label_rect, combo_rect] {
-                assert!(rect[0] >= card[0] && rect[1] >= card[1]);
-                assert!(rect[0] + rect[2] <= card[0] + card[2]);
-                assert!(rect[1] + rect[3] <= card[1] + card[3]);
-            }
-        }
-        let rectangles: Vec<_> = layout
-            .into_iter()
-            .map(|(hwnd, mut rect)| {
-                if [
-                    controls.theme_combo,
-                    controls.domain_combo,
-                    controls.script_combo,
-                ]
-                .contains(&hwnd)
-                {
-                    rect[3] = 32;
-                }
-                rect
-            })
-            .collect();
-        for (index, a) in rectangles.iter().enumerate() {
-            for b in &rectangles[index + 1..] {
-                assert!(
-                    a[0] + a[2] <= b[0]
-                        || b[0] + b[2] <= a[0]
-                        || a[1] + a[3] <= b[1]
-                        || b[1] + b[3] <= a[1],
-                    "overlapping logical controls: {a:?}, {b:?}"
-                );
-            }
-        }
-    }
-
     #[test]
     fn settings_save_guard_is_exclusive_and_releases_on_drop() {
         let state = test_state(Path::new("unused-settings-test"));
@@ -2303,7 +2927,13 @@ mod tests {
             state,
         };
         let dpi = unsafe { GetDpiForSystem() }.max(BASE_DPI);
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let style = WS_OVERLAPPED
+            | WS_CAPTION
+            | WS_SYSMENU
+            | WS_MINIMIZEBOX
+            | windows::Win32::UI::WindowsAndMessaging::WS_SIZEBOX
+            | windows::Win32::UI::WindowsAndMessaging::WS_HSCROLL
+            | WS_VSCROLL;
         let mut rect = RECT {
             left: 0,
             top: 0,
@@ -2349,7 +2979,7 @@ mod tests {
             unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(preview.hwnd) }
                 .as_bool()
         );
-        assert!(preview.state.borrow().initial_started);
+        assert!(!preview.state.borrow().initial_started);
         assert!(!preview.state.borrow().dictionary_ready);
         for control in {
             let c = preview.state.borrow().controls;
@@ -2379,7 +3009,12 @@ mod tests {
             "owned fixture first paint before release: {:?}",
             first_paint.elapsed()
         );
+        let online_ai = preview.state.borrow().controls.online_ai;
+        assert!(!is_checked(online_ai), "online AI must default to opt-out");
+        set_checked(online_ai, true);
         release.send(()).unwrap();
+        assert!(!preview.state.borrow().initial_started);
+        show_category(preview.state.as_ref(), 3);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !preview.state.borrow().dictionary_ready {
             assert!(std::time::Instant::now() < deadline);
@@ -2399,6 +3034,12 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(
+            read_form(preview.state.as_ref()).unwrap().online_ai_enabled,
+            "late dictionary load must not overwrite an edited online AI switch"
+        );
+        show_category(preview.state.as_ref(), 0);
+        set_checked(online_ai, false);
         for (label, expected) in [
             (preview.state.borrow().controls.labels[2], "候选窗主题"),
             (preview.state.borrow().controls.labels[3], "输出字形"),
@@ -2419,6 +3060,18 @@ mod tests {
         assert_eq!(
             read_form(preview.state.as_ref()).unwrap(),
             Settings::default()
+        );
+        assert_owned_shortcuts_and_categories(preview.hwnd, preview.state.as_ref(), &directory);
+        // A saved modal value must survive subsequent main-form assembly.
+        let online = crate::settings::OnlinePolishSettings {
+            enabled: true,
+            style: crate::writing::PolishStyle::Concise,
+            script: Some(crate::ChineseScript::Traditional),
+        };
+        preview.state.borrow_mut().settings.online_polish = online.clone();
+        assert_eq!(
+            read_form(preview.state.as_ref()).unwrap().online_polish,
+            online
         );
         assert!(preview.state.borrow().domain_names.is_empty());
         assert!(!directory.join("settings.json").exists());
@@ -2466,6 +3119,7 @@ mod tests {
         // Re-enter the initial path with corrupt owned bytes. Poll the same
         // completion channel as production, rather than treating failure as
         // an empty dictionary.
+        show_category(preview.state.as_ref(), 3);
         preview.state.borrow_mut().initial_started = false;
         start_initial_dictionary(preview.hwnd, preview.state.as_ref());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2526,10 +3180,285 @@ mod tests {
         println!("native preview: {}", directory.display());
     }
 
+    fn assert_owned_shortcuts_and_categories(
+        hwnd: HWND,
+        state: &RefCell<SettingsUiState>,
+        directory: &Path,
+    ) {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        let c = state.borrow().controls;
+        for category in 0..4 {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    WPARAM((CATEGORY_ID + category as i32) as usize),
+                    LPARAM(0),
+                );
+            }
+            for (index, controls) in category_controls(c).iter().enumerate() {
+                assert_eq!(
+                    read_control_text(c.categories[index]).unwrap(),
+                    ["常规", "AI功能", "快捷键", "词库与学习"][index]
+                );
+                for control in controls {
+                    assert_eq!(
+                        unsafe { IsWindowVisible(*control) }.as_bool(),
+                        index == category
+                    );
+                }
+            }
+            for control in [c.online_ai, c.online_ai_hint] {
+                assert_eq!(
+                    unsafe { IsWindowVisible(control) }.as_bool(),
+                    category == 1,
+                    "online opt-in and cost notice belong exclusively to AI",
+                );
+            }
+            let layout = control_layout(c);
+            let mut visible: Vec<_> = layout
+                .into_iter()
+                .filter(|(control, _)| unsafe { IsWindowVisible(*control) }.as_bool())
+                .collect();
+            for (control, rect) in &mut visible {
+                if [
+                    c.theme_combo,
+                    c.script_combo,
+                    c.domain_combo,
+                    c.shortcuts[0],
+                    c.shortcuts[1],
+                ]
+                .contains(control)
+                {
+                    rect[3] = 32;
+                }
+            }
+            for (index, (_, a)) in visible.iter().enumerate() {
+                for (_, b) in &visible[index + 1..] {
+                    assert!(
+                        a[0] + a[2] <= b[0]
+                            || b[0] + b[2] <= a[0]
+                            || a[1] + a[3] <= b[1]
+                            || b[1] + b[3] <= a[1],
+                        "category {category}: overlapping {a:?} {b:?}"
+                    );
+                }
+            }
+            unsafe {
+                let _ = UpdateWindow(hwnd);
+            }
+            write_preview_bitmap(
+                hwnd,
+                &directory.join(format!("settings-category-{category}.bmp")),
+            );
+        }
+        assert_owned_recording(hwnd, state);
+        let custom = WritingShortcuts {
+            draft: WritingShortcut::new(0x41, 5),
+            polish: WritingShortcut::new(0x7b, 5),
+        };
+        select_shortcuts(c, custom);
+        for (control, value) in c.shortcuts.into_iter().zip([custom.draft, custom.polish]) {
+            assert_eq!(read_control_text(control).unwrap(), value.label());
+        }
+        let store = state.borrow().store.clone();
+        for enabled in [true, false] {
+            set_checked(c.online_ai, enabled);
+            let mut form = read_form(state).unwrap();
+            assert_eq!(form.online_ai_enabled, enabled);
+            assert_eq!(form.candidate_layout_version, 1);
+            save_with_latest_consent(&store, &mut form).unwrap();
+            assert_eq!(store.load().unwrap().online_ai_enabled, enabled);
+        }
+        let form = read_form(state).unwrap();
+        assert_eq!(form.writing_shortcuts, custom);
+        store.save(&form).unwrap();
+        let before = std::fs::read(store.path()).unwrap();
+        select_shortcuts(
+            c,
+            WritingShortcuts {
+                draft: custom.draft,
+                polish: custom.draft,
+            },
+        );
+        assert!(read_form(state).is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        unsafe {
+            SetWindowLongPtrW(c.shortcuts[0], GWLP_USERDATA, 0);
+        }
+        assert!(read_form(state).is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        select_shortcuts(c, custom);
+        let mut online = state.borrow().settings.online_polish.clone();
+        online.enabled = true;
+        state.borrow_mut().settings.online_polish = online.clone();
+        let form = read_form(state).unwrap();
+        assert_eq!(form.writing_shortcuts, custom);
+        assert_eq!(form.online_polish, online);
+        store.save(&form).unwrap();
+        assert_eq!(store.load().unwrap(), form);
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                WPARAM(RESET_SHORTCUTS_ID as usize),
+                LPARAM(0),
+            );
+        }
+        assert_eq!(
+            read_form(state).unwrap().writing_shortcuts,
+            WritingShortcuts::default()
+        );
+        assert_eq!(
+            store.load().unwrap(),
+            form,
+            "reset must not immediately save"
+        );
+        let defaults = read_form(state).unwrap();
+        store.save(&defaults).unwrap();
+        assert_eq!(
+            store.load().unwrap().writing_shortcuts,
+            WritingShortcuts::default()
+        );
+        state.borrow_mut().settings.online_polish = Default::default();
+        std::fs::remove_file(store.path()).unwrap();
+        // Shrink only our own HWND and exercise both native scroll ranges.
+        let mut original = RECT::default();
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut original).unwrap();
+        }
+        unsafe {
+            MoveWindow(hwnd, original.left, original.top, 480, 360, TRUE).unwrap();
+            SendMessageW(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::WM_VSCROLL,
+                WPARAM(7),
+                LPARAM(0),
+            );
+            SendMessageW(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::WM_HSCROLL,
+                WPARAM(7),
+                LPARAM(0),
+            );
+        }
+        assert!(state.borrow().controls.scroll_y > 0);
+        assert!(state.borrow().controls.scroll_x > 0);
+        write_preview_bitmap(hwnd, &directory.join("settings-small-workarea.bmp"));
+        unsafe {
+            MoveWindow(
+                hwnd,
+                original.left,
+                original.top,
+                original.right - original.left,
+                original.bottom - original.top,
+                TRUE,
+            )
+            .unwrap();
+        }
+        unsafe {
+            SendMessageW(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::WM_VSCROLL,
+                WPARAM(6),
+                LPARAM(0),
+            );
+            SendMessageW(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::WM_HSCROLL,
+                WPARAM(6),
+                LPARAM(0),
+            );
+        }
+        assert_eq!(state.borrow().controls.scroll_y, 0);
+        assert_eq!(state.borrow().controls.scroll_x, 0);
+        show_category(state, 0);
+    }
+
+    fn assert_owned_recording(hwnd: HWND, state: &RefCell<SettingsUiState>) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
+        use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
+        struct KeyboardRestore([u8; 256]);
+        impl Drop for KeyboardRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SetKeyboardState(&self.0);
+                }
+            }
+        }
+        let mut original = [0; 256];
+        unsafe {
+            GetKeyboardState(&mut original).unwrap();
+        }
+        let _restore = KeyboardRestore(original);
+        show_category(state, 2);
+        let c = state.borrow().controls;
+        let send = |index: usize, key: u16, mods: u8, down: bool| {
+            let mut keys = [0u8; 256];
+            for (vk, bit) in [(0x11, 1), (0x12, 2), (0x10, 4), (0x5b, 8)] {
+                if mods & bit != 0 {
+                    keys[vk] = 0x80;
+                }
+            }
+            unsafe {
+                SetKeyboardState(&keys).unwrap();
+            }
+            let message = MSG {
+                hwnd: c.shortcuts[index],
+                message: if down { WM_KEYDOWN } else { WM_KEYUP },
+                wParam: WPARAM(key as usize),
+                ..Default::default()
+            };
+            preprocess_settings_key(hwnd, state, &message)
+        };
+        let begin = |index: usize| unsafe {
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                WPARAM((DRAFT_SHORTCUT_ID as usize) + index),
+                LPARAM(0),
+            );
+        };
+        select_shortcuts(c, WritingShortcuts::default());
+        begin(0);
+        assert!(send(0, 0x11, 1, true));
+        assert!(send(0, 0x12, 3, true));
+        assert!(send(0, 0x12, 1, false));
+        assert!(send(0, 0x11, 0, false));
+        assert_eq!(read_shortcuts(c).unwrap().draft, WritingShortcut::new(0, 3));
+        begin(1);
+        assert!(send(1, 0x20, 1, true));
+        assert_eq!(
+            read_shortcuts(c).unwrap().polish,
+            WritingShortcut::new(0x20, 1)
+        );
+        for (key, mods) in [(0x41, 9), (0xba, 6)] {
+            begin(0);
+            assert!(send(0, key, mods, true));
+            assert_eq!(
+                read_shortcuts(c).unwrap().draft,
+                WritingShortcut::new(key, mods)
+            );
+        }
+        let confirmed = read_shortcuts(c).unwrap();
+        for (key, mods) in [(0x20, 1), (0x73, 2), (0x46, 5), (0x1b, 0), (0x0d, 0)] {
+            begin(0);
+            assert!(send(0, key, mods, true));
+            assert_eq!(read_shortcuts(c).unwrap(), confirmed);
+        }
+        begin(0);
+        assert!(!send(0, 0x09, 0, true));
+        assert!(state.borrow().controls.recording.is_none());
+        assert_eq!(read_shortcuts(c).unwrap(), confirmed);
+        select_shortcuts(c, WritingShortcuts::default());
+    }
+
     fn assert_owned_keyboard_route(hwnd: HWND, state: &RefCell<SettingsUiState>, directory: &Path) {
         use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, VK_SPACE, VK_TAB};
         use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, CB_SHOWDROPDOWN, PM_REMOVE};
         let controls = state.borrow().controls;
+        assert_owned_small_window_focus(hwnd, state, directory);
+        assert_owned_queued_recording(hwnd, state, directory);
         let key_message = |target, key: u16| MSG {
             hwnd: target,
             message: WM_KEYDOWN,
@@ -2551,7 +3480,24 @@ mod tests {
             (controls.clear_learning, CLEAR_LEARNING_ID),
             (controls.page_edit, SAVE_BUTTON_ID),
             (controls.save_button, SAVE_BUTTON_ID),
+            (controls.categories[2], CATEGORY_ID + 2),
+            (controls.reset_shortcuts, RESET_SHORTCUTS_ID),
+            (controls.online_settings, 390),
+            (controls.model_api_settings, 392),
+            (controls.restore_send_confirmation, 391),
         ] {
+            if target == controls.clear_learning {
+                show_category(state, 3);
+            } else if target == controls.reset_shortcuts {
+                show_category(state, 2);
+            } else if target == controls.online_settings
+                || target == controls.model_api_settings
+                || target == controls.restore_send_confirmation
+            {
+                show_category(state, 1);
+            } else {
+                show_category(state, 0);
+            }
             let _ = unsafe { SetFocus(target) };
             let key = key_message(target, VK_RETURN.0);
             assert_eq!(
@@ -2582,6 +3528,16 @@ mod tests {
             controls.domain_combo,
             controls.script_combo,
         ] {
+            show_category(
+                state,
+                if combo == controls.domain_combo {
+                    3
+                } else if controls.shortcuts.contains(&combo) {
+                    2
+                } else {
+                    0
+                },
+            );
             let _ = unsafe { EnableWindow(combo, TRUE) };
             for key in [VK_RETURN.0, VK_ESCAPE.0] {
                 unsafe {
@@ -2624,6 +3580,199 @@ mod tests {
         assert!(!preprocess_settings_key(hwnd, state, &close));
     }
 
+    fn assert_owned_queued_recording(
+        hwnd: HWND,
+        state: &RefCell<SettingsUiState>,
+        directory: &Path,
+    ) {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+        show_category(state, 2);
+        let c = state.borrow().controls;
+        let original = read_shortcuts(c).unwrap();
+        // Only post to our own HWNDs. Use the production loop's ordering:
+        // recording/Enter routing first, native dialog navigation second.
+        let pump = || {
+            let mut message = MSG::default();
+            let mut count = 0;
+            while unsafe { PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE) }.as_bool() {
+                count += 1;
+                assert!(count < 1000, "owned queue did not settle");
+                if message.message == WM_COMMAND {
+                    assert!(
+                        !matches!(
+                            (message.wParam.0 & 0xffff) as i32,
+                            SAVE_BUTTON_ID | CANCEL_BUTTON_ID | CLEAR_LEARNING_ID
+                        ),
+                        "recording must not post a save, close or destructive command"
+                    );
+                }
+                if !preprocess_settings_key(hwnd, state, &message)
+                    && !unsafe { IsDialogMessageW(hwnd, &message) }.as_bool()
+                {
+                    unsafe {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                ensure_settings_focus_visible(hwnd, state);
+            }
+            assert!(count > 0, "queued recording selector must consume messages");
+        };
+        for activate_by_enter in [false, true] {
+            for cancel in [0x1b, 0x0d, 0x09] {
+                let _ = unsafe { SetFocus(c.shortcuts[0]) };
+                unsafe {
+                    if activate_by_enter {
+                        PostMessageW(c.shortcuts[0], WM_KEYDOWN, WPARAM(0x0d), LPARAM(0)).unwrap();
+                    } else {
+                        PostMessageW(
+                            hwnd,
+                            WM_COMMAND,
+                            WPARAM(DRAFT_SHORTCUT_ID as usize),
+                            LPARAM(c.shortcuts[0].0 as isize),
+                        )
+                        .unwrap();
+                    }
+                }
+                pump();
+                assert_eq!(state.borrow().controls.recording, Some(0));
+                unsafe {
+                    PostMessageW(c.shortcuts[0], WM_KEYDOWN, WPARAM(cancel), LPARAM(0)).unwrap();
+                }
+                pump();
+                assert!(state.borrow().controls.recording.is_none());
+                assert_eq!(read_shortcuts(c).unwrap(), original);
+                assert_eq!(
+                    read_control_text(c.shortcuts[0]).unwrap(),
+                    original.draft.label()
+                );
+                assert!(!directory.join("settings.json").exists());
+                assert!(!directory.join("dictionary.json").exists());
+            }
+        }
+    }
+
+    fn assert_owned_small_window_focus(
+        hwnd: HWND,
+        state: &RefCell<SettingsUiState>,
+        directory: &Path,
+    ) {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetFocus, GetKeyboardState, SetKeyboardState, VK_SHIFT, VK_TAB,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetClientRect, GetWindowRect, IsWindowVisible, PeekMessageW, PM_REMOVE,
+        };
+        struct KeyboardState([u8; 256]);
+        impl Drop for KeyboardState {
+            fn drop(&mut self) {
+                // Thread-local state only: never synthesize or inject a system key.
+                let _ = unsafe { SetKeyboardState(&self.0) };
+            }
+        }
+        let mut keys = [0u8; 256];
+        unsafe { GetKeyboardState(&mut keys).unwrap() };
+        let _restore = KeyboardState(keys);
+        let mut original = RECT::default();
+        unsafe {
+            GetWindowRect(hwnd, &mut original).unwrap();
+            MoveWindow(hwnd, original.left, original.top, 480, 360, TRUE).unwrap();
+        }
+        let c = state.borrow().controls;
+        let mut visited = Vec::new();
+        for category in 0..4 {
+            show_category(state, category);
+            let _ = unsafe { SetFocus(c.categories[category]) };
+            for backwards in [false, true] {
+                keys[VK_SHIFT.0 as usize] = if backwards { 0x80 } else { 0 };
+                unsafe { SetKeyboardState(&keys).unwrap() };
+                for _ in 0..24 {
+                    let message = MSG {
+                        hwnd: unsafe { GetFocus() },
+                        message: WM_KEYDOWN,
+                        wParam: WPARAM(VK_TAB.0 as usize),
+                        ..Default::default()
+                    };
+                    assert!(!preprocess_settings_key(hwnd, state, &message));
+                    assert!(unsafe { IsDialogMessageW(hwnd, &message) }.as_bool());
+                    ensure_settings_focus_visible(hwnd, state);
+                    let focused = unsafe { GetFocus() };
+                    assert!(unsafe { IsWindowVisible(focused) }.as_bool());
+                    visited.push(focused);
+                    let mut rect = RECT::default();
+                    let mut client = RECT::default();
+                    unsafe {
+                        GetWindowRect(focused, &mut rect).unwrap();
+                        GetClientRect(hwnd, &mut client).unwrap();
+                    }
+                    let mut origin = POINT {
+                        x: rect.left,
+                        y: rect.top,
+                    };
+                    assert!(unsafe { ScreenToClient(hwnd, &mut origin) }.as_bool());
+                    assert!(
+                        origin.x >= 0 && origin.y >= 0
+                            && origin.x + rect.right - rect.left <= client.right
+                            && origin.y + rect.bottom - rect.top <= client.bottom,
+                        "category={category}, backwards={backwards}, focus={}, origin={origin:?}, rect={rect:?}, client={client:?}",
+                        unsafe { GetDlgCtrlID(focused) }
+                    );
+                    let mut command = MSG::default();
+                    while unsafe {
+                        PeekMessageW(&mut command, hwnd, WM_COMMAND, WM_COMMAND, PM_REMOVE)
+                    }
+                    .as_bool()
+                    {
+                        assert!(
+                            !matches!(
+                                (command.wParam.0 & 0xffff) as i32,
+                                SAVE_BUTTON_ID | CLEAR_LEARNING_ID
+                            ),
+                            "Tab must not save or clear"
+                        );
+                    }
+                }
+            }
+        }
+        for target in c.categories.into_iter().chain([
+            c.online_ai,
+            c.page_edit,
+            c.theme_combo,
+            c.script_combo,
+            c.save_button,
+            c.cancel_button,
+            c.reset_shortcuts,
+            c.online_settings,
+            c.model_api_settings,
+            c.ai_correction,
+            c.ai_scope_compatibility,
+            c.restore_send_confirmation,
+        ]) {
+            assert!(
+                visited.contains(&target),
+                "native traversal missed {}",
+                unsafe { GetDlgCtrlID(target) }
+            );
+        }
+        assert!(!directory.join("settings.json").exists());
+        assert!(!directory.join("dictionary.json").exists());
+        write_preview_bitmap(hwnd, &directory.join("settings-small-tab-focus.bmp"));
+        unsafe {
+            MoveWindow(
+                hwnd,
+                original.left,
+                original.top,
+                original.right - original.left,
+                original.bottom - original.top,
+                TRUE,
+            )
+            .unwrap();
+        }
+        show_category(state, 0);
+    }
+
     fn write_preview_bitmap(hwnd: HWND, path: &Path) {
         use windows::Win32::Graphics::Gdi::*;
         #[link(name = "user32")]
@@ -2632,7 +3781,7 @@ mod tests {
         }
         unsafe {
             let mut rect = RECT::default();
-            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).unwrap();
+            windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect).unwrap();
             let width = rect.right - rect.left;
             let height = rect.bottom - rect.top;
             let dc = CreateCompatibleDC(HDC::default());
@@ -2652,7 +3801,7 @@ mod tests {
             let mut bits = std::ptr::null_mut();
             let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
             let old = SelectObject(dc, HGDIOBJ::from(bitmap));
-            let rendered = PrintWindow(hwnd.0, dc.0, 0);
+            let rendered = PrintWindow(hwnd.0, dc.0, 1); // PW_CLIENTONLY
             let byte_count = (width * height * 4) as usize;
             let mut bytes = Vec::with_capacity(54 + byte_count);
             bytes.extend_from_slice(b"BM");

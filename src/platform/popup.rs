@@ -120,11 +120,10 @@ mod windows_impl {
             RefCell::new((HWND::default(), 0, 0, 0));
     }
 
-    /// Keeps status geometry out of the selectable candidate model.
+    /// Candidate viewport and a fixed, independently owned settings column.
     struct PopupLayout {
         candidates: CandidatePopupLayout,
         size: PopupSize,
-        status: Option<PopupRect>,
         lines: Vec<Vec<String>>,
         full_rows: Vec<PopupRect>,
         viewport: PopupRect,
@@ -134,26 +133,43 @@ mod windows_impl {
     }
 
     impl PopupLayout {
+        fn settings_rect(size: PopupSize, dpi: u32) -> Option<PopupRect> {
+            let column = scaled(32, dpi);
+            let edge = scaled(28, dpi);
+            if size.width <= column || size.height < edge {
+                return None;
+            }
+            let top = (size.height - edge) / 2;
+            Some(PopupRect::new(
+                size.width - edge,
+                top,
+                size.width,
+                top + edge,
+            ))
+        }
+
         fn new(
             snapshot: &CandidatePopupSnapshot,
             dpi: u32,
             bounds: PopupSize,
             status: Option<AiStatus>,
         ) -> Self {
+            Self::for_paint_dc(snapshot, dpi, bounds, status, None)
+        }
+
+        fn for_paint_dc(
+            snapshot: &CandidatePopupSnapshot,
+            dpi: u32,
+            bounds: PopupSize,
+            _status: Option<AiStatus>,
+            paint_dc: Option<HDC>,
+        ) -> Self {
             let height = bounds.height.max(1);
-            let total_width = bounds.width.max(1).min(scaled(560, dpi));
+            let total_width = bounds.width.max(1);
             let settings_width = scaled(32, dpi).min((total_width - 1).max(0));
             let content_width = (total_width - settings_width).max(1);
-            let status_height = if status.is_some() {
-                scaled(22, dpi).max(1).min(height)
-            } else {
-                0
-            };
-            let mut candidates = CandidatePopupLayout::new(
-                snapshot,
-                dpi,
-                PopupSize::new(content_width, (height - status_height).max(1)),
-            );
+            let mut candidates =
+                CandidatePopupLayout::new(snapshot, dpi, PopupSize::new(content_width, height));
             let line_height = scaled(30, dpi).max(1);
             let padding = scaled(8, dpi);
             let mut lines = Vec::new();
@@ -161,8 +177,12 @@ mod windows_impl {
             let dc = MeasureDc::new();
             let font = dc.as_ref().and_then(|dc| PaintFont::new(dc.0, dpi));
             let measure = |text: &str| {
-                font.as_ref()
-                    .and_then(|_| measured_width(dc.as_ref()?.0, text))
+                if let Some(hdc) = paint_dc {
+                    measured_width(hdc, text)
+                } else {
+                    font.as_ref()
+                        .and_then(|_| measured_width(dc.as_ref()?.0, text))
+                }
             };
             let labels: Vec<String> = snapshot
                 .candidates
@@ -170,75 +190,75 @@ mod windows_impl {
                 .enumerate()
                 .map(|(i, c)| format!("{}. {}", i + 1, c.display_text()))
                 .collect();
-            let vertical = labels.len() != candidates.candidates.len()
-                || labels
-                    .iter()
-                    .zip(&candidates.candidates)
-                    .any(|(text, row)| {
-                        measure(text).map_or(true, |w| w > row.width() - scaled(6, dpi))
-                    });
-            if vertical && font.is_some() {
-                let width = content_width;
+            if paint_dc.is_some() || font.is_some() {
+                let tail_padding = scaled(6, dpi);
+                let gap = scaled(12, dpi);
+                let natural = labels.iter().try_fold(padding * 2, |sum, text| {
+                    measure(text).map(|w| {
+                        sum.saturating_add(w)
+                            .saturating_add(tail_padding)
+                            .saturating_add(gap)
+                    })
+                });
+                let width = natural
+                    .map(|width| width.saturating_sub(if labels.is_empty() { 0 } else { gap }))
+                    .unwrap_or(content_width)
+                    .min(content_width)
+                    .max(1);
                 let available = (width - padding * 2 - scaled(6, dpi)).max(0);
                 candidates.candidates.clear();
                 let mut top = padding;
+                let mut x = padding;
+                let mut row_height = line_height;
                 for label in &labels {
                     let wrapped = wrap_candidate_text(label, available, &measure);
+                    let cell_width =
+                        measure(label).unwrap_or(available).min(available) + tail_padding;
+                    if x > padding && x.saturating_add(cell_width) > width - padding {
+                        top = top.saturating_add(row_height);
+                        x = padding;
+                        row_height = line_height;
+                    }
                     let bottom =
                         top.saturating_add(line_height.saturating_mul(wrapped.len() as i32));
                     candidates.candidates.push(PopupRect::new(
-                        padding,
+                        x,
                         top,
-                        (width - padding).max(padding),
+                        x.saturating_add(cell_width).min(width - padding).max(x),
                         bottom,
                     ));
+                    row_height = row_height.max(bottom - top);
+                    // The horizontal gap belongs to neither the highlight nor hit testing.
+                    x = x.saturating_add(cell_width).saturating_add(gap);
                     lines.push(wrapped);
-                    top = bottom;
                 }
                 candidates.size = PopupSize::new(
                     width,
-                    top.saturating_add(padding)
-                        .min((height - status_height).max(0)),
+                    top.saturating_add(row_height)
+                        .saturating_add(padding)
+                        .min(height),
                 );
-            } else if font.is_some() {
-                lines = labels.into_iter().map(|s| vec![s]).collect();
             } else {
                 // Font/measurement failure must not leave selectable unseen text.
                 candidates.candidates.clear();
+            }
+            if lines.iter().any(Vec::is_empty) {
+                // A font/width failure cannot authorize a partially rendered page.
+                candidates.candidates.clear();
+                lines.clear();
             }
             if candidates.size.height < padding * 2 + line_height {
                 candidates.candidates.clear();
                 lines.clear();
             }
-            // CandidatePopupLayout requires a positive bound; at a one-pixel
-            // work area the status owns that pixel and no candidate can fit.
-            if height <= status_height {
-                candidates.candidates.clear();
-                candidates.size.height = 0;
-            }
             let size = PopupSize::new(
                 candidates.size.width + settings_width,
-                candidates
-                    .size
-                    .height
-                    .saturating_add(status_height)
-                    .min(height),
+                candidates.size.height.min(height),
             );
-            let status = status.map(|_| {
-                PopupRect::new(
-                    0,
-                    candidates.size.height,
-                    candidates.size.width,
-                    size.height,
-                )
-            });
-            if settings_width >= scaled(32, dpi) && size.height >= scaled(28, dpi) {
-                candidates.settings_button = Some(PopupRect::new(
-                    candidates.size.width + scaled(4, dpi),
-                    0,
-                    size.width,
-                    scaled(28, dpi),
-                ));
+            // Never inherit the base layout's button on an undersized work area.
+            candidates.settings_button = None;
+            if settings_width >= scaled(32, dpi) {
+                candidates.settings_button = Self::settings_rect(size, dpi);
             }
             let full_rows = candidates.candidates.clone();
             let viewport = PopupRect::new(
@@ -253,7 +273,6 @@ mod windows_impl {
             let mut result = Self {
                 candidates,
                 size,
-                status,
                 lines,
                 full_rows,
                 viewport,
@@ -389,7 +408,6 @@ mod windows_impl {
     struct PresentedCandidates {
         snapshot: CandidatePopupSnapshot,
         dpi: u32,
-        status: Option<AiStatus>,
         offset: Option<i32>,
         client: PopupRect,
         window: PopupRect,
@@ -639,36 +657,17 @@ mod windows_impl {
             Ok(())
         }
 
-        /// Changes only the fixed, non-selectable diagnostic row.
+        /// Compatibility notification only: AI diagnostics have no popup UI.
         pub(crate) fn set_ai_status(&mut self, status: AiStatus) -> Result<(), PopupError> {
             self.ensure_alive()?;
-            let (added, caret) = {
+            {
                 let mut state = self
                     .state
                     .as_deref()
                     .ok_or(PopupError::Destroyed)?
                     .try_borrow_mut()
                     .map_err(|_| state_busy_error())?;
-                if state.ai_status == Some(status) {
-                    return Ok(());
-                }
-                let added = state.ai_status.is_none();
                 state.ai_status = Some(status);
-                state.presented = None;
-                (added, state.last_caret)
-            };
-            // Only the first status changes geometry. Never show a hidden popup.
-            if added && self.is_visible() {
-                if let Some(caret) = caret {
-                    self.show_at(caret)?;
-                }
-            }
-            // SAFETY: The live window is invalidated without activating it.
-            if !unsafe { InvalidateRect(self.hwnd, None, TRUE) }.as_bool() {
-                return Err(PopupError::win32(
-                    "AI status invalidation",
-                    WindowsError::from_win32(),
-                ));
             }
             Ok(())
         }
@@ -1608,7 +1607,6 @@ mod windows_impl {
         let frame = state.presented.as_ref()?;
         if state.snapshot.as_ref() != Some(&frame.snapshot)
             || state.dpi != frame.dpi
-            || state.ai_status != frame.status
             || state.scroll_offset != frame.offset
             || rect_from_windows(client) != frame.client
             || rect_from_windows(window) != frame.window
@@ -1764,56 +1762,75 @@ mod windows_impl {
         }
     }
 
-    /// A bounded eight-tooth vector silhouette with a genuinely empty hub.
-    /// Regions need no selected GDI objects or font and never touch adjacent rows.
+    /// Supersampled eight-tooth silhouette, preblended into an opaque DIB.
     fn paint_settings_gear(hdc: HDC, rect: PopupRect, dpi: u32, palette: PopupPalette) -> bool {
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::Graphics::Gdi::{
-            CombineRgn, CreateEllipticRgn, CreatePolygonRgn, FillRgn, ALTERNATE, ERROR, RGN_DIFF,
-        };
         let size = scaled(18, dpi);
-        if size < 8 || rect.width() < size + 2 || rect.height() < size + 2 {
+        if hdc.is_invalid()
+            || !(8..=512).contains(&size)
+            || rect.width() < size + 2
+            || rect.height() < size + 2
+        {
             return false;
         }
         let left = rect.left + (rect.width() - size) / 2;
         let top = rect.top + (rect.height() - size) / 2;
         let radius = f64::from(size) / 2.0;
-        let points: Vec<POINT> = (0..64)
-            .map(|i| {
-                let angle = (f64::from(i) - 0.5) * std::f64::consts::TAU / 64.0;
-                let r = radius * if i % 8 < 4 { 1.0 } else { 0.76 };
-                POINT {
-                    x: (f64::from(left) + radius + angle.cos() * r).round() as i32,
-                    y: (f64::from(top) + radius + angle.sin() * r).round() as i32,
+        let mut pixels = Vec::<u32>::new();
+        if pixels.try_reserve_exact((size * size) as usize).is_err() {
+            return false;
+        }
+        for y in 0..size {
+            for x in 0..size {
+                let mut coverage = 0u32;
+                for sy in 0..8 {
+                    for sx in 0..8 {
+                        let dx = (f64::from(x) + (f64::from(sx) + 0.5) / 8.0 - radius) / radius;
+                        let dy = (f64::from(y) + (f64::from(sy) + 0.5) / 8.0 - radius) / radius;
+                        let distance = dx.hypot(dy);
+                        // Smooth shoulders avoid angular polygon joins at small sizes.
+                        let tooth = ((dx.atan2(dy) * 8.0).cos() * 1.8).tanh();
+                        let outer = 0.85 + 0.12 * tooth;
+                        if distance <= outer && distance >= 0.35 {
+                            coverage += 1;
+                        }
+                    }
                 }
-            })
-            .collect();
-        // Every handle is owned locally; even failed construction/combination is cleaned up.
+                let channel = |shift: u32| -> u32 {
+                    let fg = (palette.text >> shift) & 255;
+                    let bg = (palette.background >> shift) & 255;
+                    (fg * coverage + bg * (64 - coverage) + 32) / 64
+                };
+                pixels.push((channel(0) << 16) | (channel(8) << 8) | channel(16));
+            }
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size,
+                biHeight: -size,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: Complete top-down opaque 32-bit scanlines; no selected resources.
         unsafe {
-            let gear = CreatePolygonRgn(&points, ALTERNATE);
-            let inset = (size * 5 / 16).max(1);
-            let hub = CreateEllipticRgn(
-                left + inset,
-                top + inset,
-                left + size - inset,
-                top + size - inset,
-            );
-            let brush = CreateSolidBrush(COLORREF(palette.text));
-            let painted = !gear.is_invalid()
-                && !hub.is_invalid()
-                && !brush.is_invalid()
-                && CombineRgn(gear, gear, hub, RGN_DIFF).0 != ERROR
-                && FillRgn(hdc, gear, brush).as_bool();
-            if !brush.is_invalid() {
-                let _ = DeleteObject(brush);
-            }
-            if !hub.is_invalid() {
-                let _ = DeleteObject(hub);
-            }
-            if !gear.is_invalid() {
-                let _ = DeleteObject(gear);
-            }
-            painted
+            SetDIBitsToDevice(
+                hdc,
+                left,
+                top,
+                size as u32,
+                size as u32,
+                0,
+                0,
+                0,
+                size as u32,
+                pixels.as_ptr().cast(),
+                &info,
+                DIB_RGB_COLORS,
+            ) == size
         }
     }
 
@@ -1847,15 +1864,22 @@ mod windows_impl {
             SetBkMode(hdc, TRANSPARENT);
         }
 
-        let mut layout = PopupLayout::new(
+        let mut layout = PopupLayout::for_paint_dc(
             snapshot,
             dpi,
             PopupSize::new(client.right - client.left, client.bottom - client.top),
             *status,
+            font.as_ref().map(|_| hdc),
         );
         let offset = unsafe { popup_state_pointer(hwnd).as_ref() }
             .and_then(|s| s.try_borrow().ok())
             .and_then(|s| s.scroll_offset);
+        // The actual HWND client is authoritative, including externally resized
+        // owned test windows. The column never follows the content's scroll.
+        layout.candidates.settings_button = PopupLayout::settings_rect(
+            PopupSize::new(client.right - client.left, client.bottom - client.top),
+            dpi,
+        );
         if let Some(offset) = offset {
             layout.set_scroll(offset);
         }
@@ -1867,36 +1891,16 @@ mod windows_impl {
                 .settings_button
                 .map_or(true, |rect| paint_settings_gear(hdc, rect, dpi, palette));
 
-        if let (Some(status), Some(rect)) = (status, layout.status) {
-            let padding = scaled(8, dpi).min(rect.width() / 2).max(0);
-            let mut text_rect = windows_rect(PopupRect::new(
-                rect.left + padding,
-                rect.top,
-                rect.right - padding,
-                rect.bottom,
-            ));
-            let (text, _) =
-                fitted_candidate_text(hdc, status.label(), text_rect.right - text_rect.left);
-            set_text_color(hdc, COLORREF(palette.text));
-            draw_text(
-                hdc,
-                &text,
-                &mut text_rect,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-            );
-        }
         if presented && settings_painted {
             if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
                 if let Ok(mut state) = state.try_borrow_mut() {
                     if state.snapshot.as_ref() == Some(snapshot)
                         && state.dpi == dpi
-                        && state.ai_status == *status
                         && state.scroll_offset == offset
                     {
                         state.presented = Some(PresentedCandidates {
                             snapshot: snapshot.clone(),
                             dpi,
-                            status: *status,
                             offset,
                             client: rect_from_windows(client),
                             window: rect_from_windows(window),
@@ -1916,7 +1920,7 @@ mod windows_impl {
         palette: PopupPalette,
         layout: &PopupLayout,
     ) -> bool {
-        // Clip both text and highlight before painting the separately owned status.
+        // Clip both text and highlight before painting the fixed settings column.
         let saved = save_candidate_dc(hdc);
         if saved == 0 {
             return false;
@@ -2072,6 +2076,7 @@ mod windows_impl {
             .then_some(size.cx)
     }
 
+    #[cfg(test)]
     fn fitted_candidate_text(hdc: HDC, text: &str, available: i32) -> (String, i32) {
         fit_candidate_text(text, available, |text| measured_width(hdc, text))
     }
@@ -2180,6 +2185,7 @@ mod windows_impl {
         }) == height
     }
 
+    #[cfg(test)]
     fn fit_candidate_text(
         text: &str,
         available: i32,
@@ -2368,6 +2374,7 @@ mod windows_impl {
             bitmap: HBITMAP,
             previous: HGDIOBJ,
             client: RECT,
+            bits: *mut std::ffi::c_void,
         }
 
         impl FrameSurface {
@@ -2400,7 +2407,40 @@ mod windows_impl {
                     bitmap,
                     previous,
                     client,
+                    bits,
                 }
+            }
+
+            fn save(&self, name: &str) {
+                let Some(directory) = std::env::var_os("FLOWER_POPUP_TEST_ARTIFACTS") else {
+                    return;
+                };
+                unsafe {
+                    windows::Win32::Graphics::Gdi::GdiFlush().unwrap();
+                }
+                let width = self.client.right;
+                let height = self.client.bottom;
+                let pixels = unsafe {
+                    std::slice::from_raw_parts(
+                        self.bits.cast::<u8>(),
+                        (width * height * 4) as usize,
+                    )
+                };
+                let mut bmp = Vec::new();
+                bmp.extend_from_slice(b"BM");
+                bmp.extend_from_slice(&(54 + pixels.len() as u32).to_le_bytes());
+                bmp.extend_from_slice(&[0; 4]);
+                bmp.extend_from_slice(&54u32.to_le_bytes());
+                bmp.extend_from_slice(&40u32.to_le_bytes());
+                bmp.extend_from_slice(&width.to_le_bytes());
+                bmp.extend_from_slice(&(-height).to_le_bytes());
+                bmp.extend_from_slice(&1u16.to_le_bytes());
+                bmp.extend_from_slice(&32u16.to_le_bytes());
+                bmp.extend_from_slice(&[0; 24]);
+                bmp.extend_from_slice(pixels);
+                let path = std::path::PathBuf::from(directory);
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join(format!("{name}.bmp")), bmp).unwrap();
             }
 
             fn paint(&self, hwnd: HWND) {
@@ -2423,6 +2463,140 @@ mod windows_impl {
 
         fn paint_native_test_frame(hwnd: HWND) {
             FrameSurface::new(hwnd).paint(hwnd);
+        }
+
+        #[test]
+        fn native_own_hwnd_short_long_and_gear_artifacts() {
+            for (name, words) in [
+                ("short", vec!["你好", "您好", "你们", "你", "拟", "泥", "呢"]),
+                ("long", vec!["这是普通完整句候选需要保留全部最后尾字这是普通完整句候选需要保留全部最后尾字",
+                    "这是唯一纠正完整句候选同样不能丢失最后尾字这是唯一纠正完整句候选同样不能丢失最后尾字",
+                    "这是", "普通", "完整", "字", "词"]),
+            ] {
+                for (theme_name, theme) in [("light", Theme::Light), ("dark", Theme::Dark)] {
+                  for dpi in [96, 144, 192] {
+                    let mut popup = CandidatePopupWindow::new().unwrap();
+                    let mut snapshot = long_snapshot();
+                    snapshot.candidates = words.iter().map(|w| crate::engine::Candidate::new(*w, "")).collect();
+                    snapshot.highlighted = Some(0);
+                    popup.update_snapshot(&snapshot).unwrap();
+                    popup.set_theme(theme).unwrap();
+                    popup.show_at(PopupRect::new(10, 10, 11, 30)).unwrap();
+                    // Force a narrow owned client for a reproducible wrapped image.
+                    unsafe { SetWindowPos(popup.hwnd, HWND::default(), 0, 0,
+                        if name == "long" { 720 } else { scaled(520, dpi) },
+                        if name == "long" { 300 } else { scaled(60, dpi) },
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE).unwrap(); }
+                    popup.state.as_ref().unwrap().borrow_mut().dpi = dpi;
+                    let surface = FrameSurface::new(popup.hwnd);
+                    surface.paint(popup.hwnd);
+                    let button = {
+                        let state = popup.state.as_ref().unwrap().borrow();
+                        let frame = state.presented.as_ref().unwrap();
+                        assert!(!frame.candidates.candidates.is_empty(), "candidate screenshot must not be an empty fail-closed frame");
+                        if name == "short" {
+                            assert_eq!(frame.candidates.candidates.len(), snapshot.candidates.len());
+                        }
+                        let button = frame.candidates.settings_button.unwrap();
+                        assert_eq!(button.right, frame.client.right);
+                        assert!((button.top - (frame.client.bottom - button.bottom)).abs() <= 1);
+                        assert!(frame.candidates.candidates.iter().all(|r| r.right <= button.left));
+                        button
+                    };
+                    let point = PopupPoint { x: button.left + 1, y: button.top + 1 };
+                    assert!(settings_at(popup.hwnd, point));
+                    surface.save(&format!("own-hwnd-{name}-{theme_name}-{dpi}"));
+                    if name == "long" {
+                        popup.state.as_ref().unwrap().borrow_mut().scroll_offset = Some(i32::MAX);
+                        assert!(!settings_at(popup.hwnd, point), "old scroll frame is stale");
+                        surface.paint(popup.hwnd);
+                        let state = popup.state.as_ref().unwrap().borrow();
+                        assert_eq!(state.presented.as_ref().unwrap().candidates.settings_button, Some(button));
+                        drop(state);
+                        assert!(settings_at(popup.hwnd, point));
+                        surface.save(&format!("own-hwnd-{name}-scroll-{theme_name}-{dpi}"));
+                    }
+                    popup.destroy().unwrap();
+                  }
+                }
+            }
+        }
+
+        #[test]
+        fn fixed_seven_natural_flow_preserves_every_label_and_index() {
+            let mut snapshot = long_snapshot();
+            snapshot.candidates = [
+                "这是普通完整候选句尾字",
+                "这是唯一纠正完整候选句尾字",
+                "测试",
+                "自然",
+                "候选",
+                "字",
+                "词",
+            ]
+            .into_iter()
+            .map(|text| crate::engine::Candidate::new(text, ""))
+            .collect();
+            snapshot.highlighted = None;
+            for dpi in [96, 144, 192] {
+                for width in [240, 720, 1800] {
+                    let layout = PopupLayout::new(
+                        &snapshot,
+                        dpi,
+                        PopupSize::new(width, scaled(2000, dpi)),
+                        None,
+                    );
+                    assert_eq!(layout.full_rows.len(), 7);
+                    assert_eq!(layout.max_scroll, 0);
+                    for (index, (row, lines)) in
+                        layout.full_rows.iter().zip(&layout.lines).enumerate()
+                    {
+                        assert_eq!(
+                            lines.concat(),
+                            format!(
+                                "{}. {}",
+                                index + 1,
+                                snapshot.candidates[index].display_text()
+                            )
+                        );
+                        assert_eq!(
+                            layout.candidates.hit_test(
+                                &snapshot,
+                                PopupPoint {
+                                    x: row.left,
+                                    y: row.top
+                                }
+                            ),
+                            Some(CandidatePopupAction::Select {
+                                revision: snapshot.revision,
+                                page: snapshot.page,
+                                index
+                            })
+                        );
+                    }
+                    for (i, a) in layout.full_rows.iter().enumerate() {
+                        for b in &layout.full_rows[i + 1..] {
+                            assert!(
+                                a.right <= b.left
+                                    || b.right <= a.left
+                                    || a.bottom <= b.top
+                                    || b.bottom <= a.top
+                            );
+                        }
+                    }
+                }
+            }
+            let wide = PopupLayout::new(&snapshot, 96, PopupSize::new(2400, 2000), None);
+            assert!(wide.size.width > 560, "no historical fixed width cap");
+            snapshot.candidates = (0..7)
+                .map(|_| crate::engine::Candidate::new("字", ""))
+                .collect();
+            let short = PopupLayout::new(&snapshot, 96, PopupSize::new(2400, 2000), None);
+            assert!(short.size.width < wide.size.width);
+            assert!(short
+                .full_rows
+                .iter()
+                .all(|r| r.top == short.full_rows[0].top));
         }
 
         #[test]
@@ -2450,11 +2624,14 @@ mod windows_impl {
                         windows::Win32::Graphics::Gdi::GdiFlush().unwrap();
                     }
                     let mut ink = 0;
+                    let mut edge_colors = std::collections::BTreeSet::new();
                     for y in 0..96 {
                         for x in 0..96 {
                             let color = unsafe { GetPixel(surface.dc, x, y) }.0;
                             if color != palette.background {
-                                assert_eq!(color, palette.text);
+                                if color != palette.text {
+                                    edge_colors.insert(color);
+                                }
                                 assert!(x > button.left && x < button.right - 1);
                                 assert!(y > button.top && y < button.bottom - 1);
                                 ink += 1;
@@ -2462,6 +2639,18 @@ mod windows_impl {
                         }
                     }
                     assert!(ink > scaled(40, dpi));
+                    assert!(
+                        edge_colors.len() >= 4,
+                        "multilevel opaque antialias coverage"
+                    );
+                    surface.save(&format!(
+                        "gear-{dpi}-{}",
+                        if palette.background == super::super::LIGHT_PALETTE.background {
+                            "light"
+                        } else {
+                            "dark"
+                        }
+                    ));
                     let cx = (button.left + button.right) / 2;
                     let cy = (button.top + button.bottom) / 2;
                     assert_eq!(
@@ -2528,6 +2717,10 @@ mod windows_impl {
             };
             let position = LPARAM(((point.y as u32) << 16 | point.x as u32) as isize);
             assert!(settings_at(popup.hwnd, point));
+            // A nonvisual diagnostic transition must retain this frame's authority.
+            popup.set_ai_status(AiStatus::Checking).unwrap();
+            assert!(popup.state.as_ref().unwrap().borrow().presented.is_some());
+            assert!(settings_at(popup.hwnd, point));
             assert_eq!(popup_action_at(popup.hwnd, point), None);
             unsafe {
                 SendMessageW(popup.hwnd, WM_LBUTTONUP, WPARAM(0), position);
@@ -2584,6 +2777,43 @@ mod windows_impl {
         }
 
         #[test]
+        fn settings_column_short_wrap_scroll_and_tiny_work_area() {
+            for dpi in [96, 144, 192] {
+                let mut snapshot = long_snapshot();
+                snapshot.candidates = (0..7)
+                    .map(|_| crate::engine::Candidate::new("字", ""))
+                    .collect();
+                let short = PopupLayout::new(&snapshot, dpi, PopupSize::new(4000, 1000), None);
+                assert!(short
+                    .full_rows
+                    .iter()
+                    .all(|r| r.top == short.full_rows[0].top));
+                let long = long_snapshot();
+                for (snapshot, bounds) in [
+                    (&snapshot, PopupSize::new(4000, 1000)),
+                    (&long, PopupSize::new(240, 2000)),
+                    (&long, PopupSize::new(240, 160)),
+                ] {
+                    let mut layout = PopupLayout::new(snapshot, dpi, bounds, None);
+                    let button = layout.candidates.settings_button.unwrap();
+                    assert_eq!(button.right, layout.size.width);
+                    assert!((button.top - (layout.size.height - button.bottom)).abs() <= 1);
+                    assert!(layout.viewport.right <= button.left);
+                    layout.set_scroll(i32::MAX);
+                    assert_eq!(layout.candidates.settings_button, Some(button));
+                }
+                for bounds in [PopupSize::new(1, 1), PopupSize::new(20, 20)] {
+                    let layout = PopupLayout::new(&snapshot, dpi, bounds, None);
+                    assert!(layout.candidates.settings_button.is_none());
+                    assert!(layout.candidates.candidates.is_empty());
+                    assert!(
+                        layout.size.width <= bounds.width && layout.size.height <= bounds.height
+                    );
+                }
+            }
+        }
+
+        #[test]
         fn settings_button_layout_dpi_narrow_and_candidate_boundaries() {
             let snapshot = long_snapshot();
             for dpi in [96, 144, 192, 288] {
@@ -2595,13 +2825,12 @@ mod windows_impl {
                         Some(AiStatus::Waiting),
                     );
                     assert!(layout.size.width <= width);
-                    assert!(layout.size.width <= scaled(560, dpi));
                     assert_eq!(layout.candidates.footer, None);
                     if let Some(button) = layout.candidates.settings_button {
                         assert_eq!(button.width(), scaled(28, dpi));
-                        assert!(button.right <= layout.size.width);
+                        assert_eq!(button.right, layout.size.width);
+                        assert!((button.top - (layout.size.height - button.bottom)).abs() <= 1);
                         assert!(layout.viewport.right <= button.left);
-                        assert!(layout.status.unwrap().right <= button.left);
                         for row in &layout.candidates.candidates {
                             assert!(row.right <= button.left);
                         }
@@ -2657,7 +2886,6 @@ mod windows_impl {
                 popup_action_at(popup.hwnd, point),
                 Some(CandidatePopupAction::Select { .. })
             ));
-            let mut expected_status = Vec::new();
             for fault in [1, 2, 3] {
                 CANDIDATE_CLIP_FAULT.with(|value| value.set(fault));
                 let mut before = RECT::default();
@@ -2692,18 +2920,7 @@ mod windows_impl {
                         assert_eq!(popup_action_at(popup.hwnd, PopupPoint { x, y }), None);
                     }
                 }
-                assert!(
-                    status_pixels.iter().any(|p| *p != 0xffffff),
-                    "status still drawn after restoring DC"
-                );
-                if fault == 1 {
-                    expected_status = status_pixels;
-                } else {
-                    assert_eq!(
-                        status_pixels, expected_status,
-                        "no status pollution at fault {fault}"
-                    );
-                }
+                assert!(status_pixels.iter().all(|p| *p == 0xffffff));
                 CANDIDATE_CLIP_FAULT.with(|value| value.set(0));
                 surface.paint(popup.hwnd);
                 assert!(matches!(
@@ -2809,13 +3026,12 @@ mod windows_impl {
                             );
                         }
                     }
-                    let status = layout.status.unwrap();
                     assert_eq!(
                         layout.candidates.hit_test(
                             &snapshot,
                             PopupPoint {
                                 x: 20,
-                                y: status.top
+                                y: layout.size.height
                             }
                         ),
                         None
@@ -2870,7 +3086,7 @@ mod windows_impl {
                         &snapshot,
                         PopupPoint {
                             x: 10,
-                            y: layout.status.unwrap().top
+                            y: layout.size.height
                         }
                     ),
                     None
@@ -2955,7 +3171,13 @@ mod windows_impl {
                 );
             }
             assert_eq!(
-                popup_action_at(popup.hwnd, PopupPoint { x: 20, y: 150 }),
+                popup_action_at(
+                    popup.hwnd,
+                    PopupPoint {
+                        x: 20,
+                        y: layout.viewport.bottom,
+                    },
+                ),
                 None
             );
             let mut next = snapshot.clone();
@@ -3022,7 +3244,8 @@ mod windows_impl {
                 pump(popup.hwnd);
                 MESSAGE_COUNTS.with(|c| {
                     assert_eq!(c.borrow().1, 0);
-                    assert!(c.borrow().2 <= 1);
+                    assert_eq!(c.borrow().2, 0);
+                    assert_eq!(c.borrow().3, 0, "status must not request paint");
                 });
                 MESSAGE_COUNTS.with(|c| *c.borrow_mut() = (popup.hwnd, 0, 0, 0));
                 popup
@@ -3195,8 +3418,7 @@ mod windows_impl {
                     }
                 }
                 assert!(ink > 0, "last glyph has visible pixels at {dpi} DPI");
-                let status = layout.status.unwrap();
-                for y in status.top..status.bottom {
+                for y in layout.viewport.bottom..layout.size.height {
                     for x in 0..width {
                         assert_eq!(unsafe { GetPixel(dc, x, y) }.0, 0xffffff);
                     }
@@ -3260,7 +3482,7 @@ mod windows_impl {
         }
 
         #[test]
-        fn ai_status_layout_preserves_candidates_and_excludes_status_hits() {
+        fn ai_status_layout_has_no_row_or_reserved_height() {
             let snapshot = CandidatePopupSnapshot {
                 revision: 1,
                 preedit: String::new(),
@@ -3272,24 +3494,73 @@ mod windows_impl {
             for dpi in [96, 144, 192, 480] {
                 let bounds = PopupSize::new(4000, 4000);
                 let plain = PopupLayout::new(&snapshot, dpi, bounds, None);
-                let original = CandidatePopupLayout::new(&snapshot, dpi, bounds);
-                assert_eq!(plain.candidates.candidates, original.candidates);
-                assert_eq!(plain.candidates.size, original.size);
-                assert_eq!(plain.size.width, original.size.width + scaled(32, dpi));
-                assert_eq!(plain.size.height, original.size.height);
+                let dc = MeasureDc::new().unwrap();
+                let _font = PaintFont::new(dc.0, dpi).unwrap();
+                assert_eq!(plain.candidates.candidates.len(), 1);
+                assert_eq!(
+                    plain.candidates.candidates[0].width(),
+                    measured_width(dc.0, "1. 你好").unwrap() + scaled(6, dpi)
+                );
+                assert_eq!(
+                    plain.size.width,
+                    plain.candidates.size.width + scaled(32, dpi)
+                );
+                assert_eq!(plain.size.height, plain.candidates.size.height);
                 assert_eq!(plain.candidates.footer, None);
                 assert!(plain.candidates.settings_button.is_some());
-                assert!(plain.status.is_none());
                 let status = PopupLayout::new(&snapshot, dpi, bounds, Some(AiStatus::Waiting));
                 assert_eq!(status.candidates, plain.candidates);
                 assert_eq!(status.size.width, plain.size.width);
-                assert_eq!(status.size.height, plain.size.height + scaled(22, dpi));
-                let row = status.status.unwrap();
-                assert_eq!(row.top, plain.size.height);
+                assert_eq!(status.size.height, plain.size.height);
+                for status in [
+                    AiStatus::Disabled,
+                    AiStatus::Unavailable,
+                    AiStatus::ModulePathFailed,
+                    AiStatus::UnsupportedPath,
+                    AiStatus::UnsafeDirectory,
+                    AiStatus::MissingHelper,
+                    AiStatus::MissingAssets,
+                    AiStatus::ClientFailed,
+                    AiStatus::TimerFailed,
+                    AiStatus::Waiting,
+                    AiStatus::Ineligible,
+                    AiStatus::Checking,
+                    AiStatus::NoSuggestion,
+                    AiStatus::Suggested,
+                    AiStatus::Failed,
+                    AiStatus::EditFailed,
+                ]
+                .into_iter()
+                .chain(
+                    [
+                        crate::ai::ScopeBlockReason::Selection,
+                        crate::ai::ScopeBlockReason::Property,
+                        crate::ai::ScopeBlockReason::Value,
+                        crate::ai::ScopeBlockReason::Undeclared,
+                        crate::ai::ScopeBlockReason::InvalidValue,
+                        crate::ai::ScopeBlockReason::Interface,
+                        crate::ai::ScopeBlockReason::Read,
+                        crate::ai::ScopeBlockReason::Empty,
+                        crate::ai::ScopeBlockReason::InvalidList,
+                        crate::ai::ScopeBlockReason::Sensitive,
+                        crate::ai::ScopeBlockReason::Unsupported,
+                    ]
+                    .into_iter()
+                    .map(AiStatus::ScopeBlocked),
+                ) {
+                    let layout = PopupLayout::new(&snapshot, dpi, bounds, Some(status));
+                    assert_eq!(layout.size, plain.size);
+                    assert_eq!(layout.candidates, plain.candidates);
+                    assert_eq!(layout.viewport, plain.viewport);
+                }
                 assert_eq!(
-                    status
-                        .candidates
-                        .hit_test(&snapshot, PopupPoint { x: 8, y: row.top }),
+                    status.candidates.hit_test(
+                        &snapshot,
+                        PopupPoint {
+                            x: 8,
+                            y: plain.size.height
+                        }
+                    ),
                     None
                 );
                 for width in [1, 7, 32, 560] {
@@ -3301,13 +3572,7 @@ mod windows_impl {
                             Some(AiStatus::Checking),
                         );
                         assert!(layout.size.width <= width && layout.size.height <= height);
-                        let row = layout.status.unwrap();
-                        assert!(row.top >= 0 && row.bottom <= height && row.right <= width);
-                        assert!(layout
-                            .candidates
-                            .candidates
-                            .iter()
-                            .all(|cell| cell.bottom <= row.top));
+                        assert_eq!(layout.size.height, layout.candidates.size.height);
                     }
                 }
             }
@@ -3376,6 +3641,46 @@ mod windows_impl {
             let cell = PopupRect::new(10, 8, 20, 38);
             assert_eq!(candidate_highlight_rect(cell, i32::MAX, 96).right, 20);
             assert_eq!(candidate_highlight_rect(cell, -1, 96).right, 10);
+        }
+
+        #[test]
+        fn horizontal_candidate_gap_is_independent_and_not_hittable() {
+            let mut snapshot = long_snapshot();
+            snapshot.candidates = vec![
+                crate::engine::Candidate::new("你好", ""),
+                crate::engine::Candidate::new("您好", ""),
+            ];
+            for dpi in [96, 144, 192] {
+                let dc = MeasureDc::new().unwrap();
+                let _font = PaintFont::new(dc.0, dpi).unwrap();
+                let layout = PopupLayout::new(
+                    &snapshot,
+                    dpi,
+                    PopupSize::new(scaled(1000, dpi), scaled(300, dpi)),
+                    None,
+                );
+                let first = layout.candidates.candidates[0];
+                let next = layout.candidates.candidates[1];
+                assert_eq!(first.top, next.top);
+                assert_eq!(next.left - first.right, scaled(12, dpi));
+                let text_width = measured_width(dc.0, "1. 你好").unwrap();
+                let highlight = candidate_highlight_rect(first, text_width, dpi);
+                assert_eq!(highlight.right, first.left + text_width + scaled(6, dpi));
+                assert!(next.left - highlight.right >= scaled(12, dpi));
+                for x in first.right..next.left {
+                    assert_eq!(
+                        layout.candidates.hit_test(
+                            &snapshot,
+                            PopupPoint {
+                                x,
+                                y: first.top + 1
+                            },
+                        ),
+                        None,
+                        "gap must not select a candidate at dpi={dpi}, x={x}",
+                    );
+                }
+            }
         }
 
         #[test]

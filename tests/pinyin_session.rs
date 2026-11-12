@@ -10,6 +10,139 @@ fn session() -> PinyinSession {
 
 const ADAPTIVE_TSV: &str = "shi\t是\t900\nshi\t时\t800\nshi\t十\t700\nshi\t事\t600\nshi\t市\t500\nshi\t世界很长的候选文本\t400\nshi\t诗\t300";
 
+const QUOTA_TSV: &str = "jin'tian'wo'men'gong'zuo\t今天我们工作\t1000\njin'tian\t今天\t100\njin'tian\t津田\t90\njin'tian\t金田\t80\njin'tian\t近天\t70\njin\t今\t100\njin\t金\t90\njin\t近\t80\njin\t进\t70\nwo'men\t我们\t100\ngong'zuo\t工作\t100";
+
+#[test]
+fn first_page_quotas_preserve_page_size_and_remaining_ranked_choices() {
+    for (size, word_count, single_count) in [(1, 0, 0), (2, 0, 1), (4, 0, 3), (7, 3, 3), (9, 4, 4)]
+    {
+        let mut s = PinyinSession::from_lexicon_tsv(QUOTA_TSV, size).unwrap();
+        let update = type_text(&mut s, "jintianwomengongzuo");
+        assert_eq!(s.page_size(), size);
+        assert_eq!(update.candidates[0].text, "今天我们工作");
+        assert_eq!(update.candidates.len(), size);
+        assert_eq!(
+            update
+                .candidates
+                .iter()
+                .skip(1)
+                .filter(|c| c.text.chars().count() == 2)
+                .count(),
+            word_count
+        );
+        assert_eq!(
+            update
+                .candidates
+                .iter()
+                .filter(|c| c.text.chars().count() == 1)
+                .count(),
+            single_count
+        );
+        let mut all = update.candidates;
+        while s.page() + 1 < s.page_count() {
+            all.extend(s.next_page().unwrap().candidates);
+        }
+        let words: Vec<_> = all
+            .iter()
+            .filter(|c| c.text.chars().count() == 2)
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(words, ["今天", "津田", "金田", "近天"]);
+        let singles: Vec<_> = all
+            .iter()
+            .filter(|c| c.text.chars().count() == 1)
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(singles, ["今", "金", "近", "进"]);
+    }
+}
+
+#[test]
+fn first_page_quotas_fill_short_tiers_and_resize_without_changing_selection() {
+    for (remove, expected) in [
+        (
+            "\njin'tian\t津田\t90\njin'tian\t金田\t80\njin'tian\t近天\t70",
+            [1, 4],
+        ),
+        ("\njin\t金\t90\njin\t近\t80\njin\t进\t70", [4, 1]),
+    ] {
+        let words = QUOTA_TSV.replace(remove, "");
+        let mut s = PinyinSession::from_lexicon_tsv(&words, 7).unwrap();
+        let update = type_text(&mut s, "jintianwomengongzuo");
+        assert_eq!(update.candidates.len(), 6);
+        assert_eq!(
+            update
+                .candidates
+                .iter()
+                .filter(|c| c.text.chars().count() == 2)
+                .count(),
+            expected[0]
+        );
+        assert_eq!(
+            update
+                .candidates
+                .iter()
+                .filter(|c| c.text.chars().count() == 1)
+                .count(),
+            expected[1]
+        );
+    }
+    let mut s = PinyinSession::from_lexicon_tsv(QUOTA_TSV, 7).unwrap();
+    type_text(&mut s, "jintianwomengongzuo");
+    for _ in 0..4 {
+        s.process_key(KeyEvent::plain(Key::Right)).unwrap();
+    }
+    assert_eq!(
+        s.candidates_on_current_page()[s.highlighted().unwrap()].text,
+        "今"
+    );
+    s.set_page_size(4).unwrap();
+    assert_eq!(
+        s.candidates_on_current_page()[s.highlighted().unwrap()].text,
+        "今"
+    );
+    // Enter commits literal raw when the highlight consumes only a prefix;
+    // Space selects that real prefix and leaves the remaining raw composing.
+    let mut enter_session = s.clone();
+    assert_eq!(
+        enter_session
+            .process_key(KeyEvent::plain(Key::Enter))
+            .unwrap()
+            .commit
+            .as_deref(),
+        Some("jintianwomengongzuo")
+    );
+    let update = s.process_key(KeyEvent::plain(Key::Space)).unwrap();
+    assert!(update.commit.is_none());
+    assert_eq!(s.pending_input(), "tianwomengongzuo");
+    assert_eq!(s.preedit(), "今tianwomengongzuo");
+    assert!(s.pending_learning().is_empty());
+}
+
+#[test]
+fn first_page_quotas_fall_back_to_other_real_prefixes() {
+    let mut s = PinyinSession::from_lexicon_tsv(
+        "jin'tian'wo'men'gong'zuo\t今天我们工作\t1000\njin'tian'wo'men\t今天我们\t100\njin'tian\t今天\t100\ngong'zuo\t工作\t100",
+        7,
+    ).unwrap();
+    let update = type_text(&mut s, "jintianwomengongzuo");
+    assert_eq!(
+        update
+            .candidates
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>(),
+        ["今天我们工作", "今天", "今天我们"]
+    );
+    assert!(s.select_candidate(2).unwrap().commit.is_none());
+    assert_eq!(s.pending_input(), "gongzuo");
+    assert_eq!(
+        s.select_candidate(0).unwrap().commit.as_deref(),
+        Some("今天我们工作")
+    );
+    assert!(!s.pending_learning().is_empty());
+}
+
 #[test]
 fn adaptive_promotion_is_one_adjacent_step_and_can_be_restored() {
     use flower::engine::promote_order;
@@ -39,8 +172,8 @@ fn adaptive_promotion_is_one_adjacent_step_and_can_be_restored() {
 }
 
 #[test]
-fn adaptive_pages_cover_all_choices_and_preserve_absolute_highlight() {
-    let mut session = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+fn fixed_pages_cover_all_choices_and_preserve_absolute_highlight() {
+    let mut session = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 7).unwrap();
     let baseline = type_text(&mut session, "shi").candidates;
     session.process_key(KeyEvent::plain(Key::Right)).unwrap();
     session.process_key(KeyEvent::plain(Key::Right)).unwrap();
@@ -53,13 +186,7 @@ fn adaptive_pages_cover_all_choices_and_preserve_absolute_highlight() {
     let mut actual = Vec::new();
     loop {
         let page = session.candidates_on_current_page();
-        let width: u32 = page
-            .iter()
-            .enumerate()
-            .map(|(i, c)| flower::engine::paging::candidate_cell_width(&c.text, i))
-            .sum();
-        assert!(page.len() == 1 || width <= 130);
-        assert!(page.len() <= 9);
+        assert_eq!(page.len(), 7.min(baseline.len() - actual.len()));
         actual.extend_from_slice(page);
         if session.page() + 1 == session.page_count() {
             break;
@@ -67,7 +194,9 @@ fn adaptive_pages_cover_all_choices_and_preserve_absolute_highlight() {
         session.next_page().unwrap();
     }
     assert_eq!(actual, baseline);
-    let expected = session.candidates_on_current_page()[0].text.clone();
+    let wide = session.set_candidate_width(Some(10000));
+    assert_eq!(wide.candidates.len(), 7);
+    let expected = wide.candidates[wide.highlighted.unwrap()].text.clone();
     assert_eq!(
         session
             .process_key(KeyEvent::plain(Key::Enter))
@@ -81,7 +210,7 @@ fn adaptive_pages_cover_all_choices_and_preserve_absolute_highlight() {
 fn adaptive_local_selection_and_preview_do_not_apply_promotions() {
     use flower::engine::EngineRouter;
     for key in [Key::Char('2'), Key::Enter] {
-        let mut router = EngineRouter::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+        let mut router = EngineRouter::from_lexicon_tsv(ADAPTIVE_TSV, 3).unwrap();
         router.set_candidate_width(Some(130));
         for c in "shi".chars() {
             router.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
@@ -102,7 +231,7 @@ fn adaptive_local_selection_and_preview_do_not_apply_promotions() {
             before[index].text
         );
     }
-    let mut session = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+    let mut session = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 3).unwrap();
     session.set_candidate_width(Some(130));
     type_text(&mut session, "shi");
     session.next_page().unwrap();
@@ -342,7 +471,7 @@ fn page_keys_move_between_candidate_pages() {
         .process_key(KeyEvent::plain(Key::PageDown))
         .expect("next page");
     assert_eq!(second.page, 1);
-    assert_eq!(second.candidates.len(), 2);
+    assert_eq!(second.candidates.len(), 4);
     assert_ne!(first.candidates[0].text, second.candidates[0].text);
 
     let first_again = session

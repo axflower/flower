@@ -18,6 +18,7 @@ const USAGE: &str = "Flower 设置程序
 用法：
   flower-settings
   flower-settings --help
+  flower-settings --writing
   flower-settings --start-input-method
   flower-settings --startup-input-method
   flower-settings --enable-startup
@@ -33,6 +34,12 @@ const USAGE: &str = "Flower 设置程序
   flower-settings unicode U+<hex>
 
 无参数打开设置窗口。词典管理仅操作当前用户本地数据，不提权。
+--writing 打开在线帮写面板，需在模型 API 设置中配置地址、协议、模型 ID 和密钥。
+先在设置 → AI功能勾选“启用在线AI功能”（默认关闭），保存开关立即生效，无需重切Flower。
+更换模型仍需重新切换Flower读取新模型快照。
+润色还须子开关开启；选中文字按 Ctrl+Space 查看候选浮层，可在设置关闭。
+帮写/润色快捷键可直接按键录入，默认 Ctrl+Alt（单独组合松开）/ Ctrl+Space。
+面板不自动联网生成，不读取剪贴板；独立启动时只提供手动输入和复制。
 导入/导出使用三列 TSV（拼音、文字、正整数权重）；读音以单引号分音。
 选词顺序默认本地保存；成功选中前移一位，完整逐段组词可记忆。
 关闭停止新增；清空删除自动词和排序，保留手工个人词条及专业词库。
@@ -41,6 +48,7 @@ const USAGE: &str = "Flower 设置程序
 #[derive(Debug, PartialEq)]
 enum Command {
     Gui,
+    Writing,
     StartInputMethod,
     StartupInputMethod,
     EnableStartup,
@@ -106,6 +114,7 @@ fn unicode_scalar(value: &str) -> Result<char, String> {
 fn parse(args: &[OsString]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::Gui),
+        [arg] if arg == "--writing" => Ok(Command::Writing),
         [arg] if arg == "--start-input-method" => Ok(Command::StartInputMethod),
         [arg] if arg == "--startup-input-method" => Ok(Command::StartupInputMethod),
         [arg] if arg == "--enable-startup" => Ok(Command::EnableStartup),
@@ -266,6 +275,16 @@ fn execute(command: Command) -> Result<(), String> {
             #[cfg(not(target_os = "windows"))]
             return Err("Flower 设置窗口目前仅支持 Windows 10/11 x64。".to_owned());
         }
+        Command::Writing => {
+            #[cfg(target_os = "windows")]
+            {
+                return flower::platform::writing_ui::run_writing_app(
+                    flower::writing::Task::draft(),
+                );
+            }
+            #[cfg(not(target_os = "windows"))]
+            return Err("Flower 在线写作窗口目前仅支持 Windows 10/11 x64。".to_owned());
+        }
         _ => {}
     }
     let store = DictionaryStore::for_current_user().map_err(|e| e.to_string())?;
@@ -314,6 +333,7 @@ fn wants_cli_console(command: &Result<Command, String>, silent: bool) -> bool {
         && !matches!(
             command,
             Ok(Command::Gui
+                | Command::Writing
                 | Command::AiServer
                 | Command::StartInputMethod
                 | Command::StartupInputMethod
@@ -388,6 +408,7 @@ mod tests {
     fn gui_and_background_modes_never_request_a_console() {
         for mode in [
             Command::Gui,
+            Command::Writing,
             Command::AiServer,
             Command::StartInputMethod,
             Command::StartupInputMethod,
@@ -406,6 +427,7 @@ mod tests {
     #[test]
     fn strict_arguments() {
         for (flag, expected) in [
+            ("--writing", Command::Writing),
             ("--startup-input-method", Command::StartupInputMethod),
             ("--enable-startup", Command::EnableStartup),
             ("--disable-startup", Command::DisableStartup),
@@ -416,6 +438,7 @@ mod tests {
             assert!(command(&[flag, flag]).is_err());
         }
         assert_eq!(command(&[]).unwrap(), Command::Gui);
+        assert!(command(&["--polish"]).is_err());
         assert_eq!(
             command(&["--start-input-method"]).unwrap(),
             Command::StartInputMethod

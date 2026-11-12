@@ -81,6 +81,7 @@ fn rank_entries(left: &LexiconEntry, right: &LexiconEntry) -> std::cmp::Ordering
 /// Empty lines and lines whose first non-space character is `#` are ignored.
 #[derive(Debug, Clone)]
 pub struct Lexicon {
+    dormant: bool,
     entries: Arc<HashMap<String, Vec<LexiconEntry>>>,
     initials: Arc<HashMap<String, Vec<LexiconEntry>>>,
     syllables: Arc<SyllableTrie>,
@@ -166,7 +167,155 @@ impl SyllableTrie {
 
 static BUILTIN: OnceLock<Result<Lexicon, EngineError>> = OnceLock::new();
 
+#[cfg(test)]
+mod completion_budget_tests {
+    use super::*;
+
+    #[test]
+    fn three_short_syllables_and_shared_edge_budget_are_respected() {
+        let lexicon = Lexicon::from_tsv("a'o'e'he\t阿哦额和\t100").unwrap();
+        let mut budget = (512, 4096);
+        let choice = lexicon.completion_choice("aoe", &mut budget).unwrap();
+        assert_eq!(choice.candidate.text, "阿哦额和");
+        assert_eq!(choice.consumed, 3);
+        assert!(choice.events.is_empty() && choice.candidate.is_completion());
+        let mut exhausted = (3, 4096);
+        assert!(lexicon.completion_choice("aoe", &mut exhausted).is_none());
+        assert_eq!(exhausted.0, 0);
+        assert!(lexicon.completion_choice("a'o'e", &mut exhausted).is_none());
+    }
+
+    #[test]
+    fn descendant_edges_and_words_share_one_budget_without_full_table_scan() {
+        let mut tsv = String::new();
+        for i in 0..400u32 {
+            let a = char::from(b'a' + (i / 26) as u8);
+            let b = char::from(b'a' + (i % 26) as u8);
+            let text = char::from_u32(0x4e00 + i).unwrap();
+            tsv.push_str(&format!("jun'bu'jian'h{a}{b}\t君不见{text}\t{}\n", i + 1));
+        }
+        let lexicon = Lexicon::from_tsv(&tsv).unwrap();
+        let mut budget = (512, 12);
+        let _ = lexicon.completion_choice("junbujian", &mut budget);
+        assert_eq!(budget.1, 0);
+        // A fallback table cannot silently reset the refresh's exhausted budget.
+        assert!(lexicon
+            .completion_choice("junbujian", &mut budget)
+            .is_none());
+    }
+}
+
 impl Lexicon {
+    /// Whole-syllable full-Pinyin prefix completion using the existing shared
+    /// trie. Both prefix exploration and descendant inspection are bounded;
+    /// there is no per-key scan of the full table or duplicate completion index.
+    pub(crate) fn completion_choice(
+        &self,
+        raw: &str,
+        budget: &mut (usize, usize),
+    ) -> Option<super::decoder::Choice> {
+        const PREFIX_BUDGET: usize = 512;
+        const DESCENDANT_BUDGET: usize = 4096;
+        if raw.len() < 3
+            || !raw.bytes().all(|c| c.is_ascii_lowercase() || c == b'\'')
+            || raw.starts_with('\'')
+            || raw.contains("''")
+        {
+            return None;
+        }
+        let mut prefixes = vec![(0usize, 0usize, 0usize)];
+        let mut roots = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut inspected = 0;
+        while let Some((node, offset, syllables)) = prefixes.pop() {
+            if !visited.insert((node, offset, syllables)) {
+                continue;
+            }
+            if budget.0 == 0 {
+                break;
+            }
+            budget.0 -= 1;
+            inspected += 1;
+            if offset == raw.len() {
+                if syllables >= 3 {
+                    roots.push(node);
+                }
+                continue;
+            }
+            if let Some(edges) = self.syllables.nodes[node]
+                .edges
+                .get(&raw.as_bytes()[offset])
+            {
+                for (syllable, next) in edges.iter().rev() {
+                    if budget.0 == 0 {
+                        break;
+                    }
+                    budget.0 -= 1;
+                    if raw[offset..].starts_with(syllable) {
+                        let mut end = offset + syllable.len();
+                        if raw.as_bytes().get(end) == Some(&b'\'') {
+                            end += 1;
+                        }
+                        if prefixes.len() + inspected < PREFIX_BUDGET {
+                            prefixes.push((*next, end, syllables + 1));
+                        }
+                    }
+                }
+            }
+        }
+        let mut stack: Vec<_> = roots.into_iter().map(|n| (n, false)).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut best: Option<&LexiconEntry> = None;
+        inspected = 0;
+        while let Some((node, extended)) = stack.pop() {
+            if !seen.insert((node, extended)) {
+                continue;
+            }
+            if budget.1 == 0 {
+                break;
+            }
+            budget.1 -= 1;
+            inspected += 1;
+            if extended {
+                for entry in &self.syllables.nodes[node].words {
+                    if budget.1 == 0 {
+                        break;
+                    }
+                    budget.1 -= 1;
+                    inspected += 1;
+                    if entry.text.chars().count() <= 64
+                        && best.map_or(true, |old| rank_entries(entry, old).is_lt())
+                    {
+                        best = Some(entry);
+                    }
+                }
+            }
+            for (_, next) in self.syllables.nodes[node]
+                .edges
+                .values()
+                .rev()
+                .flat_map(|edges| edges.iter().rev())
+            {
+                if budget.1 == 0 {
+                    break;
+                }
+                budget.1 -= 1;
+                if stack.len() + inspected < DESCENDANT_BUDGET {
+                    stack.push((*next, true));
+                }
+            }
+        }
+        best.map(|entry| {
+            let mut choice = entry.choice(raw.len());
+            choice.candidate.comment = format!("{}{}", Candidate::COMPLETION_PREFIX, entry.reading);
+            choice.events.clear();
+            choice
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn builtin_initialized() -> bool {
+        BUILTIN.get().is_some()
+    }
     pub(crate) fn spelling_entries(&self) -> impl Iterator<Item = (&str, &str, u32)> {
         self.entries
             .values()
@@ -183,7 +332,7 @@ impl Lexicon {
                     std::str::from_utf8(&bytes).map_err(|error| EngineError::InvalidUtf8 {
                         message: error.to_string(),
                     })?;
-                let mut lexicon = Self::from_tsv(text)?;
+                let mut entries = Self::parse_entries(text)?;
                 drop(bytes);
                 let words: std::collections::HashSet<_> = EVERYDAY_PAIRS
                     .split_whitespace()
@@ -197,7 +346,6 @@ impl Lexicon {
                         Some((fields.next()?, fields.next()?))
                     })
                     .collect();
-                let entries = Arc::make_mut(&mut lexicon.entries);
                 for candidates in entries.values_mut() {
                     for entry in candidates.iter_mut() {
                         let syllables = entry.reading.split('\'').count();
@@ -209,15 +357,28 @@ impl Lexicon {
                     }
                     candidates.sort_by(rank_entries);
                 }
-                lexicon.initials = Arc::new(Self::build_initials(entries));
-                lexicon.syllables = Arc::new(SyllableTrie::build(entries));
-                Ok(lexicon)
+                Ok(Self::from_entries(entries))
             })
             .clone()
     }
 
     /// Parses and validates a UTF-8 TSV lexicon.
     pub fn from_tsv(tsv: &str) -> Result<Self, EngineError> {
+        Ok(Self::from_entries(Self::parse_entries(tsv)?))
+    }
+
+    /// Used only before the first real composing key, never as an input fallback.
+    pub(crate) fn dormant() -> Self {
+        let mut lexicon = Self::from_entries(HashMap::new());
+        lexicon.dormant = true;
+        lexicon
+    }
+
+    pub(crate) fn is_dormant(&self) -> bool {
+        self.dormant
+    }
+
+    fn parse_entries(tsv: &str) -> Result<HashMap<String, Vec<LexiconEntry>>, EngineError> {
         let tsv = tsv.strip_prefix('\u{feff}').unwrap_or(tsv);
         let mut entries: HashMap<String, Vec<LexiconEntry>> = HashMap::new();
 
@@ -314,11 +475,16 @@ impl Lexicon {
             candidates.sort_by(rank_entries);
         }
 
-        Ok(Self {
+        Ok(entries)
+    }
+
+    fn from_entries(entries: HashMap<String, Vec<LexiconEntry>>) -> Self {
+        Self {
+            dormant: false,
             initials: Arc::new(Self::build_initials(&entries)),
             syllables: Arc::new(SyllableTrie::build(&entries)),
             entries: Arc::new(entries),
-        })
+        }
     }
 
     fn build_initials(

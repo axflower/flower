@@ -11,6 +11,19 @@ pub mod windows;
 pub mod settings_ui;
 
 #[cfg(target_os = "windows")]
+pub mod writing_ui;
+
+#[cfg(target_os = "windows")]
+mod send_confirmation;
+
+#[cfg(target_os = "windows")]
+pub mod model_api_ui;
+#[cfg(target_os = "windows")]
+pub mod online_settings_ui;
+#[cfg(target_os = "windows")]
+pub mod polish_ui;
+
+#[cfg(target_os = "windows")]
 pub mod registration;
 
 #[cfg(target_os = "windows")]

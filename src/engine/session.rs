@@ -2,9 +2,7 @@ use super::{
     decoder::{decode, Choice},
     LearningEvent,
 };
-use super::{
-    paging::candidate_cell_width, ranking_indices, PromotionEvent, RankingCandidate, RankingOrder,
-};
+use super::{ranking_indices, PromotionEvent, RankingCandidate, RankingOrder};
 use super::{Candidate, CompositionUpdate, EngineError, Key, KeyEvent, Lexicon};
 use std::{ops::Range, sync::Arc};
 
@@ -17,7 +15,7 @@ struct Confirmed {
 }
 
 /// Default number of candidates shown on one page.
-pub const DEFAULT_PAGE_SIZE: usize = 9;
+pub const DEFAULT_PAGE_SIZE: usize = 7;
 
 /// Mutable Pinyin composition state.
 #[derive(Debug, Clone)]
@@ -35,6 +33,8 @@ pub struct PinyinSession {
     raw_caret: usize,
     confirmed: Vec<Confirmed>,
     choices: Vec<Choice>,
+    // Captured from the pending ordinary body before AI replaces its identity.
+    long_pending_body: bool,
     pending_learning: Vec<LearningEvent>,
     pending_phrase_learning: Vec<LearningEvent>,
     candidates: Vec<Candidate>,
@@ -70,7 +70,7 @@ impl PinyinSession {
         if page_size == 0 {
             return Err(EngineError::InvalidPageSize { page_size });
         }
-        if lexicon.is_empty() {
+        if lexicon.is_empty() && !lexicon.is_dormant() {
             return Err(EngineError::EmptyLexicon);
         }
 
@@ -88,6 +88,7 @@ impl PinyinSession {
             raw_caret: 0,
             confirmed: Vec::new(),
             choices: Vec::new(),
+            long_pending_body: false,
             pending_learning: Vec::new(),
             pending_phrase_learning: Vec::new(),
             candidates: Vec::new(),
@@ -96,6 +97,11 @@ impl PinyinSession {
             double_quote_open: true,
             single_quote_open: true,
         })
+    }
+
+    pub(crate) fn initialize_dormant_lexicon(&mut self, lexicon: Lexicon) {
+        debug_assert!(self.lexicon.is_dormant() && !self.is_composing());
+        self.lexicon = lexicon;
     }
 
     /// Processes one key and returns a snapshot of the resulting composition.
@@ -369,8 +375,11 @@ impl PinyinSession {
                 candidate_count,
             })?;
 
-        if choice.candidate.is_ai() || choice.candidate.is_spelling() {
-            let corrected = if choice.candidate.is_spelling() {
+        if choice.candidate.is_ai()
+            || choice.candidate.is_spelling()
+            || choice.candidate.is_completion()
+        {
+            let corrected = if choice.candidate.is_spelling() || choice.candidate.is_completion() {
                 self.confirmed
                     .iter()
                     .map(|s| s.text.as_str())
@@ -394,6 +403,7 @@ impl PinyinSession {
                         c.consumed == self.raw.len()
                             && !c.candidate.is_ai()
                             && !c.candidate.is_spelling()
+                            && !c.candidate.is_completion()
                     })
                     .map(Self::ranking_candidate)
                     .collect(),
@@ -464,7 +474,10 @@ impl PinyinSession {
         }
 
         self.page_size = page_size;
+        let selected = self.selected_identity();
+        self.apply_first_page_quotas();
         self.rebuild_pages();
+        self.restore_selected_identity(selected);
         Ok(())
     }
 
@@ -488,7 +501,8 @@ impl PinyinSession {
         true
     }
 
-    /// Reflows pages, preserving the absolute highlighted candidate.
+    /// Retains the host's width hint for compatibility. Pages always use the
+    /// configured count, preserving the absolute highlighted candidate.
     pub fn set_candidate_width(&mut self, width: Option<u32>) -> CompositionUpdate {
         self.candidate_width = width;
         self.rebuild_pages();
@@ -594,14 +608,15 @@ impl PinyinSession {
             || self.raw_caret != self.raw.len()
             || self.page != 0
             || self.highlighted != Some(0)
-            || self.choices.iter().any(|c| c.candidate.is_ai())
         {
             return None;
         }
-        let choice = self
-            .choices
-            .iter()
-            .find(|c| c.consumed == self.raw.len() && !c.candidate.is_spelling())?;
+        let choice = self.choices.iter().find(|c| {
+            c.consumed == self.raw.len()
+                && !c.candidate.is_spelling()
+                && !c.candidate.is_ai()
+                && !c.candidate.is_completion()
+        })?;
         let prefix: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
         let source = prefix + &choice.candidate.text;
         if !crate::ai::eligible_spelling_text(&source) {
@@ -659,11 +674,15 @@ impl PinyinSession {
     }
 
     fn insert_ai_candidate(&mut self, corrected: &str) -> CompositionUpdate {
+        let selected = self.selected_identity();
         let prefix: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
         let display = self.chinese_script.convert(corrected);
         self.choices.retain(|c| {
-            c.consumed != self.raw.len()
-                || Self::candidate_output(self.chinese_script, &prefix, &c.candidate) != display
+            !c.candidate.is_ai()
+                && !c.candidate.is_spelling()
+                && (c.consumed != self.raw.len()
+                    || Self::candidate_output(self.chinese_script, &prefix, &c.candidate)
+                        != display)
         });
         let mut choice = Choice::word(
             Candidate::new(corrected, crate::ai::AI_COMMENT),
@@ -671,10 +690,21 @@ impl PinyinSession {
             1,
         );
         choice.events.clear();
-        self.choices
-            .insert(usize::from(!self.choices.is_empty()), choice);
+        let insertion = self
+            .choices
+            .iter()
+            .position(|c| {
+                c.consumed == self.raw.len()
+                    && !c.candidate.is_ai()
+                    && !c.candidate.is_spelling()
+                    && !c.candidate.is_completion()
+            })
+            .map_or(0, |index| index + 1);
+        self.choices.insert(insertion, choice);
         self.rebuild_display_candidates();
+        self.apply_first_page_quotas();
         self.rebuild_pages();
+        self.restore_selected_identity(selected);
         self.snapshot(true)
     }
 
@@ -772,6 +802,38 @@ impl PinyinSession {
             self.choices = complete;
         }
         self.choices.extend(partial);
+        // Classify the pending body, never its display projection (which can
+        // include already confirmed segments). Stable sorting preserves ranking
+        // within each prefix tier.
+        let long = self
+            .choices
+            .iter()
+            .find(|c| c.consumed == self.raw.len())
+            .is_some_and(|c| c.candidate.text.chars().count() > 3);
+        self.long_pending_body = long;
+        if long {
+            let mut kept_full = false;
+            self.choices.retain(|c| {
+                if c.consumed == self.raw.len() {
+                    let keep = !kept_full;
+                    kept_full = true;
+                    keep
+                } else {
+                    true
+                }
+            });
+            self.choices.sort_by_key(|c| {
+                if c.consumed == self.raw.len() {
+                    0
+                } else if (2..=3).contains(&c.candidate.text.chars().count()) {
+                    1
+                } else if c.candidate.text.chars().count() == 1 {
+                    2
+                } else {
+                    3
+                }
+            });
+        }
         let mut proposals = Vec::new();
         if !self
             .auto_phrase_lexicon
@@ -789,26 +851,49 @@ impl PinyinSession {
         }
         let mut spelling = Vec::new();
         for choice in proposals {
-            if self
-                .choices
-                .iter()
-                .any(|c| c.consumed == self.raw.len() && c.candidate.text == choice.candidate.text)
-                || spelling
-                    .iter()
-                    .any(|c: &super::decoder::Choice| c.candidate.text == choice.candidate.text)
-            {
-                continue;
-            }
-            self.choices
-                .retain(|c| c.candidate.text != choice.candidate.text);
+            self.choices.retain(|c| {
+                c.consumed != self.raw.len() || c.candidate.text != choice.candidate.text
+            });
             spelling.push(choice);
-            if spelling.len() == 4 {
+            if spelling.len() == 1 {
                 break;
             }
         }
         let insertion = usize::from(!self.choices.is_empty());
         self.choices.splice(insertion..insertion, spelling);
+        if self.raw_caret == self.raw.len() {
+            let mut completion_budget = (512, 4096);
+            let completion = self
+                .lexicon
+                .completion_choice(&self.raw, &mut completion_budget)
+                .or_else(|| {
+                    self.auto_phrase_lexicon
+                        .as_ref()?
+                        .completion_choice(&self.raw, &mut completion_budget)
+                });
+            if let Some(completion) = completion {
+                let prefix: String = self.confirmed.iter().map(|c| c.text.as_str()).collect();
+                let output =
+                    Self::candidate_output(self.chinese_script, &prefix, &completion.candidate);
+                if !self.choices.iter().any(|c| {
+                    c.consumed == self.raw.len()
+                        && Self::candidate_output(self.chinese_script, &prefix, &c.candidate)
+                            == output
+                }) {
+                    let mut insertion = usize::from(!self.choices.is_empty());
+                    if self
+                        .choices
+                        .get(insertion)
+                        .is_some_and(|c| c.candidate.is_spelling())
+                    {
+                        insertion += 1;
+                    }
+                    self.choices.insert(insertion, completion);
+                }
+            }
+        }
         self.rebuild_display_candidates();
+        self.apply_first_page_quotas();
         self.page = 0;
         self.highlighted = if self.candidates.is_empty() {
             None
@@ -817,6 +902,92 @@ impl PinyinSession {
         };
         self.page_ranges.clear();
         self.rebuild_pages();
+    }
+
+    /// Reorder real choices only, after display deduplication. The unselected
+    /// remainder stays reachable and ranking within each prefix tier is stable.
+    fn apply_first_page_quotas(&mut self) {
+        if !self.long_pending_body {
+            if let Some(index) = self
+                .choices
+                .iter()
+                .position(|c| c.candidate.is_completion())
+            {
+                let choice = self.choices.remove(index);
+                let candidate = self.candidates.remove(index);
+                let mut insertion = usize::from(!self.choices.is_empty());
+                if self
+                    .choices
+                    .get(insertion)
+                    .is_some_and(|c| c.candidate.is_ai() || c.candidate.is_spelling())
+                {
+                    insertion += 1;
+                }
+                self.choices.insert(insertion, choice);
+                self.candidates.insert(insertion, candidate);
+            }
+            return;
+        }
+        let mut tiers: [Vec<usize>; 6] = Default::default();
+        for (index, c) in self.choices.iter().enumerate() {
+            let tier = if c.candidate.is_ai() || c.candidate.is_spelling() {
+                1
+            } else if c.candidate.is_completion() {
+                2
+            } else if c.consumed == self.raw.len() {
+                0
+            } else {
+                match c.candidate.text.chars().count() {
+                    2..=3 => 3,
+                    1 => 4,
+                    _ => 5,
+                }
+            };
+            tiers[tier].push(index);
+        }
+        let mut order = Vec::new();
+        order.extend(tiers[0].iter().take(1).copied());
+        order.extend(tiers[1].iter().take(1).copied());
+        order.extend(tiers[2].iter().take(1).copied());
+        let slots = self.page_size.saturating_sub(order.len());
+        let singles = slots.min(3).min(tiers[4].len());
+        let words = (slots - singles).min(tiers[3].len());
+        // If words run short, fill from singles before considering other prefixes.
+        let singles = (slots - words).min(tiers[4].len());
+        order.extend(tiers[3].iter().take(words).copied());
+        order.extend(tiers[4].iter().take(singles).copied());
+        let remaining = self.page_size.saturating_sub(order.len());
+        order.extend(tiers[5].iter().take(remaining).copied());
+        for tier in &tiers {
+            for &index in tier {
+                if !order.contains(&index) {
+                    order.push(index);
+                }
+            }
+        }
+        self.choices = order.iter().map(|&i| self.choices[i].clone()).collect();
+        self.candidates = order.iter().map(|&i| self.candidates[i].clone()).collect();
+    }
+
+    fn selected_identity(&self) -> Option<RankingCandidate> {
+        let absolute = self.page_ranges.get(self.page)?.start + self.highlighted?;
+        self.choices.get(absolute).map(Self::ranking_candidate)
+    }
+
+    fn restore_selected_identity(&mut self, selected: Option<RankingCandidate>) {
+        let absolute = selected
+            .and_then(|identity| {
+                self.choices
+                    .iter()
+                    .position(|c| Self::ranking_candidate(c) == identity)
+            })
+            .unwrap_or(0);
+        self.page = self
+            .page_ranges
+            .iter()
+            .position(|r| r.contains(&absolute))
+            .unwrap_or(0);
+        self.highlighted = self.page_ranges.get(self.page).map(|r| absolute - r.start);
     }
 
     fn ranking_candidate(choice: &Choice) -> RankingCandidate {
@@ -889,25 +1060,11 @@ impl PinyinSession {
             .and_then(|range| self.highlighted.map(|index| range.start + index))
             .unwrap_or(0);
         self.page_ranges.clear();
-        let limit = if self.candidate_width.is_some() {
-            self.page_size.min(9)
-        } else {
-            self.page_size
-        };
         let mut start = 0;
         while start < self.candidates.len() {
-            let mut end = start;
-            let mut used = 0u32;
-            while end < self.candidates.len() && end - start < limit {
-                let width = candidate_cell_width(&self.candidates[end].display_text(), end - start);
-                if let Some(budget) = self.candidate_width {
-                    if end > start && used.saturating_add(width) > budget {
-                        break;
-                    }
-                }
-                used = used.saturating_add(width);
-                end += 1;
-            }
+            let end = start
+                .saturating_add(self.page_size)
+                .min(self.candidates.len());
             self.page_ranges.push(start..end);
             start = end;
         }
@@ -969,6 +1126,7 @@ impl PinyinSession {
     }
 
     fn clear_composition(&mut self) {
+        self.long_pending_body = false;
         self.preedit.clear();
         self.raw.clear();
         self.raw_caret = 0;
@@ -1007,5 +1165,342 @@ impl PinyinSession {
             commit: None,
             cancelled: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod candidate_contract_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_seven_pages_ignore_width_and_keep_absolute_numeric_selection() {
+        let words: String = (0..16u32)
+            .map(|i| {
+                format!(
+                    "shi\t{}\t{}\n",
+                    char::from_u32(0x4e00 + i).unwrap(),
+                    100 - i
+                )
+            })
+            .collect();
+        let mut s = PinyinSession::from_lexicon_tsv(&words, 7).unwrap();
+        type_text(&mut s, "shi");
+        let all = s.candidates.clone();
+        assert_eq!(all.len(), 16);
+        for width in [Some(1), Some(10000), None] {
+            let update = s.set_candidate_width(width);
+            assert_eq!(update.candidates.len(), 7);
+            assert_eq!(s.page_ranges, vec![0..7, 7..14, 14..16]);
+        }
+        s.next_page().unwrap();
+        s.process_key(KeyEvent::plain(Key::Right)).unwrap();
+        let update = s.set_candidate_width(Some(1));
+        assert_eq!(update.highlighted, Some(1));
+        assert_eq!(update.candidates[1], all[8]);
+        assert_eq!(
+            s.process_key(KeyEvent::plain(Key::Char('2')))
+                .unwrap()
+                .commit,
+            Some(all[8].text.clone())
+        );
+        type_text(&mut s, "shi");
+        s.next_page().unwrap();
+        s.next_page().unwrap();
+        let before = s.snapshot(false);
+        assert!(
+            s.process_key(KeyEvent::plain(Key::Char('3')))
+                .unwrap()
+                .handled
+        );
+        assert_eq!(s.current_page(), before.candidates);
+        assert_eq!(
+            s.select_candidate(1).unwrap().commit,
+            Some(all[15].text.clone())
+        );
+    }
+
+    fn type_text(s: &mut PinyinSession, raw: &str) {
+        for c in raw.chars() {
+            s.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+    }
+
+    fn select_text(s: &mut PinyinSession, text: &str) -> CompositionUpdate {
+        for _ in 0..s.page_count() {
+            if let Some(index) = s.current_page().iter().position(|c| c.text == text) {
+                return s.select_candidate(index).unwrap();
+            }
+            s.next_page().unwrap();
+        }
+        panic!("missing {text}");
+    }
+
+    #[test]
+    fn builtin_sentence_has_one_full_and_real_word_then_single_prefixes() {
+        let mut s = PinyinSession::new().unwrap();
+        type_text(&mut s, "jintianwomengongzuo");
+        let ordinary: Vec<_> = s
+            .choices
+            .iter()
+            .filter(|c| !c.candidate.is_spelling() && !c.candidate.is_ai())
+            .collect();
+        assert_eq!(
+            ordinary
+                .iter()
+                .filter(|c| c.consumed == s.raw.len())
+                .count(),
+            1
+        );
+        assert!(ordinary[0].candidate.text.chars().count() > 3);
+        let prefixes: Vec<_> = ordinary
+            .iter()
+            .filter(|c| c.consumed < s.raw.len())
+            .collect();
+        assert!(prefixes
+            .iter()
+            .any(|c| (2..=3).contains(&c.candidate.text.chars().count())));
+        assert!(prefixes
+            .iter()
+            .any(|c| c.candidate.text.chars().count() == 1));
+        for choice in &prefixes {
+            assert!(s
+                .lexicon
+                .contains_exact_pair(&choice.candidate.comment, &choice.candidate.text));
+            let reading = choice.candidate.comment.replace('\'', "");
+            assert_eq!(&s.raw[..choice.consumed], reading);
+        }
+        let tiers: Vec<_> = s.choices[..7]
+            .iter()
+            .skip(1)
+            .map(|c| match c.candidate.text.chars().count() {
+                2..=3 => 0,
+                1 => 1,
+                _ => 2,
+            })
+            .collect();
+        assert_eq!(tiers, [0, 0, 0, 1, 1, 1]);
+        let input = s.ai_input().unwrap();
+        let update = s.apply_ai_candidate(&input, "今天我们工做").unwrap();
+        assert_eq!(update.highlighted, Some(0));
+        assert!(update.candidates[1].is_ai());
+        assert_eq!(
+            s.choices[..7]
+                .iter()
+                .skip(2)
+                .map(|c| match c.candidate.text.chars().count() {
+                    2..=3 => 0,
+                    1 => 1,
+                    _ => 2,
+                })
+                .collect::<Vec<_>>(),
+            [0, 0, 1, 1, 1]
+        );
+        for choice in &s.choices[2..7] {
+            assert!(choice.consumed < s.raw.len());
+            assert!(s
+                .lexicon
+                .contains_exact_pair(&choice.candidate.comment, &choice.candidate.text));
+            assert_eq!(
+                &s.raw[..choice.consumed],
+                choice.candidate.comment.replace('\'', "")
+            );
+        }
+        assert!(select_text(&mut s, "今天").commit.is_none());
+        assert_eq!(s.pending_input(), "womengongzuo");
+        assert!(select_text(&mut s, "我们").commit.is_none());
+        assert_eq!(s.pending_input(), "gongzuo");
+        assert_eq!(
+            select_text(&mut s, "工作").commit.as_deref(),
+            Some("今天我们工作")
+        );
+        assert!(!s.pending_learning().is_empty());
+        assert!(s
+            .pending_learning()
+            .iter()
+            .all(|e| !e.pinyin.contains("AI")));
+    }
+
+    #[test]
+    fn short_pending_body_keeps_ambiguities_with_multiple_confirmed_segments() {
+        let mut s = PinyinSession::from_lexicon_tsv(
+            "jin'tian\t今天\t100\nwo'men\t我们\t100\nwo'men\t我门\t90\ngong'zuo\t工作\t100\ngong'zuo\t工做\t90", 7,
+        ).unwrap();
+        type_text(&mut s, "jintianwomengongzuo");
+        select_text(&mut s, "今天");
+        select_text(&mut s, "我们");
+        assert_eq!(s.pending_input(), "gongzuo");
+        assert!(s.candidates.iter().any(|c| c.text == "工作"));
+        assert!(s.candidates.iter().any(|c| c.text == "工做"));
+    }
+
+    #[test]
+    fn spelling_proposals_keep_the_original_top_one_only() {
+        let lexicon = Lexicon::from_tsv("jin'tian\t今天\t100\njin'tian\t津田\t90").unwrap();
+        let proposals = lexicon.short_spelling_choices("jintain");
+        assert!(proposals.len() >= 2);
+        let top = proposals[0].candidate.text.clone();
+        let mut s = PinyinSession::from_lexicon(lexicon, 7).unwrap();
+        type_text(&mut s, "jintain");
+        let corrections: Vec<_> = s
+            .choices
+            .iter()
+            .filter(|c| c.candidate.is_spelling())
+            .collect();
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].candidate.text, top);
+    }
+
+    #[test]
+    fn ai_display_equivalent_full_keeps_quotas_raw_and_source_without_learning() {
+        let mut s = PinyinSession::from_lexicon_tsv(
+            "jin'tian'tou'fa'hen'hao\t今天头发很好\t1000\njin'tian\t今天\t100\njin'tian\t津田\t90\njin'tian\t金田\t80\njin'tian\t近天\t70\njin\t今\t100\njin\t金\t90\njin\t近\t80\njin\t进\t70",
+            7,
+        ).unwrap();
+        type_text(&mut s, "jintiantoufahenhao");
+        let input = s.ai_input().unwrap();
+        assert_eq!(input.source, "今天头发很好");
+        let update = s.apply_ai_candidate(&input, "今天頭发很好").unwrap();
+        assert_eq!(update.highlighted, Some(0));
+        assert_eq!(update.candidates[0].text, "今天头发很好");
+        assert!(update.candidates[0].is_ai());
+        assert_eq!(
+            s.choices
+                .iter()
+                .filter(|c| c.consumed == s.raw.len())
+                .count(),
+            1
+        );
+        assert_eq!(
+            update
+                .candidates
+                .iter()
+                .map(|c| c.text.chars().count())
+                .collect::<Vec<_>>(),
+            [6, 2, 2, 2, 1, 1, 1]
+        );
+        assert_eq!(s.choices[0].consumed, s.raw.len());
+        assert!(s.choices[0].events.is_empty());
+        for choice in &s.choices[1..7] {
+            assert!(s
+                .lexicon
+                .contains_exact_pair(&choice.candidate.comment, &choice.candidate.text));
+            assert_eq!(
+                &s.raw[..choice.consumed],
+                choice.candidate.comment.replace('\'', "")
+            );
+        }
+        // Reapplying the layout (including resizing) must not need an ordinary full.
+        s.set_page_size(4).unwrap();
+        assert_eq!(
+            s.current_page()
+                .iter()
+                .map(|c| c.text.chars().count())
+                .collect::<Vec<_>>(),
+            [6, 1, 1, 1]
+        );
+        s.set_page_size(7).unwrap();
+        assert_eq!(
+            s.select_candidate(0).unwrap().commit.as_deref(),
+            Some("今天头发很好")
+        );
+        assert!(s.pending_learning().is_empty());
+        assert!(s.pending_promotions().is_empty());
+        assert!(s.pending_phrase_learning().is_empty());
+    }
+
+    #[test]
+    fn ai_equivalent_with_confirmed_prefix_does_not_classify_short_body_as_long() {
+        let mut s = PinyinSession::from_lexicon_tsv(
+            "jin'tian\t今天\t100\nwo'men\t我们\t100\ntou'fa\t头发\t100\ntou'fa\t投法\t90",
+            7,
+        )
+        .unwrap();
+        type_text(&mut s, "jintianwomentoufa");
+        select_text(&mut s, "今天");
+        select_text(&mut s, "我们");
+        assert!(!s.long_pending_body);
+        let input = s.ai_input().unwrap();
+        assert_eq!(input.source, "今天我们头发");
+        s.apply_ai_candidate(&input, "今天我們头发").unwrap();
+        assert!(!s.long_pending_body);
+        assert_eq!(s.choices[0].consumed, "toufa".len());
+        assert!(s.candidates.iter().any(|c| c.text == "投法"));
+        assert_eq!(
+            s.candidates
+                .iter()
+                .filter(|c| c.text == "今天我们头发" && c.is_ai())
+                .count(),
+            1
+        );
+        let index = s.candidates.iter().position(|c| c.is_ai()).unwrap();
+        assert_eq!(
+            s.select_candidate(index).unwrap().commit.as_deref(),
+            Some("今天我们头发")
+        );
+        assert!(s.pending_learning().is_empty());
+        assert!(s.pending_promotions().is_empty());
+        assert!(s.pending_phrase_learning().is_empty());
+    }
+
+    #[test]
+    fn ai_replaces_corrections_and_deduplicates_without_learning() {
+        let mut s =
+            PinyinSession::from_lexicon_tsv("jin'tian'xin'qing'hen'hao\t今天新情很好\t100", 7)
+                .unwrap();
+        type_text(&mut s, "jintianxinqinghenhao");
+        let input = s.ai_input().unwrap();
+        // Exercise the same insertion boundary even when a correction and an
+        // ordinary equivalent are both present before the result arrives.
+        s.choices.push(Choice::word(
+            Candidate::new("今天心情很好", "jin'tian'xin'qing'hen'hao"),
+            s.raw.len(),
+            1,
+        ));
+        s.choices.push(Choice::word(
+            Candidate::new(
+                "今天新晴很好",
+                format!("{}test", Candidate::SPELLING_PREFIX),
+            ),
+            s.raw.len(),
+            1,
+        ));
+        let first = s.apply_ai_candidate(&input, "今天心情很好").unwrap();
+        assert_eq!(
+            first
+                .candidates
+                .iter()
+                .filter(|c| c.text == "今天心情很好")
+                .count(),
+            1
+        );
+        assert!(first
+            .candidates
+            .iter()
+            .any(|c| c.text == "今天心情很好" && c.is_ai()));
+        let replaced = s.apply_ai_candidate(&input, "今天新晴很好").unwrap();
+        assert_eq!(
+            replaced
+                .candidates
+                .iter()
+                .filter(|c| c.is_ai() || c.is_spelling())
+                .count(),
+            1
+        );
+        assert!(replaced
+            .candidates
+            .iter()
+            .any(|c| c.text == "今天新晴很好" && c.is_ai()));
+        assert!(!replaced.candidates.iter().any(|c| c.text == "今天心情很好"));
+        let before = s.candidates.clone();
+        assert!(s.apply_ai_candidate(&input, "invalid").is_none());
+        assert_eq!(s.candidates, before);
+        assert_eq!(
+            select_text(&mut s, "今天新晴很好").commit.as_deref(),
+            Some("今天新晴很好")
+        );
+        assert!(s.pending_learning().is_empty());
+        assert!(s.pending_phrase_learning().is_empty());
+        assert!(s.pending_promotions().is_empty());
+        assert!(s.apply_ai_candidate(&input, "今天心情很好").is_none());
     }
 }

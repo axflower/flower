@@ -346,7 +346,10 @@ mod windows_exports {
         processing: bool,
         english: bool,
         shift: ShiftGesture,
+        writing_gesture: WritingGesture,
         settings_worker: Option<SettingsLaunchWorker>,
+        /// Validated personal overlay; base indexes are loaded only for real input.
+        pending_lexicon: Option<String>,
         context_generation: Rc<Cell<u64>>,
         _thread_events: Option<ThreadEvents>,
         /// Activation snapshot; script override is never written to disk.
@@ -363,7 +366,1055 @@ mod windows_exports {
         ai_unavailable: AiStatus,
     }
 
+    fn starts_pinyin(event: KeyEvent) -> bool {
+        !event.is_passthrough()
+            && matches!(event.key, crate::engine::Key::Char(c) if c.is_ascii_alphabetic())
+    }
+
+    fn ensure_input_lexicon(active: &mut Activation) -> Result<()> {
+        let Some(overlay) = active.pending_lexicon.as_ref() else {
+            return Ok(());
+        };
+        // No COM calls while installing the immutable snapshot. Failed loads
+        // leave the pending state intact and never publish an empty input table.
+        let lexicon = Lexicon::builtin()
+            .and_then(|base| base.with_overlay(overlay))
+            .map_err(|_| Error::from(E_UNEXPECTED))?;
+        for entry in active.contexts.values_mut() {
+            entry.router.initialize_dormant_lexicon(lexicon.clone());
+        }
+        active.lexicon = lexicon;
+        active.pending_lexicon = None;
+        // Retain each dormant router's punctuation/quote state.
+        if active.settings.ai_correction_enabled && active.ai.is_none() {
+            match protected_ai_helper().and_then(|helper| {
+                crate::ai::ipc::AiClient::start(helper).map_err(|_| AiStatus::ClientFailed)
+            }) {
+                Ok(client) => active.ai = Some(AiScheduler::new(Box::new(client))),
+                Err(reason) => active.ai_unavailable = reason,
+            }
+        }
+        Ok(())
+    }
+
     type SharedActivation = Rc<RefCell<Option<Activation>>>;
+
+    struct ThreadWritingPanel {
+        window: crate::platform::writing_ui::WritingPanel,
+        _registration: ObjectRegistration,
+    }
+
+    struct ThreadPolishPopup {
+        window: crate::platform::polish_ui::PolishPopup,
+        key: ContextKey,
+        _registration: ObjectRegistration,
+    }
+
+    thread_local! {
+        static POLISH_POPUPS: RefCell<HashMap<ActivationToken, ThreadPolishPopup>> =
+            RefCell::new(HashMap::new());
+        static WRITING_PANELS: RefCell<HashMap<ActivationToken, ThreadWritingPanel>> =
+            RefCell::new(HashMap::new());
+        static WRITING_BUSY: RefCell<std::collections::HashSet<ActivationToken>> =
+            RefCell::new(std::collections::HashSet::new());
+    }
+
+    struct WritingLease(ActivationToken);
+
+    impl WritingLease {
+        fn acquire(token: ActivationToken) -> Option<Self> {
+            WRITING_BUSY
+                .with(|busy| busy.borrow_mut().insert(token))
+                .then(|| Self(token))
+        }
+    }
+
+    impl Drop for WritingLease {
+        fn drop(&mut self) {
+            WRITING_BUSY.with(|busy| {
+                busy.borrow_mut().remove(&self.0);
+            });
+        }
+    }
+
+    fn close_writing_panel(token: ActivationToken) {
+        close_polish_popup(token);
+        let panel = WRITING_PANELS.with(|panels| panels.borrow_mut().remove(&token));
+        // Closing joins the worker. Keep its registration alive until then.
+        if let Some(mut panel) = panel {
+            panel.window.close();
+        }
+    }
+
+    fn close_polish_popup(token: ActivationToken) {
+        let popup = POLISH_POPUPS.with(|p| p.borrow_mut().remove(&token));
+        if let Some(mut popup) = popup {
+            popup.window.close();
+        }
+    }
+
+    fn polish_popup_open(token: ActivationToken) -> bool {
+        POLISH_POPUPS.with(|p| p.borrow().get(&token).is_some_and(|p| p.window.is_open()))
+    }
+
+    fn polish_escape_target(
+        shared: &SharedActivation,
+        context: &ITfContext,
+        key: usize,
+    ) -> Option<ActivationToken> {
+        if key != 0x1b {
+            return None;
+        }
+        let token = shared.try_borrow().ok()?.as_ref()?.token;
+        let key = context_key(context).ok()?;
+        POLISH_POPUPS.with(|p| {
+            p.borrow()
+                .get(&token)
+                .filter(|p| p.key == key && p.window.is_open())
+                .map(|_| token)
+        })
+    }
+
+    fn writing_shortcut(
+        key: usize,
+        modifiers: Modifiers,
+        shortcuts: crate::settings::WritingShortcuts,
+    ) -> Option<crate::writing::Task> {
+        if !shortcuts.is_valid() {
+            return None;
+        }
+        match key {
+            key if u16::try_from(key)
+                .ok()
+                .is_some_and(|key| shortcuts.draft.matches(key, modifiers)) =>
+            {
+                Some(crate::writing::Task::draft())
+            }
+            key if u16::try_from(key)
+                .ok()
+                .is_some_and(|key| shortcuts.polish.matches(key, modifiers)) =>
+            {
+                Some(crate::writing::Task::polish())
+            }
+            _ => None,
+        }
+    }
+
+    fn current_writing_shortcut(
+        shared: &SharedActivation,
+        key: usize,
+    ) -> Option<crate::writing::Task> {
+        // Copy the activation snapshot and release the borrow before routing or opening UI.
+        if virtual_key_is_down(VIRTUAL_KEY(0xa5)) {
+            return None;
+        }
+        let shortcuts = shared
+            .try_borrow()
+            .ok()?
+            .as_ref()?
+            .settings
+            .writing_shortcuts;
+        writing_shortcut(
+            key,
+            Modifiers {
+                control: virtual_key_is_down(VK_CONTROL),
+                shift: virtual_key_is_down(VK_SHIFT),
+                alt: virtual_key_is_down(VK_MENU),
+                meta: virtual_key_is_down(VK_LWIN) || virtual_key_is_down(VK_RWIN),
+            },
+            shortcuts,
+        )
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static WRITING_NOTICES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[cfg(test)]
+    fn writing_notice(message: &str) {
+        WRITING_NOTICES.with(|notices| notices.borrow_mut().push(message.to_owned()));
+    }
+
+    #[cfg(not(test))]
+    fn writing_notice(message: &str) {
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+        let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                windows::core::PCWSTR(text.as_ptr()),
+                windows::core::w!("Flower AI"),
+                MB_OK | MB_ICONWARNING,
+            );
+        }
+    }
+
+    const WRITING_TARGET_ERROR: &str = "原文或目标已变化，无法安全应用；可以复制结果。";
+
+    #[implement(windows::Win32::UI::TextServices::ITfTextEditSink)]
+    struct WritingObserver {
+        invalid: Rc<Cell<bool>>,
+    }
+
+    impl windows::Win32::UI::TextServices::ITfTextEditSink_Impl for WritingObserver_Impl {
+        fn OnEndEdit(
+            &self,
+            _: Option<&ITfContext>,
+            _: u32,
+            _: Option<&windows::Win32::UI::TextServices::ITfEditRecord>,
+        ) -> Result<()> {
+            self.invalid.set(true);
+            Ok(())
+        }
+    }
+
+    struct WritingObservation {
+        source: windows::Win32::UI::TextServices::ITfSource,
+        cookie: u32,
+        _sink: windows::Win32::UI::TextServices::ITfTextEditSink,
+    }
+
+    impl WritingObservation {
+        fn connect(context: &ITfContext, invalid: Rc<Cell<bool>>) -> Result<Self> {
+            use windows::Win32::UI::TextServices::{ITfSource, ITfTextEditSink};
+            let source = context.cast::<ITfSource>()?;
+            let sink: ITfTextEditSink = WritingObserver { invalid }.into();
+            let cookie = unsafe { source.AdviseSink(&ITfTextEditSink::IID, &sink)? };
+            Ok(Self {
+                source,
+                cookie,
+                _sink: sink,
+            })
+        }
+    }
+
+    impl Drop for WritingObservation {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.source.UnadviseSink(self.cookie);
+            }
+        }
+    }
+
+    struct WritingBinding {
+        context: ITfContext,
+        range: ITfRange,
+        style: TF_SELECTIONSTYLE,
+        original: String,
+        key: ContextKey,
+        token: ActivationToken,
+        owner: ThreadId,
+        focus: windows::Win32::Foundation::HWND,
+        root: windows::Win32::Foundation::HWND,
+        process: u32,
+        invalid: Rc<Cell<bool>>,
+        used: Cell<bool>,
+        // Only inline polish is invalidated by every focus/context transition.
+        polish_guard: Option<(u64, u64)>,
+        _observation: WritingObservation,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        // Weak observation only; tests must not extend a production binding's life.
+        static LAST_WRITING_BINDING: RefCell<Option<std::rc::Weak<WritingBinding>>> =
+            const { RefCell::new(None) };
+        static WRITING_CAPTURE_CALLS: Cell<usize> = const { Cell::new(0) };
+        static WRITING_BODY_READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn writing_selection(
+        context: &ITfContext,
+        cookie: u32,
+    ) -> Result<(ITfRange, TF_SELECTIONSTYLE)> {
+        let mut selections = [TF_SELECTION::default()];
+        let mut fetched = 0;
+        let result =
+            unsafe { context.GetSelection(cookie, u32::MAX, &mut selections, &mut fetched) };
+        let range = unsafe { std::mem::ManuallyDrop::take(&mut selections[0].range) };
+        result?;
+        if fetched != 1 {
+            return Err(E_UNEXPECTED.into());
+        }
+        Ok((
+            range.ok_or_else(|| Error::from(E_UNEXPECTED))?,
+            selections[0].style,
+        ))
+    }
+
+    // 500 Unicode scalars occupy at most 1000 UTF-16 units. One extra unit
+    // distinguishes overflow without ever reading surrounding text.
+    fn writing_range_text(range: &ITfRange, cookie: u32) -> Result<String> {
+        let cursor = unsafe { range.Clone()? };
+        let mut text_units = Vec::new();
+        while !unsafe { cursor.IsEmpty(cookie)? }.as_bool() {
+            let mut buffer = [0u16; 1001];
+            let capacity = 1001 - text_units.len();
+            let mut fetched = 0;
+            unsafe {
+                cursor.GetText(
+                    cookie,
+                    windows::Win32::UI::TextServices::TF_TF_MOVESTART,
+                    &mut buffer[..capacity],
+                    &mut fetched,
+                )?;
+            }
+            if fetched == 0 || fetched as usize > capacity {
+                return Err(E_INVALIDARG.into());
+            }
+            text_units.extend_from_slice(&buffer[..fetched as usize]);
+            if text_units.len() > 1000 {
+                return Err(E_INVALIDARG.into());
+            }
+        }
+        let text = String::from_utf16(&text_units).map_err(|_| Error::from(E_INVALIDARG))?;
+        if text.chars().count() > 500 {
+            return Err(E_INVALIDARG.into());
+        }
+        Ok(text)
+    }
+
+    type CapturedWritingRange = (ITfRange, TF_SELECTIONSTYLE, String);
+
+    #[implement(ITfEditSession)]
+    struct WritingCapture {
+        context: ITfContext,
+        task: crate::writing::Task,
+        result: Rc<RefCell<Option<CapturedWritingRange>>>,
+        too_long: Rc<Cell<bool>>,
+    }
+
+    impl ITfEditSession_Impl for WritingCapture_Impl {
+        fn DoEditSession(&self, cookie: u32) -> Result<()> {
+            #[cfg(test)]
+            WRITING_CAPTURE_CALLS.with(|calls| calls.set(calls.get() + 1));
+            // Strict declaration only: never inherit offline compatibility.
+            application_scope(&self.context, cookie, ScopePolicy::Ai)
+                .map_err(|_| Error::from(E_UNEXPECTED))?;
+            let status = unsafe { self.context.GetStatus()? };
+            if status.dwStaticFlags & windows::Win32::UI::TextServices::TS_SD_READONLY != 0 {
+                return Err(E_UNEXPECTED.into());
+            }
+            let (range, style) = writing_selection(&self.context, cookie)?;
+            let empty = unsafe { range.IsEmpty(cookie)? }.as_bool();
+            let original = match self.task {
+                crate::writing::Task::Draft { .. } if empty => String::new(),
+                crate::writing::Task::Polish { .. } if !empty => {
+                    #[cfg(test)]
+                    WRITING_BODY_READS.with(|calls| calls.set(calls.get() + 1));
+                    match writing_range_text(&range, cookie) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            self.too_long.set(true);
+                            return Err(error);
+                        }
+                    }
+                }
+                _ => return Err(E_UNEXPECTED.into()),
+            };
+            let cloned = unsafe { range.Clone()? };
+            *self.result.borrow_mut() = Some((cloned, style, original));
+            Ok(())
+        }
+    }
+
+    fn writing_activation_valid(
+        shared: &SharedActivation,
+        token: ActivationToken,
+    ) -> Option<(ITfThreadMgr, u32)> {
+        let state = shared.try_borrow().ok()?;
+        let active = state.as_ref()?;
+        if active.token != token
+            || active.owner_thread != std::thread::current().id()
+            || active.processing
+            || active
+                .contexts
+                .values()
+                .any(|entry| entry.composition.is_some() || entry.router.is_composing())
+        {
+            return None;
+        }
+        Some((active.thread_manager.clone(), active.client_id))
+    }
+
+    #[implement(ITfEditSession)]
+    struct WritingApply {
+        binding: Rc<WritingBinding>,
+        shared: std::rc::Weak<RefCell<Option<Activation>>>,
+        output: String,
+        success: Rc<Cell<bool>>,
+    }
+
+    impl ITfEditSession_Impl for WritingApply_Impl {
+        fn DoEditSession(&self, cookie: u32) -> Result<()> {
+            let binding = &self.binding;
+            let shared = self
+                .shared
+                .upgrade()
+                .ok_or_else(|| Error::from(E_UNEXPECTED))?;
+            let (manager, _) = writing_activation_valid(&shared, binding.token)
+                .ok_or_else(|| Error::from(E_UNEXPECTED))?;
+            if binding.invalid.get()
+                || !polish_activation_matches(binding, &shared)
+                || (binding.polish_guard.is_some() && !polish_host_matches(binding))
+                || focused_context_key(&manager) != Some(binding.key)
+                || unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() }
+                    != binding.focus
+            {
+                return Err(E_UNEXPECTED.into());
+            }
+            application_scope(&binding.context, cookie, ScopePolicy::Ai)
+                .map_err(|_| Error::from(E_UNEXPECTED))?;
+            unsafe {
+                if binding.context.GetStatus()?.dwStaticFlags
+                    & windows::Win32::UI::TextServices::TS_SD_READONLY
+                    != 0
+                {
+                    return Err(E_UNEXPECTED.into());
+                }
+                let (selection, style) = writing_selection(&binding.context, cookie)?;
+                if selection.CompareStart(cookie, &binding.range, TF_ANCHOR_START)? != 0
+                    || selection.CompareEnd(cookie, &binding.range, TF_ANCHOR_END)? != 0
+                    || style.ase != binding.style.ase
+                    || style.fInterimChar != binding.style.fInterimChar
+                    || writing_range_text(&binding.range, cookie)? != binding.original
+                    || binding.invalid.get()
+                    || !polish_activation_matches(binding, &shared)
+                    || writing_activation_valid(&shared, binding.token).is_none()
+                    || focused_context_key(&manager) != Some(binding.key)
+                    || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != binding.focus
+                    || (binding.polish_guard.is_some() && !polish_host_matches(binding))
+                {
+                    return Err(E_UNEXPECTED.into());
+                }
+                let output: Vec<u16> = self.output.encode_utf16().collect();
+                // The sole text mutation. Never use the current insertion point.
+                binding.range.SetText(cookie, 0, &output)?;
+                let caret = binding.range.Clone()?;
+                caret.Collapse(cookie, TF_ANCHOR_END)?;
+                let selection = TF_SELECTION {
+                    range: std::mem::ManuallyDrop::new(Some(caret)),
+                    style: TF_SELECTIONSTYLE {
+                        ase: TF_AE_NONE,
+                        fInterimChar: FALSE,
+                    },
+                };
+                let mut selection = [selection];
+                let selected = binding.context.SetSelection(cookie, &selection);
+                std::mem::ManuallyDrop::drop(&mut selection[0].range);
+                selected?;
+            }
+            self.success.set(true);
+            Ok(())
+        }
+    }
+
+    fn apply_writing_binding(
+        binding: Rc<WritingBinding>,
+        shared: &std::rc::Weak<RefCell<Option<Activation>>>,
+        panel: windows::Win32::Foundation::HWND,
+        output: &str,
+    ) -> std::result::Result<(), String> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetAncestor, GetForegroundWindow, IsWindow, SetForegroundWindow, GA_ROOT,
+        };
+        let denied = || WRITING_TARGET_ERROR.to_string();
+        if binding.used.replace(true)
+            || binding.invalid.get()
+            || binding.owner != std::thread::current().id()
+            || output.is_empty()
+            || output.chars().count() > 800
+        {
+            return Err(denied());
+        }
+        let shared = shared.upgrade().ok_or_else(denied)?;
+        let (manager, client) =
+            writing_activation_valid(&shared, binding.token).ok_or_else(denied)?;
+        unsafe {
+            let mut process = 0;
+            let mut root_process = 0;
+            let root_thread = GetWindowThreadProcessId(binding.root, Some(&mut root_process));
+            if panel.is_invalid()
+                || GetForegroundWindow() != panel
+                || !IsWindow(binding.focus).as_bool()
+                || !IsWindow(binding.root).as_bool()
+                || GetAncestor(binding.focus, GA_ROOT) != binding.root
+                || root_thread != windows::Win32::System::Threading::GetCurrentThreadId()
+                || root_process != binding.process
+                || GetWindowThreadProcessId(binding.focus, Some(&mut process))
+                    != windows::Win32::System::Threading::GetCurrentThreadId()
+                || process != binding.process
+                || !SetForegroundWindow(binding.root).as_bool()
+            {
+                return Err(denied());
+            }
+            let _ = SetFocus(binding.focus);
+            if GetFocus() != binding.focus || focused_context_key(&manager) != Some(binding.key) {
+                return Err(denied());
+            }
+        }
+        let success = Rc::new(Cell::new(false));
+        let context = binding.context.clone();
+        let session: ITfEditSession = WritingApply {
+            binding,
+            shared: Rc::downgrade(&shared),
+            output: output.into(),
+            success: Rc::clone(&success),
+        }
+        .into();
+        let result =
+            unsafe { context.RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READWRITE) };
+        if !matches!(result, Ok(hr) if hr.is_ok()) || !success.get() {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    // Unlike Draft, this gate never restores focus or activates any window.
+    fn polish_binding_valid(
+        binding: &WritingBinding,
+        shared: &std::rc::Weak<RefCell<Option<Activation>>>,
+    ) -> bool {
+        let valid = (|| {
+            if binding.invalid.get()
+                || binding.used.get()
+                || binding.owner != std::thread::current().id()
+            {
+                return false;
+            }
+            let Some(shared) = shared.upgrade() else {
+                return false;
+            };
+            if !polish_activation_matches(binding, &shared) {
+                return false;
+            }
+            // Clone the manager and release activation before any COM/Win32.
+            let Some((manager, _)) = writing_activation_valid(&shared, binding.token) else {
+                return false;
+            };
+            polish_host_matches(binding)
+                && focused_context_key(&manager) == Some(binding.key)
+                && !binding.invalid.get()
+                && writing_activation_valid(&shared, binding.token).is_some()
+                && polish_activation_matches(binding, &shared)
+        })();
+        if !valid {
+            binding.invalid.set(true);
+        }
+        valid
+    }
+
+    fn polish_host_matches(binding: &WritingBinding) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetAncestor, GetForegroundWindow, IsWindow, GA_ROOT,
+        };
+        if binding.owner != std::thread::current().id() {
+            return false;
+        }
+        unsafe {
+            let thread = windows::Win32::System::Threading::GetCurrentThreadId();
+            let mut process = 0;
+            let mut root_process = 0;
+            IsWindow(binding.focus).as_bool()
+                && IsWindow(binding.root).as_bool()
+                && GetForegroundWindow() == binding.root
+                && GetFocus() == binding.focus
+                && GetAncestor(binding.focus, GA_ROOT) == binding.root
+                && GetWindowThreadProcessId(binding.focus, Some(&mut process)) == thread
+                && GetWindowThreadProcessId(binding.root, Some(&mut root_process)) == thread
+                && process == binding.process
+                && root_process == binding.process
+        }
+    }
+
+    fn polish_activation_matches(binding: &WritingBinding, shared: &SharedActivation) -> bool {
+        let Some((epoch, generation)) = binding.polish_guard else {
+            return true;
+        };
+        shared.try_borrow().ok().is_some_and(|s| {
+            s.as_ref().is_some_and(|a| {
+                a.token == binding.token
+                    && a.focus_epoch == epoch
+                    && a.context_generation.get() == generation
+            })
+        })
+    }
+
+    fn apply_polish_binding(
+        binding: Rc<WritingBinding>,
+        shared: &std::rc::Weak<RefCell<Option<Activation>>>,
+        output: &str,
+    ) -> std::result::Result<(), String> {
+        let denied = || WRITING_TARGET_ERROR.to_owned();
+        if !polish_binding_valid(&binding, shared)
+            || output.trim().is_empty()
+            || output.chars().count() > 800
+            || binding.used.replace(true)
+        {
+            return Err(denied());
+        }
+        let shared = shared.upgrade().ok_or_else(denied)?;
+        let (_, client) = writing_activation_valid(&shared, binding.token).ok_or_else(denied)?;
+        let context = binding.context.clone();
+        let success = Rc::new(Cell::new(false));
+        let session: ITfEditSession = WritingApply {
+            binding,
+            shared: Rc::downgrade(&shared),
+            output: output.into(),
+            success: Rc::clone(&success),
+        }
+        .into();
+        let result =
+            unsafe { context.RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READWRITE) };
+        if matches!(result, Ok(hr) if hr.is_ok()) && success.get() {
+            Ok(())
+        } else {
+            Err(denied())
+        }
+    }
+
+    #[implement(ITfEditSession)]
+    struct PolishAnchor {
+        context: ITfContext,
+        range: ITfRange,
+        result: Rc<Cell<Option<RECT>>>,
+    }
+    impl ITfEditSession_Impl for PolishAnchor_Impl {
+        fn DoEditSession(&self, cookie: u32) -> Result<()> {
+            unsafe {
+                let view = self.context.GetActiveView()?;
+                let mut rect = RECT::default();
+                let mut clipped = FALSE;
+                if view
+                    .GetTextExt(cookie, &self.range, &mut rect, &mut clipped)
+                    .is_ok()
+                    && !clipped.as_bool()
+                    && valid_caret_rect(rect)
+                {
+                    self.result.set(Some(rect));
+                } else if let Ok(viewport) = view.GetScreenExt() {
+                    self.result.set(
+                        gui_caret_for_view(&view, viewport)
+                            .or_else(|| viewport_edge_anchor(viewport)),
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static WRITING_TEST_STORE: RefCell<Option<crate::settings::SettingsStore>> = const { RefCell::new(None) };
+    }
+
+    fn writing_settings_store() -> Option<crate::settings::SettingsStore> {
+        #[cfg(not(test))]
+        {
+            crate::settings::SettingsStore::for_current_user().ok()
+        }
+        #[cfg(test)]
+        {
+            WRITING_TEST_STORE.with(|store| store.borrow().clone())
+        }
+    }
+
+    fn writing_online_authorized(
+        shared: &SharedActivation,
+        store: Option<&crate::settings::SettingsStore>,
+    ) -> bool {
+        // The user's explicit save applies to an already active browser context.
+        // Activation/focus/model identities are checked independently by callers.
+        shared
+            .try_borrow()
+            .ok()
+            .is_some_and(|state| state.is_some())
+            && crate::writing::config::online_enabled(store)
+    }
+
+    fn open_polish_popup(shared: &SharedActivation, context: &ITfContext) {
+        // Tests must use an explicit isolated store, never discover the user's store.
+        let store = writing_settings_store();
+        open_polish_popup_with_store(shared, context, store.as_ref());
+    }
+
+    fn open_polish_popup_with_store(
+        shared: &SharedActivation,
+        context: &ITfContext,
+        store: Option<&crate::settings::SettingsStore>,
+    ) {
+        if !writing_online_authorized(shared, store) {
+            writing_notice(&crate::writing::WritingError::OnlineDisabled.to_string());
+            return;
+        }
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetWindowRect, GA_ROOT};
+        let snapshot = shared.try_borrow().ok().and_then(|s| {
+            let a = s.as_ref()?;
+            Some((
+                a.token,
+                a.owner_thread,
+                a.client_id,
+                a.settings.online_polish.clone(),
+                a.settings.model_api.clone(),
+                a.settings.chinese_script,
+                (a.focus_epoch, a.context_generation.get()),
+                a.contexts
+                    .values()
+                    .any(|e| e.composition.is_some() || e.router.is_composing()),
+            ))
+        });
+        let Some((token, owner, client, options, model_api, active_script, guard, composing)) =
+            snapshot
+        else {
+            return;
+        };
+        let Some(_lease) = WritingLease::acquire(token) else {
+            return;
+        };
+        // This precedes all selection/text queries. Key credentials are only
+        // consulted by the worker after an explicitly authorized start.
+        if !options.enabled {
+            writing_notice("请先在设置中启用在线润色，保存后重新切换 Flower。");
+            return;
+        }
+        let profile = model_api.active().ok();
+        let Some(profile) = profile.filter(|p| {
+            store.is_some_and(|store| crate::writing::config::polish_authorized(store, p))
+        }) else {
+            writing_notice("模型连接或润色授权已变化，请保存设置并重新切换 Flower。");
+            return;
+        };
+        if composing {
+            writing_notice("请先完成或取消当前拼音输入，再润色所选文字。");
+            return;
+        }
+        let existing = POLISH_POPUPS.with(|p| p.borrow_mut().remove(&token));
+        if let Some(popup) = existing {
+            if popup.window.is_open() {
+                popup.window.show();
+                if writing_activation_valid(shared, token).is_some() {
+                    let displaced = POLISH_POPUPS.with(|p| p.borrow_mut().insert(token, popup));
+                    drop(displaced);
+                }
+                return;
+            }
+            drop(popup);
+        }
+        let draft_open =
+            WRITING_PANELS.with(|p| p.borrow().get(&token).is_some_and(|p| p.window.is_open()));
+        if draft_open {
+            writing_notice("请先关闭当前帮写窗口，再润色所选文字。");
+            return;
+        }
+        let Some((manager, _)) = writing_activation_valid(shared, token) else {
+            return;
+        };
+        let Ok(key) = context_key(context) else {
+            return;
+        };
+        let focus = unsafe { GetFocus() };
+        let root = unsafe { GetAncestor(focus, GA_ROOT) };
+        if focused_context_key(&manager) != Some(key) {
+            return;
+        }
+        let invalid = Rc::new(Cell::new(false));
+        let Ok(observation) = WritingObservation::connect(context, Rc::clone(&invalid)) else {
+            writing_notice("无法可靠绑定原选区，请重新选择。");
+            return;
+        };
+        let result = Rc::new(RefCell::new(None));
+        let task = crate::writing::Task::Polish {
+            style: options.style,
+        };
+        let session: ITfEditSession = WritingCapture {
+            context: context.clone(),
+            task,
+            result: Rc::clone(&result),
+            too_long: Rc::new(Cell::new(false)),
+        }
+        .into();
+        let captured =
+            unsafe { context.RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READ) };
+        let capture = result.borrow_mut().take();
+        let Some((range, style, original)) = capture.filter(|(_, _, text)| {
+            matches!(captured, Ok(hr) if hr.is_ok())
+                && !text.trim().is_empty()
+                && text.chars().count() <= 500
+        }) else {
+            writing_notice("请在可编辑的安全输入框中选择 1–500 字；当前选区不可润色。");
+            return;
+        };
+        let mut process = 0;
+        unsafe {
+            GetWindowThreadProcessId(focus, Some(&mut process));
+        }
+        let binding = Rc::new(WritingBinding {
+            context: context.clone(),
+            range,
+            style,
+            original,
+            key,
+            token,
+            owner,
+            focus,
+            root,
+            process,
+            invalid,
+            used: Cell::new(false),
+            polish_guard: Some(guard),
+            _observation: observation,
+        });
+        let weak = Rc::downgrade(shared);
+        if !polish_binding_valid(&binding, &weak) {
+            writing_notice("无法可靠绑定原选区，请重新选择。");
+            return;
+        }
+        let anchor = Rc::new(Cell::new(None));
+        let session: ITfEditSession = PolishAnchor {
+            context: context.clone(),
+            range: binding.range.clone(),
+            result: Rc::clone(&anchor),
+        }
+        .into();
+        let _ = unsafe { context.RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READ) };
+        let anchor = anchor.get().or_else(|| {
+            let mut rect = RECT::default();
+            unsafe {
+                GetWindowRect(focus, &mut rect).ok()?;
+            }
+            viewport_edge_anchor(rect)
+        });
+        let Some(anchor) = anchor else {
+            writing_notice("无法定位原选区，请重新选择。");
+            return;
+        };
+        let request = polish_request(&options, active_script, binding.original.clone());
+        let apply_binding = Rc::clone(&binding);
+        let apply_weak = weak.clone();
+        let apply = Box::new(move |text: &str| {
+            apply_polish_binding(Rc::clone(&apply_binding), &apply_weak, text)
+        });
+        let validate = Box::new(move || polish_binding_valid(&binding, &weak));
+        let registration = ObjectRegistration::new();
+        if !store.is_some_and(|store| crate::writing::config::polish_authorized(store, &profile)) {
+            writing_notice("模型连接或润色授权已变化，本次未发送。");
+            return;
+        }
+        match crate::platform::polish_ui::open_popup(
+            request,
+            profile,
+            anchor,
+            apply,
+            validate,
+            store.cloned(),
+        ) {
+            Ok(mut window) => {
+                if writing_activation_valid(shared, token).is_some() {
+                    let popup = ThreadPolishPopup {
+                        window,
+                        key,
+                        _registration: registration,
+                    };
+                    let displaced = POLISH_POPUPS.with(|p| p.borrow_mut().insert(token, popup));
+                    drop(displaced);
+                } else {
+                    window.close();
+                }
+            }
+            Err(error) => writing_notice(&error),
+        }
+    }
+
+    fn polish_request(
+        options: &crate::settings::OnlinePolishSettings,
+        active_script: crate::ChineseScript,
+        input: String,
+    ) -> crate::writing::WritingRequest {
+        crate::writing::WritingRequest {
+            id: 1,
+            task: crate::writing::Task::Polish {
+                style: options.style,
+            },
+            script: options.script.unwrap_or(active_script),
+            input,
+        }
+    }
+
+    fn open_writing_panel(
+        shared: &SharedActivation,
+        context: &ITfContext,
+        task: crate::writing::Task,
+    ) {
+        let store = writing_settings_store();
+        if !writing_online_authorized(shared, store.as_ref()) {
+            writing_notice(&crate::writing::WritingError::OnlineDisabled.to_string());
+            return;
+        }
+        if matches!(task, crate::writing::Task::Polish { .. }) {
+            open_polish_popup(shared, context);
+            return;
+        }
+        use crate::platform::writing_ui::{open_panel_with_store, ApplyCallback, PanelSource};
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, IsWindow, GA_ROOT};
+        let Some((token, owner, script, client, composing)) =
+            shared.try_borrow().ok().and_then(|s| {
+                let a = s.as_ref()?;
+                Some((
+                    a.token,
+                    a.owner_thread,
+                    a.settings.chinese_script,
+                    a.client_id,
+                    a.contexts
+                        .values()
+                        .any(|e| e.composition.is_some() || e.router.is_composing()),
+                ))
+            })
+        else {
+            return;
+        };
+        let Some(_lease) = WritingLease::acquire(token) else {
+            return;
+        };
+        if composing {
+            writing_notice("请先完成或取消当前拼音输入，再打开 AI 面板。");
+            return;
+        }
+        if polish_popup_open(token) {
+            writing_notice("请先关闭当前润色候选，再打开帮写。");
+            return;
+        }
+        let existing = WRITING_PANELS.with(|p| p.borrow_mut().remove(&token));
+        if let Some(panel) = existing {
+            if panel.window.is_open() {
+                let result = panel.window.show(task);
+                let live = shared
+                    .try_borrow()
+                    .ok()
+                    .is_some_and(|s| s.as_ref().is_some_and(|a| a.token == token));
+                if live {
+                    let displaced = WRITING_PANELS.with(|p| p.borrow_mut().insert(token, panel));
+                    drop(displaced);
+                }
+                if result.is_err() {
+                    writing_notice("当前任务尚未结束，请先停止生成。");
+                }
+                return;
+            }
+            drop(panel);
+        }
+        let result = Rc::new(RefCell::new(None));
+        let too_long = Rc::new(Cell::new(false));
+        let Some((manager, _)) = writing_activation_valid(shared, token) else {
+            return;
+        };
+        let original_key = context_key(context).ok();
+        let original_focus = unsafe { GetFocus() };
+        let original_root = unsafe { GetAncestor(original_focus, GA_ROOT) };
+        if original_key.is_none() || focused_context_key(&manager) != original_key {
+            return;
+        }
+        let session: ITfEditSession = WritingCapture {
+            context: context.clone(),
+            task,
+            result: Rc::clone(&result),
+            too_long: Rc::clone(&too_long),
+        }
+        .into();
+        let invalid = Rc::new(Cell::new(false));
+        // Observe before capture to avoid an unobserved host-edit interval.
+        let observation = WritingObservation::connect(context, Rc::clone(&invalid)).ok();
+        let captured =
+            unsafe { context.RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READ) };
+        let mut source = PanelSource::Manual;
+        let mut apply: Option<ApplyCallback> = None;
+        let panel_hwnd = Rc::new(Cell::new(windows::Win32::Foundation::HWND::default()));
+        let captured_range = result.borrow_mut().take();
+        if matches!(captured, Ok(hr) if hr.is_ok()) {
+            if let Some((range, style, original)) = captured_range {
+                if !original.is_empty() {
+                    source = PanelSource::Selection(original.clone());
+                }
+                unsafe {
+                    let focus = original_focus;
+                    let root = original_root;
+                    let mut process = 0;
+                    let same_thread = GetWindowThreadProcessId(focus, Some(&mut process))
+                        == windows::Win32::System::Threading::GetCurrentThreadId();
+                    if let (Some(observation), Ok(key)) = (observation, context_key(context)) {
+                        if same_thread
+                            && IsWindow(focus).as_bool()
+                            && IsWindow(root).as_bool()
+                            && !invalid.get()
+                            && GetFocus() == focus
+                            && GetAncestor(focus, GA_ROOT) == root
+                            && focused_context_key(&manager) == Some(key)
+                        {
+                            if original.is_empty() {
+                                source = PanelSource::Insertion;
+                            }
+                            let binding = Rc::new(WritingBinding {
+                                context: context.clone(),
+                                range,
+                                style,
+                                original,
+                                key,
+                                token,
+                                owner,
+                                focus,
+                                root,
+                                process,
+                                invalid,
+                                used: Cell::new(false),
+                                polish_guard: None,
+                                _observation: observation,
+                            });
+                            #[cfg(test)]
+                            LAST_WRITING_BINDING.with(|last| {
+                                *last.borrow_mut() = Some(Rc::downgrade(&binding));
+                            });
+                            let weak = Rc::downgrade(shared);
+                            let hwnd = Rc::clone(&panel_hwnd);
+                            apply = Some(Box::new(move |text| {
+                                apply_writing_binding(Rc::clone(&binding), &weak, hwnd.get(), text)
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        if too_long.get() {
+            writing_notice("所选文字超过 500 字或无法安全读取，请缩短选区或手动输入。");
+        }
+        if writing_activation_valid(shared, token).is_none() {
+            return;
+        }
+        let registration = ObjectRegistration::new();
+        match open_panel_with_store(task, script, source, apply, store) {
+            Ok(mut window) => {
+                panel_hwnd.set(window.hwnd());
+                let live = shared
+                    .try_borrow()
+                    .ok()
+                    .is_some_and(|s| s.as_ref().is_some_and(|a| a.token == token));
+                if live {
+                    let panel = ThreadWritingPanel {
+                        window,
+                        _registration: registration,
+                    };
+                    let displaced = WRITING_PANELS.with(|p| p.borrow_mut().insert(token, panel));
+                    drop(displaced);
+                } else {
+                    window.close();
+                }
+            }
+            Err(_) => writing_notice("无法打开 AI 面板，请稍后重试。"),
+        }
+    }
 
     /// Owns both the worker and its DLL lifetime. Cancellation cannot interrupt
     /// an ACL syscall; drop waits for the bounded local validator to return.
@@ -1139,6 +2190,113 @@ mod windows_exports {
     struct ShiftGesture {
         pressed: Option<(u32, ContextKey, u64)>,
         context_generation: u64,
+    }
+
+    fn writing_modifier(key: usize) -> u8 {
+        match key {
+            0x11 | 0xa2 | 0xa3 => 1,
+            0x12 | 0xa4 | 0xa5 => 2,
+            0x10 | 0xa0 | 0xa1 => 4,
+            0x5b | 0x5c => 8,
+            _ => 0,
+        }
+    }
+
+    #[derive(Default)]
+    struct WritingGesture {
+        held: u8,
+        invalid: bool,
+        releasing: bool,
+        binding: Option<(ContextKey, u64, u64, ActivationToken)>,
+        task: Option<crate::writing::Task>,
+    }
+
+    impl WritingGesture {
+        fn down(
+            &mut self,
+            bit: u8,
+            repeat: bool,
+            unsafe_snapshot: bool,
+            binding: (ContextKey, u64, u64, ActivationToken),
+            shortcuts: crate::settings::WritingShortcuts,
+        ) {
+            if self.held == 0 {
+                self.binding = Some(binding);
+                self.invalid = false;
+            }
+            self.invalid |= bit == 0
+                || repeat
+                || unsafe_snapshot
+                || self.binding != Some(binding)
+                || self.held & bit != 0
+                || self.releasing;
+            self.held |= bit;
+            self.task = None;
+            if self.invalid {
+                self.task = None;
+                return;
+            }
+            if shortcuts.is_valid() {
+                if shortcuts.draft.key == 0 && shortcuts.draft.modifiers == self.held {
+                    self.task = Some(crate::writing::Task::draft());
+                } else if shortcuts.polish.key == 0 && shortcuts.polish.modifiers == self.held {
+                    self.task = Some(crate::writing::Task::polish());
+                }
+            }
+        }
+
+        fn up(
+            &mut self,
+            bit: u8,
+            binding: Option<(ContextKey, u64, u64, ActivationToken)>,
+        ) -> Option<crate::writing::Task> {
+            self.invalid |= self.binding != binding || self.held & bit == 0;
+            self.releasing = true;
+            self.held &= !bit;
+            if self.held != 0 {
+                return None;
+            }
+            let task = if self.invalid { None } else { self.task.take() };
+            *self = Self::default();
+            task
+        }
+    }
+
+    fn writing_snapshot_unsafe(known: u8, bit: u8, key: usize, lparam: LPARAM) -> bool {
+        let mut state = [0u8; 256];
+        if unsafe { GetKeyboardState(&mut state) }.is_err() {
+            return true;
+        }
+        writing_keyboard_unsafe(&state, known, bit, key, lparam)
+    }
+
+    fn writing_keyboard_unsafe(
+        state: &[u8; 256],
+        known: u8,
+        bit: u8,
+        key: usize,
+        lparam: LPARAM,
+    ) -> bool {
+        // Right Alt (including generic extended Alt) is AltGr, never a gesture.
+        if state[0xa5] & 0x80 != 0
+            || key == 0xa5
+            || (key == 0x12 && lparam.0 as usize & (1 << 24) != 0)
+        {
+            return true;
+        }
+        if [(0xa0, 0xa1), (0xa2, 0xa3), (0xa4, 0xa5), (0x5b, 0x5c)]
+            .iter()
+            .any(|&(left, right)| state[left] & state[right] & 0x80 != 0)
+        {
+            return true;
+        }
+        state.iter().enumerate().any(|(key, value)| {
+            if key < 8 || value & 0x80 == 0 {
+                return false;
+            }
+            let modifier = writing_modifier(key);
+            modifier == 0 || modifier & (known | bit) == 0
+        })
     }
 
     fn shift_identity(key: usize, lparam: LPARAM) -> Option<u32> {
@@ -3080,6 +4238,7 @@ mod windows_exports {
                 .and_then(|mut activation| activation.take());
 
             if let Some(active) = active {
+                close_writing_panel(active.token);
                 active.ui.close();
                 // Best effort: only the owning thread can destroy the window.
                 close_thread_popup(active.token, active.owner_thread);
@@ -3116,18 +4275,25 @@ mod windows_exports {
             }
 
             // Load configuration once per activation, before borrowing the
-            // activation state and before creating its popup. Errors use
-            // defaults without rewriting the configured file or surfacing a
-            // host UI.
-            let settings = self
+            // activation state and before creating its popup. Invalid shortcut
+            // configurations reject activation instead of silently re-enabling
+            // default shortcuts. Other load errors retain the existing fallback.
+            let settings = match self
                 .get_impl()
                 .stores
                 .as_ref()
                 .map(|(settings, _)| Ok(settings.clone()))
                 .unwrap_or_else(SettingsStore::for_current_user)
                 .and_then(|store| store.load())
-                .unwrap_or_default();
-            let mut lexicon = Lexicon::builtin().map_err(|_| Error::from(E_UNEXPECTED))?;
+            {
+                Ok(settings) => settings,
+                Err(crate::settings::SettingsError::InvalidWritingShortcuts) => {
+                    return Err(E_INVALIDARG.into());
+                }
+                Err(_) => Settings::default(),
+            };
+            let lexicon = Lexicon::dormant();
+            let mut pending_lexicon = String::new();
             let mut local_data_error = false;
             let mut learning = None;
             let mut rankings = Arc::new(Vec::new());
@@ -3142,33 +4308,27 @@ mod windows_exports {
                 .unwrap_or_else(DictionaryStore::for_current_user)
                 .and_then(|store| store.load().map(|data| (store, data)))
             {
-                Ok((store, data)) => {
-                    match data
-                        .base_lexicon_tsv()
-                        .ok()
-                        .and_then(|tsv| lexicon.with_overlay(&tsv).ok())
-                    {
-                        Some(snapshot) => {
-                            lexicon = snapshot;
-                            match auto_phrase_index(&data.auto_phrases) {
-                                Ok(index) => {
-                                    auto_phrase_lexicon = index;
-                                    auto_phrases = Arc::new(data.auto_phrases.clone());
-                                }
+                Ok((store, data)) => match data.base_lexicon_tsv().ok() {
+                    Some(tsv) => {
+                        pending_lexicon = tsv;
+                        match auto_phrase_index(&data.auto_phrases) {
+                            Ok(index) => {
+                                auto_phrase_lexicon = index;
+                                auto_phrases = Arc::new(data.auto_phrases.clone());
+                            }
+                            Err(_) => local_data_error = true,
+                        }
+                        adaptive_ranking_enabled = data.adaptive_ranking_enabled;
+                        if adaptive_ranking_enabled {
+                            rankings = Arc::new(data.rankings.clone());
+                            match LearningWorker::start(store, data.generation) {
+                                Ok(worker) => learning = Some(worker),
                                 Err(_) => local_data_error = true,
                             }
-                            adaptive_ranking_enabled = data.adaptive_ranking_enabled;
-                            if adaptive_ranking_enabled {
-                                rankings = Arc::new(data.rankings.clone());
-                                match LearningWorker::start(store, data.generation) {
-                                    Ok(worker) => learning = Some(worker),
-                                    Err(_) => local_data_error = true,
-                                }
-                            }
                         }
-                        None => local_data_error = true,
                     }
-                }
+                    None => local_data_error = true,
+                },
                 Err(_) => local_data_error = true,
             }
             let ui_manager: ITfUIElementMgr = thread_manager.cast()?;
@@ -3202,20 +4362,9 @@ mod windows_exports {
             }
             let token = next_activation_token();
             let owner_thread = std::thread::current().id();
-            let mut ai_unavailable = AiStatus::Unavailable;
-            let ai = if settings.ai_correction_enabled {
-                match protected_ai_helper().and_then(|helper| {
-                    crate::ai::ipc::AiClient::start(helper).map_err(|_| AiStatus::ClientFailed)
-                }) {
-                    Ok(client) => Some(AiScheduler::new(Box::new(client))),
-                    Err(reason) => {
-                        ai_unavailable = reason;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            // Focusing a settings control must not start a model broker.
+            let ai_unavailable = AiStatus::Waiting;
+            let ai = None;
             {
                 let weak = Rc::downgrade(&self.get_impl().activation);
                 let sink: Rc<dyn Fn()> = Rc::new(move || {
@@ -3312,7 +4461,9 @@ mod windows_exports {
                         processing: false,
                         english: false,
                         shift: ShiftGesture::default(),
+                        writing_gesture: WritingGesture::default(),
                         settings_worker: None,
+                        pending_lexicon: Some(pending_lexicon),
                         context_generation: Rc::clone(&context_generation),
                         _thread_events: Some(thread_events),
                         settings,
@@ -3397,6 +4548,11 @@ mod windows_exports {
             let Some(mut active) = active else {
                 return Ok(());
             };
+            // An attempted deactivation ends key gestures even if unadvising
+            // fails and the activation must be restored for orderly cleanup.
+            active.writing_gesture = WritingGesture::default();
+            active.shift.pressed = None;
+            close_writing_panel(active.token);
             active.ui.close();
 
             // SAFETY: The keystroke manager was obtained from the thread manager
@@ -3485,6 +4641,9 @@ mod windows_exports {
                 };
                 if active.processing {
                     return Ok(FALSE);
+                }
+                if event.is_some_and(starts_pinyin) {
+                    ensure_input_lexicon(active)?;
                 }
                 let entry = active.contexts.remove(&key);
                 let client_id = active.client_id;
@@ -3620,6 +4779,7 @@ mod windows_exports {
                     }
                     active.foreground = foreground.as_bool();
                     active.shift.pressed = None;
+                    active.writing_gesture = WritingGesture::default();
                     if foreground.as_bool() {
                         None
                     } else {
@@ -3630,6 +4790,7 @@ mod windows_exports {
             };
 
             if let Some((token, owner_thread)) = popup {
+                close_polish_popup(token);
                 if let Some(ui) = activation_ui(&self.get_impl().activation, token) {
                     ui.end();
                 }
@@ -3663,7 +4824,7 @@ mod windows_exports {
             &self,
             context: Option<&ITfContext>,
             wparam: WPARAM,
-            lparam: LPARAM,
+            _lparam: LPARAM,
         ) -> Result<BOOL> {
             record(Stage::TestKeyDown, S_OK);
             if !self.get_impl().owns_current_thread() {
@@ -3675,6 +4836,12 @@ mod windows_exports {
             let Some((_, english)) = self.key_mode(context) else {
                 return Ok(FALSE);
             };
+            if current_writing_shortcut(&self.get_impl().activation, wparam.0).is_some() {
+                return Ok(TRUE);
+            }
+            if polish_escape_target(&self.get_impl().activation, context, wparam.0).is_some() {
+                return Ok(TRUE);
+            }
             if map_key_event(wparam).is_some_and(KeyEvent::is_script_toggle) {
                 return Ok(TRUE);
             }
@@ -3686,11 +4853,11 @@ mod windows_exports {
                 .try_borrow()
                 .ok()
                 .is_some_and(|state| {
-                    state
-                        .as_ref()
-                        .is_some_and(|active| active.shift.pressed.is_some())
+                    state.as_ref().is_some_and(|active| {
+                        active.shift.pressed.is_some() || active.writing_gesture.held != 0
+                    })
                 });
-            if shift_identity(wparam.0, lparam).is_some() || pending {
+            if writing_modifier(wparam.0) != 0 || pending {
                 return Ok(TRUE);
             }
             if english {
@@ -3710,6 +4877,10 @@ mod windows_exports {
                 };
                 if active.processing {
                     return Ok(FALSE);
+                }
+                if active.pending_lexicon.is_some() && starts_pinyin(event) {
+                    // Predict only. Never build the dictionary from OnTest.
+                    return Ok(TRUE);
                 }
                 (
                     active
@@ -3752,14 +4923,17 @@ mod windows_exports {
             &self,
             context: Option<&ITfContext>,
             wparam: WPARAM,
-            lparam: LPARAM,
+            _lparam: LPARAM,
         ) -> Result<BOOL> {
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
-            let (Some(context), Some(_shift)) = (context, shift_identity(wparam.0, lparam)) else {
+            let Some(context) = context else {
                 return Ok(FALSE);
             };
+            if writing_modifier(wparam.0) == 0 {
+                return Ok(FALSE);
+            }
             if self.key_mode(context).is_none() {
                 return Ok(FALSE);
             }
@@ -3769,7 +4943,7 @@ mod windows_exports {
             Ok(BOOL::from(state.as_ref().is_some_and(|active| {
                 // Even a cancelled chord release must reach the real callback
                 // to clear its pending gesture; only OnKeyUp decides to eat it.
-                active.shift.pressed.is_some()
+                active.shift.pressed.is_some() || active.writing_gesture.held != 0
             })))
         }
 
@@ -3784,12 +4958,78 @@ mod windows_exports {
                 return Err(E_UNEXPECTED.into());
             }
             let Some(context) = context else {
+                if let Ok(mut state) = self.get_impl().activation.try_borrow_mut() {
+                    if let Some(active) = state.as_mut() {
+                        active.writing_gesture = WritingGesture::default();
+                        active.shift.pressed = None;
+                    }
+                }
                 return Ok(FALSE);
             };
             let shift = shift_identity(wparam.0, lparam);
             let Some((epoch, english)) = self.key_mode(context) else {
+                if let Ok(mut state) = self.get_impl().activation.try_borrow_mut() {
+                    if let Some(active) = state.as_mut() {
+                        active.writing_gesture = WritingGesture::default();
+                        active.shift.pressed = None;
+                    }
+                }
                 return Ok(FALSE);
             };
+            {
+                let key = context_key(context)?;
+                let bit = writing_modifier(wparam.0);
+                let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
+                    return Ok(FALSE);
+                };
+                let Some(active) = state.as_mut() else {
+                    return Ok(FALSE);
+                };
+                let binding = (key, epoch, active.context_generation.get(), active.token);
+                if active
+                    .writing_gesture
+                    .binding
+                    .is_some_and(|old| old != binding)
+                {
+                    active.writing_gesture = WritingGesture::default();
+                }
+                let unsafe_snapshot =
+                    writing_snapshot_unsafe(active.writing_gesture.held, bit, wparam.0, lparam);
+                active.writing_gesture.down(
+                    bit,
+                    lparam.0 as usize & (1 << 30) != 0,
+                    unsafe_snapshot,
+                    binding,
+                    active.settings.writing_shortcuts,
+                );
+                if active.writing_gesture.held.count_ones() >= 2 {
+                    active.shift.pressed = None;
+                }
+            }
+            if let Some(token) =
+                polish_escape_target(&self.get_impl().activation, context, wparam.0)
+            {
+                close_polish_popup(token);
+                return Ok(TRUE);
+            }
+            if let Some(task) = current_writing_shortcut(&self.get_impl().activation, wparam.0) {
+                {
+                    let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
+                        return Ok(FALSE);
+                    };
+                    let Some(active) = state
+                        .as_mut()
+                        .filter(|a| !a.processing && a.focus_epoch == epoch)
+                    else {
+                        return Ok(FALSE);
+                    };
+                    active.shift.pressed = None;
+                }
+                if lparam.0 as usize & (1 << 30) == 0 {
+                    open_writing_panel(&self.get_impl().activation, context, task);
+                }
+                return Ok(TRUE);
+            }
             let key = context_key(context)?;
             let script_toggle = map_key_event(wparam).is_some_and(KeyEvent::is_script_toggle);
             let repeat = lparam.0 as usize & (1 << 30) != 0;
@@ -3860,6 +5100,47 @@ mod windows_exports {
         ) -> Result<BOOL> {
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
+            }
+            let bit = writing_modifier(wparam.0);
+            if bit != 0 {
+                let binding = context.and_then(|context| {
+                    let (epoch, _) = self.key_mode(context)?;
+                    Some((context_key(context).ok()?, epoch))
+                });
+                let task = {
+                    let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
+                        return Ok(FALSE);
+                    };
+                    let Some(active) = state.as_mut() else {
+                        return Ok(FALSE);
+                    };
+                    if writing_snapshot_unsafe(active.writing_gesture.held, bit, wparam.0, lparam) {
+                        active.writing_gesture.invalid = true;
+                        active.writing_gesture.task = None;
+                    }
+                    let had_gesture = active.writing_gesture.held.count_ones() >= 2
+                        || active.writing_gesture.task.is_some();
+                    let binding = binding.map(|(key, epoch)| {
+                        (key, epoch, active.context_generation.get(), active.token)
+                    });
+                    if binding.is_none() || active.writing_gesture.binding != binding {
+                        active.writing_gesture = WritingGesture::default();
+                        active.shift.pressed = None;
+                        return Ok(FALSE);
+                    }
+                    let task = active.writing_gesture.up(bit, binding);
+                    if had_gesture || task.is_some() {
+                        active.shift.pressed = None;
+                    }
+                    task
+                };
+                if let (Some(task), Some(context)) = (task, context) {
+                    open_writing_panel(&self.get_impl().activation, context, task);
+                }
+                // Never eat modifier releases: the host must see balanced key state.
+                if shift_identity(wparam.0, lparam).is_none() {
+                    return Ok(FALSE);
+                }
             }
             let Some(shift) = shift_identity(wparam.0, lparam) else {
                 return Ok(FALSE);
@@ -3985,6 +5266,1570 @@ mod windows_exports {
     mod native_tests {
         include!("compatibility_tests.rs");
         use super::*;
+
+        #[test]
+        fn writing_lease_failed_reentry_preserves_outer_owner() {
+            let token = next_activation_token();
+            let first = WritingLease::acquire(token).unwrap();
+            assert!(WritingLease::acquire(token).is_none());
+            assert!(WritingLease::acquire(token).is_none());
+            assert!(WRITING_BUSY.with(|busy| busy.borrow().contains(&token)));
+            drop(first);
+            let next = WritingLease::acquire(token).unwrap();
+            assert!(WritingLease::acquire(token).is_none());
+            drop(next);
+            assert!(!WRITING_BUSY.with(|busy| busy.borrow().contains(&token)));
+        }
+
+        thread_local! {
+            static WRITING_REENTRY: RefCell<Option<Box<dyn FnOnce()>>> =
+                const { RefCell::new(None) };
+        }
+
+        unsafe extern "system" fn writing_host_subclass(
+            hwnd: windows::Win32::Foundation::HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+            _: usize,
+            _: usize,
+        ) -> windows::Win32::Foundation::LRESULT {
+            use windows::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE};
+            if message == WM_ACTIVATE && wparam.0 as u16 == WA_INACTIVE as u16 {
+                let hook = WRITING_REENTRY.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    // No unwind may cross a Win32 callback. The test records
+                    // its observations and asserts after returning from Win32.
+                    let _ = catch_unwind(AssertUnwindSafe(hook));
+                }
+            }
+            windows::Win32::UI::Shell::DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+
+        fn writing_window_count() -> usize {
+            unsafe extern "system" fn count(
+                hwnd: windows::Win32::Foundation::HWND,
+                data: LPARAM,
+            ) -> BOOL {
+                let mut name = [0u16; 64];
+                let length =
+                    windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut name);
+                if String::from_utf16_lossy(&name[..length as usize]) == "Flower.WritingPanel.050" {
+                    *(data.0 as *mut usize) += 1;
+                }
+                TRUE
+            }
+            let mut total = 0usize;
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows(
+                    windows::Win32::System::Threading::GetCurrentThreadId(),
+                    Some(count),
+                    LPARAM((&mut total as *mut usize) as isize),
+                )
+                .unwrap();
+            }
+            total
+        }
+
+        fn writing_pump_owned_messages() {
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            let mut message = MSG::default();
+            for _ in 0..256 {
+                if !unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    return;
+                }
+                assert_ne!(
+                    message.message, WM_QUIT,
+                    "panel must not quit the host message loop"
+                );
+                unsafe {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            panic!("isolated fixture message queue failed to settle");
+        }
+
+        struct WritingPanelCleanup(ActivationToken);
+
+        impl Drop for WritingPanelCleanup {
+            fn drop(&mut self) {
+                close_writing_panel(self.0);
+            }
+        }
+
+        struct WritingHostWindow {
+            root: windows::Win32::Foundation::HWND,
+            control: windows::Win32::Foundation::HWND,
+            manager: ITfThreadMgr,
+            previous_view: windows::Win32::Foundation::HWND,
+        }
+
+        impl WritingHostWindow {
+            fn new(host: &NativeDocument) -> Self {
+                use windows::Win32::UI::WindowsAndMessaging::*;
+                unsafe {
+                    let root = CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        windows::core::w!("STATIC"),
+                        windows::core::w!("Flower isolated writing fixture"),
+                        WS_OVERLAPPEDWINDOW,
+                        40,
+                        40,
+                        420,
+                        160,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    let control = CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        windows::core::w!("EDIT"),
+                        windows::core::w!("Synthetic fixture only"),
+                        WS_CHILD | WS_VISIBLE,
+                        10,
+                        10,
+                        320,
+                        40,
+                        root,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    let fixture = Self {
+                        root,
+                        control,
+                        manager: host.manager.clone(),
+                        previous_view: COMPAT_VIEW.with(|view| view.replace(control)),
+                    };
+                    for hwnd in [root, control] {
+                        // windows 0.58 maps S_OK + a null previous document to
+                        // Err(S_OK). A first association legitimately has none.
+                        if let Err(error) = host.manager.AssociateFocus(hwnd, &host.document) {
+                            assert_eq!(error.code(), S_OK);
+                        }
+                    }
+                    windows::Win32::UI::Shell::SetWindowSubclass(
+                        root,
+                        Some(writing_host_subclass),
+                        0x4657,
+                        0,
+                    )
+                    .ok()
+                    .unwrap();
+                    fixture.focus(host);
+                    fixture
+                }
+            }
+
+            fn focus(&self, host: &NativeDocument) {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+                use windows::Win32::UI::WindowsAndMessaging::*;
+                unsafe {
+                    let _ = ShowWindow(self.root, SW_SHOWNORMAL);
+                    assert!(
+                        SetForegroundWindow(self.root).as_bool(),
+                        "system denied foreground for the isolated host"
+                    );
+                    SetFocus(self.control).unwrap();
+                    writing_pump_owned_messages();
+                    assert_eq!(GetForegroundWindow(), self.root);
+                    assert_eq!(GetFocus(), self.control);
+                    // The association, not a manual SetFocus(document) after
+                    // panel closure, must restore canonical context identity.
+                    assert_eq!(
+                        focused_context_key(&host.manager),
+                        Some(context_key(&host.context))
+                    );
+                }
+            }
+        }
+
+        impl Drop for WritingHostWindow {
+            fn drop(&mut self) {
+                WRITING_REENTRY.with(|slot| {
+                    drop(slot.borrow_mut().take());
+                });
+                COMPAT_VIEW.with(|view| view.set(self.previous_view));
+                unsafe {
+                    let _ = self
+                        .manager
+                        .AssociateFocus(self.control, None::<&ITfDocumentMgr>);
+                    let _ = self
+                        .manager
+                        .AssociateFocus(self.root, None::<&ITfDocumentMgr>);
+                    let _ = windows::Win32::UI::Shell::RemoveWindowSubclass(
+                        self.root,
+                        Some(writing_host_subclass),
+                        0x4657,
+                    );
+                    if windows::Win32::UI::WindowsAndMessaging::IsWindow(self.root).as_bool() {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.root);
+                    }
+                }
+            }
+        }
+
+        fn writing_arm_reentry(
+            shared: &SharedActivation,
+            host: &NativeDocument,
+        ) -> Rc<RefCell<Vec<(bool, usize)>>> {
+            let observed = Rc::new(RefCell::new(Vec::new()));
+            let results = Rc::clone(&observed);
+            let shared = Rc::clone(shared);
+            let context = host.context.clone();
+            let token = shared.borrow().as_ref().unwrap().token;
+            WRITING_REENTRY.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    for _ in 0..2 {
+                        open_writing_panel(&shared, &context, crate::writing::Task::polish());
+                        let busy = WRITING_BUSY.with(|busy| busy.borrow().contains(&token));
+                        results.borrow_mut().push((busy, writing_window_count()));
+                    }
+                }));
+            });
+            observed
+        }
+
+        #[test]
+        #[ignore = "requires an interactive desktop; only owns synthetic host/panel windows"]
+        fn native_writing_owned_window_foreground_roundtrip_and_cleanup() {
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for case in 0..6 {
+                let scope: IUnknown = TestScope(vec![0]).into();
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(scope)),
+                    calls: Rc::new(Cell::new(0)),
+                    fail: false,
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let (_service, shared) = basic_service(&host);
+                // This isolated application client is not a registered TIP.
+                // Do not register an IME merely to advise its keyboard sink.
+                let window = WritingHostWindow::new(&host);
+                writing_fixture_edit(&host, Some("隔离原文🙂"), true);
+                let token = shared.borrow().as_ref().unwrap().token;
+                let _panel_cleanup = WritingPanelCleanup(token);
+                let object_baseline = OBJECT_COUNT.load(Ordering::SeqCst);
+                let opening = writing_arm_reentry(&shared, &host);
+                open_writing_panel(&shared, &host.context, crate::writing::Task::polish());
+                writing_pump_owned_messages();
+                assert_eq!(
+                    &*opening.borrow(),
+                    &[(true, 1), (true, 1)],
+                    "creation must suppress both nested openings without losing its lease"
+                );
+                assert_eq!(writing_window_count(), 1);
+                let panel = WRITING_PANELS
+                    .with(|panels| panels.borrow().get(&token).unwrap().window.hwnd());
+                assert_eq!(
+                    unsafe { GetForegroundWindow() },
+                    panel,
+                    "real panel must reach foreground; a denied foreground is a test failure"
+                );
+                assert_eq!(OBJECT_COUNT.load(Ordering::SeqCst), object_baseline + 1);
+                let weak =
+                    LAST_WRITING_BINDING.with(|last| last.borrow().as_ref().unwrap().clone());
+                let binding = weak
+                    .upgrade()
+                    .expect("production capture must bind the synthetic target");
+                let invalid = Rc::downgrade(&binding.invalid);
+                assert!(
+                    !binding.invalid.get(),
+                    "opening the panel must not invalidate the source"
+                );
+
+                // Programmatic edit of our own real panel control, no WM_KEY*,
+                // generation command, credential access, clipboard or network.
+                unsafe {
+                    let edit = GetDlgItem(panel, 111).unwrap();
+                    SetWindowTextW(edit, windows::core::w!("合成结果")).unwrap();
+                }
+                writing_pump_owned_messages();
+                assert!(!binding.invalid.get(), "panel editing is not a source edit");
+                window.focus(&host);
+                assert!(
+                    !binding.invalid.get(),
+                    "focus-only return cannot revoke the binding"
+                );
+                let showing = writing_arm_reentry(&shared, &host);
+                open_writing_panel(&shared, &host.context, crate::writing::Task::polish());
+                writing_pump_owned_messages();
+                assert_eq!(
+                    &*showing.borrow(),
+                    &[(true, 1), (true, 1)],
+                    "show must suppress both nested openings"
+                );
+                assert_eq!(writing_window_count(), 1);
+                assert_eq!(unsafe { GetForegroundWindow() }, panel);
+                assert!(!binding.invalid.get());
+
+                match case {
+                    1 => {
+                        writing_fixture_edit(&host, None, false);
+                        writing_fixture_edit(&host, None, true);
+                        assert!(binding.invalid.get(), "selection restored still invalid");
+                    }
+                    2 => {
+                        writing_fixture_edit(&host, Some("临时更改"), true);
+                        writing_fixture_edit(&host, Some("隔离原文🙂"), true);
+                        assert!(binding.invalid.get(), "text restored still invalid");
+                    }
+                    3 => {
+                        shared.borrow_mut().as_mut().unwrap().token = next_activation_token();
+                    }
+                    4 => {
+                        unsafe { DestroyWindow(window.root) }.unwrap();
+                    }
+                    5 => {
+                        // Model the activation removal and panel shutdown at
+                        // the beginning of Deactivate without registering a TIP.
+                        let active = shared.borrow_mut().take();
+                        close_writing_panel(token);
+                        drop(active);
+                        assert!(shared.borrow().is_none());
+                        assert!(WRITING_PANELS.with(|panels| !panels.borrow().contains_key(&token)));
+                    }
+                    _ => {}
+                }
+                let applied = apply_writing_binding(
+                    Rc::clone(&binding),
+                    &Rc::downgrade(&shared),
+                    panel,
+                    "合成结果",
+                );
+                assert_eq!(applied.is_ok(), case == 0, "case {case}: {applied:?}");
+                if case == 0 {
+                    assert_eq!(unsafe { GetFocus() }, window.control);
+                    assert_eq!(unsafe { GetForegroundWindow() }, window.root);
+                    assert_eq!(
+                        focused_context_key(&host.manager),
+                        Some(context_key(&host.context))
+                    );
+                    assert_eq!(read_document(&host, None), "合成结果");
+                    // Even coming back to this same panel cannot reuse authority.
+                    let leased = WRITING_PANELS
+                        .with(|panels| panels.borrow_mut().remove(&token))
+                        .unwrap();
+                    leased.window.show(crate::writing::Task::polish()).unwrap();
+                    assert_eq!(unsafe { GetForegroundWindow() }, panel);
+                    let old =
+                        WRITING_PANELS.with(|panels| panels.borrow_mut().insert(token, leased));
+                    drop(old);
+                    assert!(apply_writing_binding(
+                        Rc::clone(&binding),
+                        &Rc::downgrade(&shared),
+                        panel,
+                        "不应再写"
+                    )
+                    .is_err());
+                    assert_eq!(read_document(&host, None), "合成结果");
+                } else {
+                    assert_eq!(read_document(&host, None), "隔离原文🙂");
+                }
+                assert!(binding.used.get());
+                close_writing_panel(token);
+                assert_eq!(writing_window_count(), 0);
+                assert!(WRITING_PANELS.with(|panels| !panels.borrow().contains_key(&token)));
+                assert_eq!(OBJECT_COUNT.load(Ordering::SeqCst), object_baseline);
+                drop(binding);
+                assert!(weak.upgrade().is_none(), "registry/UI must release binding");
+                assert!(
+                    invalid.upgrade().is_none(),
+                    "UnadviseSink must release observer and its state"
+                );
+                if case != 5 {
+                    shared.borrow_mut().as_mut().unwrap().token = token;
+                    drop(shared.borrow_mut().take());
+                }
+                drop(window);
+            }
+        }
+
+        #[test]
+        fn writing_shortcut_exact_main_keyboard_only() {
+            let shortcuts = crate::settings::WritingShortcuts::default();
+            for key in [0, 0x20, 0x31, 0x32] {
+                for mask in 0..16 {
+                    let modifiers = Modifiers {
+                        control: mask & 1 != 0,
+                        shift: mask & 2 != 0,
+                        alt: mask & 4 != 0,
+                        meta: mask & 8 != 0,
+                    };
+                    assert_eq!(
+                        writing_shortcut(key, modifiers, shortcuts).is_some(),
+                        key == 0x20 && mask == 1
+                    );
+                }
+            }
+            for key in [0x30, 0x33, 0x61, 0x62, 0x70] {
+                assert!(writing_shortcut(key, Modifiers::CONTROL, shortcuts).is_none());
+            }
+        }
+
+        #[test]
+        fn writing_modifier_gesture_orders_cancellation_and_binding() {
+            let shortcuts = crate::settings::WritingShortcuts::default();
+            let binding = (1, 2, 3, 4);
+            for down in [[1, 2], [2, 1]] {
+                for up in [[1, 2], [2, 1]] {
+                    let mut gesture = WritingGesture::default();
+                    gesture.down(down[0], false, false, binding, shortcuts);
+                    gesture.down(down[1], false, false, binding, shortcuts);
+                    assert!(gesture.up(up[0], Some(binding)).is_none());
+                    assert_eq!(
+                        gesture.up(up[1], Some(binding)),
+                        Some(crate::writing::Task::draft())
+                    );
+                    assert!(gesture.up(up[1], Some(binding)).is_none());
+                }
+            }
+            for reason in 0..6 {
+                let mut gesture = WritingGesture::default();
+                gesture.down(1, false, reason == 0, binding, shortcuts);
+                gesture.down(2, reason == 1, reason == 2, binding, shortcuts);
+                if reason == 3 {
+                    gesture.down(0, false, false, binding, shortcuts);
+                }
+                if reason == 4 {
+                    gesture.down(2, true, false, binding, shortcuts);
+                }
+                let release_binding = if reason == 5 {
+                    Some((1, 2, 5, 4))
+                } else {
+                    Some(binding)
+                };
+                assert!(gesture.up(1, release_binding).is_none());
+                assert!(gesture.up(2, release_binding).is_none());
+            }
+            let mut gesture = WritingGesture::default();
+            gesture.down(1, false, false, binding, shortcuts);
+            gesture.down(2, false, false, (2, 2, 3, 4), shortcuts);
+            assert!(gesture.up(1, Some(binding)).is_none());
+            assert!(gesture.up(2, Some(binding)).is_none());
+            let mut gesture = WritingGesture::default();
+            gesture.down(1, false, false, binding, shortcuts);
+            gesture.down(2, false, false, binding, shortcuts);
+            assert!(gesture.up(1, Some((1, 2, 3, 5))).is_none());
+            assert!(gesture.up(2, Some(binding)).is_none());
+            let mut gesture = WritingGesture::default();
+            gesture.down(1, false, false, binding, shortcuts);
+            gesture.down(2, false, false, binding, shortcuts);
+            assert!(gesture.up(1, Some(binding)).is_none());
+            gesture.down(1, false, false, binding, shortcuts);
+            assert!(gesture.up(1, Some(binding)).is_none());
+            assert!(gesture.up(2, Some(binding)).is_none());
+        }
+
+        #[test]
+        fn writing_modifier_snapshot_rejects_preheld_altgr_and_aliases() {
+            let mut keys = [0u8; 256];
+            keys[0x11] = 0x80;
+            assert!(!writing_keyboard_unsafe(&keys, 0, 1, 0x11, LPARAM(0)));
+            keys[0x12] = 0x80;
+            assert!(writing_keyboard_unsafe(&keys, 0, 1, 0x11, LPARAM(0)));
+            assert!(!writing_keyboard_unsafe(&keys, 1, 2, 0x12, LPARAM(0)));
+            for key in [0x41, 0xa5] {
+                keys[key] = 0x80;
+                assert!(writing_keyboard_unsafe(&keys, 1, 2, 0x12, LPARAM(0)));
+                keys[key] = 0;
+            }
+            assert!(writing_keyboard_unsafe(&keys, 1, 2, 0x12, LPARAM(1 << 24)));
+            keys[0xa2] = 0x80;
+            keys[0xa3] = 0x80;
+            assert!(writing_keyboard_unsafe(&keys, 1, 2, 0x12, LPARAM(0)));
+        }
+
+        #[test]
+        fn writing_shortcut_custom_modifier_masks_are_exact() {
+            use crate::settings::{WritingShortcut, WritingShortcuts};
+            for mask in 1..16 {
+                let shortcuts = WritingShortcuts {
+                    draft: WritingShortcut::new(0x41, mask),
+                    polish: WritingShortcut::new(0x7b, mask),
+                };
+                for actual in 0..16 {
+                    let modifiers = Modifiers {
+                        control: actual & 1 != 0,
+                        alt: actual & 2 != 0,
+                        shift: actual & 4 != 0,
+                        meta: actual & 8 != 0,
+                    };
+                    assert_eq!(
+                        writing_shortcut(0x41, modifiers, shortcuts).is_some(),
+                        actual == mask
+                    );
+                    assert_eq!(
+                        writing_shortcut(0x7b, modifiers, shortcuts).is_some(),
+                        actual == mask
+                    );
+                }
+            }
+        }
+
+        #[test]
+        #[ignore = "owned HWND and isolated Store; FLOWER_CONSENT_TEST_DIR required"]
+        fn native_writing_online_gate_launch_and_focus_recovery() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let dir =
+                std::path::PathBuf::from(std::env::var_os("FLOWER_CONSENT_TEST_DIR").unwrap());
+            let store = crate::settings::SettingsStore::new(dir.join("writing-online-launch.json"));
+            struct ResetStore;
+            impl Drop for ResetStore {
+                fn drop(&mut self) {
+                    WRITING_TEST_STORE.with(|s| *s.borrow_mut() = None);
+                }
+            }
+            let _reset = ResetStore;
+            WRITING_TEST_STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
+            let token = shared.borrow().as_ref().unwrap().token;
+            let mut settings = Settings {
+                online_ai_enabled: true,
+                ..Settings::default()
+            };
+            // Draft needs no model: this fixture cannot accidentally send.
+            settings.model_api.active_id = None;
+            store.save(&settings).unwrap();
+            // Keep the already-active snapshot opted out, as in a browser that
+            // was focused before the user saved the checkbox in settings.
+            let mut activation_settings = settings.clone();
+            activation_settings.online_ai_enabled = false;
+            shared.borrow_mut().as_mut().unwrap().settings = activation_settings;
+            let down = |vk, mods| {
+                let _keys = LocalKeyboard::set(mods);
+                let held = shared.borrow().as_ref().unwrap().writing_gesture.held;
+                for _ in 0..2 {
+                    let _ = unsafe { sink.OnTestKeyDown(&host.context, WPARAM(vk), LPARAM(1)) }
+                        .unwrap();
+                }
+                assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, held);
+                assert!(
+                    !unsafe { sink.OnKeyDown(&host.context, WPARAM(vk), LPARAM(1)) }
+                        .unwrap()
+                        .as_bool()
+                );
+            };
+            let up = |vk, mods| {
+                let _keys = LocalKeyboard::set(mods);
+                let held = shared.borrow().as_ref().unwrap().writing_gesture.held;
+                let lp = LPARAM(0xc0000001u32 as isize);
+                for _ in 0..2 {
+                    let _ = unsafe { sink.OnTestKeyUp(&host.context, WPARAM(vk), lp) }.unwrap();
+                }
+                assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, held);
+                assert!(!unsafe { sink.OnKeyUp(&host.context, WPARAM(vk), lp) }
+                    .unwrap()
+                    .as_bool());
+            };
+            let both = Modifiers {
+                control: true,
+                alt: true,
+                shift: false,
+                meta: false,
+            };
+            let alt = Modifiers {
+                control: false,
+                alt: true,
+                shift: false,
+                meta: false,
+            };
+            for reverse in [false, true] {
+                let (first, second, first_mod, remaining) = if reverse {
+                    (0xa4, 0xa2, alt, Modifiers::CONTROL)
+                } else {
+                    (0x11, 0x12, Modifiers::CONTROL, alt)
+                };
+                WRITING_CAPTURE_CALLS.with(|c| c.set(0));
+                down(first, first_mod);
+                down(second, both);
+                up(first, remaining);
+                assert!(!WRITING_PANELS.with(|p| p.borrow().contains_key(&token)));
+                up(second, Modifiers::NONE);
+                WRITING_PANELS.with(|p| {
+                    let p = p.borrow();
+                    let panel = &p[&token];
+                    assert!(panel.window.is_open());
+                    assert!(unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::IsWindow(panel.window.hwnd())
+                    }
+                    .as_bool());
+                });
+                WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 1));
+                close_writing_panel(token);
+            }
+            down(0x11, Modifiers::CONTROL);
+            down(0x12, both);
+            unsafe { sink.OnSetFocus(FALSE) }.unwrap();
+            unsafe { sink.OnSetFocus(TRUE) }.unwrap();
+            assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, 0);
+            up(0xa2, alt);
+            up(0xa4, Modifiers::NONE);
+            assert!(!WRITING_PANELS.with(|p| p.borrow().contains_key(&token)));
+            down(0xa2, Modifiers::CONTROL);
+            down(0xa4, both);
+            up(0x11, alt);
+            up(0x12, Modifiers::NONE);
+            assert!(WRITING_PANELS.with(|p| p.borrow()[&token].window.is_open()));
+            close_writing_panel(token);
+            // Lose both releases entirely; a new physical chord must recover.
+            down(0x11, Modifiers::CONTROL);
+            down(0x12, both);
+            unsafe { sink.OnSetFocus(FALSE) }.unwrap();
+            unsafe { sink.OnSetFocus(TRUE) }.unwrap();
+            down(0xa4, alt);
+            down(0xa2, both);
+            up(0x12, Modifiers::CONTROL);
+            up(0x11, Modifiers::NONE);
+            assert!(WRITING_PANELS.with(|p| p.borrow()[&token].window.is_open()));
+            close_writing_panel(token);
+            settings.online_ai_enabled = false;
+            store.save(&settings).unwrap();
+            WRITING_CAPTURE_CALLS.with(|c| c.set(0));
+            WRITING_NOTICES.with(|n| n.borrow_mut().clear());
+            down(0x11, Modifiers::CONTROL);
+            down(0x12, both);
+            up(0x11, alt);
+            up(0x12, Modifiers::NONE);
+            WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 0));
+            assert!(!WRITING_PANELS.with(|p| p.borrow().contains_key(&token)));
+            WRITING_NOTICES.with(|n| {
+                assert_eq!(
+                    n.borrow().last().unwrap(),
+                    &crate::writing::WritingError::OnlineDisabled.to_string()
+                )
+            });
+        }
+
+        #[test]
+        fn native_writing_modifier_prediction_release_and_stale_focus() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let _keys = LocalKeyboard::set(Modifiers::NONE);
+            send_key(&sink, &host.context, b'N');
+            send_key(&sink, &host.context, b'I');
+            let before = read_document(&host, None);
+            let key = context_key(&host.context);
+            let pending = shared.borrow().as_ref().unwrap().contexts[&key]
+                .router
+                .pending_input()
+                .to_owned();
+            WRITING_CAPTURE_CALLS.with(|calls| calls.set(0));
+            for cancel in 0..5 {
+                WRITING_NOTICES.with(|n| n.borrow_mut().clear());
+                shared.borrow_mut().as_mut().unwrap().writing_gesture = WritingGesture::default();
+                for (vk, mods) in [
+                    (0x11, Modifiers::CONTROL),
+                    (
+                        0x12,
+                        Modifiers {
+                            control: true,
+                            alt: true,
+                            shift: false,
+                            meta: false,
+                        },
+                    ),
+                ] {
+                    let _keys = LocalKeyboard::set(mods);
+                    let held = shared.borrow().as_ref().unwrap().writing_gesture.held;
+                    for _ in 0..3 {
+                        assert!(unsafe {
+                            sink.OnTestKeyDown(&host.context, WPARAM(vk), LPARAM(0))
+                        }
+                        .unwrap()
+                        .as_bool());
+                    }
+                    assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, held);
+                    assert!(
+                        !unsafe { sink.OnKeyDown(&host.context, WPARAM(vk), LPARAM(0)) }
+                            .unwrap()
+                            .as_bool()
+                    );
+                }
+                let both = Modifiers {
+                    control: true,
+                    alt: true,
+                    shift: false,
+                    meta: false,
+                };
+                {
+                    let _keys = LocalKeyboard::set(both);
+                    if cancel == 1 {
+                        assert!(
+                            !unsafe { sink.OnKeyDown(&host.context, WPARAM(0x58), LPARAM(0)) }
+                                .unwrap()
+                                .as_bool()
+                        );
+                    } else if cancel == 2 {
+                        let active = shared.borrow_mut();
+                        let active = active.as_ref().unwrap();
+                        // Focus away and back has no net context identity change.
+                        active
+                            .context_generation
+                            .set(active.context_generation.get().wrapping_add(2));
+                    } else if cancel == 3 {
+                        assert!(!unsafe {
+                            sink.OnKeyDown(&host.context, WPARAM(0x12), LPARAM(1 << 30))
+                        }
+                        .unwrap()
+                        .as_bool());
+                    } else if cancel == 4 {
+                        // This manual fixture never advised a key sink. The
+                        // real method may report Unadvise failure, but must
+                        // still invalidate all pending shortcut work.
+                        let _ = unsafe { service.Deactivate() };
+                    }
+                }
+                for (vk, mods) in [
+                    (
+                        0x11,
+                        Modifiers {
+                            control: false,
+                            alt: true,
+                            shift: false,
+                            meta: false,
+                        },
+                    ),
+                    (0x12, Modifiers::NONE),
+                ] {
+                    let _keys = LocalKeyboard::set(mods);
+                    if cancel != 4 {
+                        let held = shared.borrow().as_ref().unwrap().writing_gesture.held;
+                        for _ in 0..3 {
+                            assert_eq!(
+                                unsafe { sink.OnTestKeyUp(&host.context, WPARAM(vk), LPARAM(0)) }
+                                    .unwrap()
+                                    .as_bool(),
+                                held != 0
+                            );
+                        }
+                        assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, held);
+                    }
+                    assert!(
+                        !unsafe { sink.OnKeyUp(&host.context, WPARAM(vk), LPARAM(0)) }
+                            .unwrap()
+                            .as_bool()
+                    );
+                }
+                WRITING_NOTICES.with(|n| assert_eq!(n.borrow().len(), usize::from(cancel == 0)));
+                WRITING_CAPTURE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+                if cancel != 4 {
+                    assert_eq!(read_document(&host, None), before);
+                    assert_eq!(
+                        shared.borrow().as_ref().unwrap().contexts[&key]
+                            .router
+                            .pending_input(),
+                        pending
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn native_writing_default_polish_prediction_and_missing_model_capture_nothing() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            shared
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .settings
+                .model_api
+                .active_id = None;
+            if let Some(store) = writing_settings_store() {
+                store
+                    .save(&shared.borrow().as_ref().unwrap().settings)
+                    .unwrap();
+            }
+            assert!(
+                shared
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .online_polish
+                    .enabled
+            );
+            let _keys = LocalKeyboard::set(Modifiers::CONTROL);
+            WRITING_CAPTURE_CALLS.with(|calls| calls.set(0));
+            WRITING_NOTICES.with(|n| n.borrow_mut().clear());
+            for _ in 0..3 {
+                assert!(
+                    unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x20), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+            }
+            WRITING_NOTICES.with(|n| assert!(n.borrow().is_empty()));
+            assert!(
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x20), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x20), LPARAM(1 << 30)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            WRITING_NOTICES.with(|n| assert_eq!(n.borrow().len(), 1));
+            WRITING_CAPTURE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+            assert!(POLISH_POPUPS.with(|p| p.borrow().is_empty()));
+            assert!(WRITING_PANELS.with(|p| p.borrow().is_empty()));
+        }
+
+        #[test]
+        fn writing_shortcut_custom_keys_and_collisions() {
+            use crate::settings::{WritingShortcut, WritingShortcuts};
+            let modifiers = Modifiers {
+                control: true,
+                shift: true,
+                alt: false,
+                meta: false,
+            };
+            let shortcuts = WritingShortcuts {
+                draft: WritingShortcut::new(0x41, 5),
+                polish: WritingShortcut::new(0x7b, 5),
+            };
+            assert_eq!(
+                writing_shortcut(0x41, modifiers, shortcuts),
+                Some(crate::writing::Task::draft())
+            );
+            assert_eq!(
+                writing_shortcut(0x7b, modifiers, shortcuts),
+                Some(crate::writing::Task::polish())
+            );
+            for key in [0x31, 0x32, 0x46, 0x61, 0x62] {
+                assert!(writing_shortcut(key, modifiers, shortcuts).is_none());
+            }
+            for invalid in [
+                WritingShortcuts {
+                    polish: shortcuts.draft,
+                    ..shortcuts
+                },
+                WritingShortcuts {
+                    draft: WritingShortcut::new(0x46, 5),
+                    ..shortcuts
+                },
+                WritingShortcuts {
+                    draft: WritingShortcut::new(0x1b, 5),
+                    ..shortcuts
+                },
+            ] {
+                for key in [0x41, 0x46, 0x1b, 0x7b] {
+                    assert!(writing_shortcut(key, modifiers, invalid).is_none());
+                }
+            }
+        }
+
+        #[implement(ITfEditSession)]
+        struct WritingFixtureEdit {
+            context: ITfContext,
+            text: Option<String>,
+            select_all: bool,
+        }
+
+        impl ITfEditSession_Impl for WritingFixtureEdit_Impl {
+            fn DoEditSession(&self, cookie: u32) -> Result<()> {
+                unsafe {
+                    let range = self.context.GetStart(cookie)?;
+                    let end = self.context.GetEnd(cookie)?;
+                    range.ShiftEndToRange(cookie, &end, TF_ANCHOR_END)?;
+                    if let Some(text) = &self.text {
+                        range.SetText(cookie, 0, &text.encode_utf16().collect::<Vec<_>>())?;
+                    }
+                    if !self.select_all {
+                        range.Collapse(cookie, TF_ANCHOR_END)?;
+                    }
+                    let mut selection = [TF_SELECTION {
+                        range: std::mem::ManuallyDrop::new(Some(range)),
+                        style: TF_SELECTIONSTYLE {
+                            ase: TF_AE_NONE,
+                            fInterimChar: FALSE,
+                        },
+                    }];
+                    let result = self.context.SetSelection(cookie, &selection);
+                    std::mem::ManuallyDrop::drop(&mut selection[0].range);
+                    result
+                }
+            }
+        }
+
+        fn writing_fixture_edit(host: &NativeDocument, text: Option<&str>, select_all: bool) {
+            let session: ITfEditSession = WritingFixtureEdit {
+                context: host.context.clone(),
+                text: text.map(str::to_owned),
+                select_all,
+            }
+            .into();
+            unsafe {
+                host.context
+                    .RequestEditSession(host.client, &session, TF_ES_SYNC | TF_ES_READWRITE)
+            }
+            .unwrap()
+            .ok()
+            .unwrap();
+        }
+
+        fn writing_fixture_capture(
+            host: &NativeDocument,
+            task: crate::writing::Task,
+        ) -> Option<CapturedWritingRange> {
+            let result = Rc::new(RefCell::new(None));
+            let session: ITfEditSession = WritingCapture {
+                context: host.context.clone(),
+                task,
+                result: Rc::clone(&result),
+                too_long: Rc::new(Cell::new(false)),
+            }
+            .into();
+            let _ = unsafe {
+                host.context
+                    .RequestEditSession(host.client, &session, TF_ES_SYNC | TF_ES_READ)
+            };
+            let captured = result.borrow_mut().take();
+            captured
+        }
+
+        #[test]
+        fn native_writing_capture_privacy_bounds_and_observer() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for scope in [None, Some(31), Some(61), Some(999), Some(0)] {
+                let value = scope
+                    .map(|s| {
+                        let object: IUnknown = TestScope(vec![s]).into();
+                        VARIANT::from(object)
+                    })
+                    .unwrap_or_default();
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(value),
+                    calls: Rc::new(Cell::new(0)),
+                    fail: false,
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                writing_fixture_edit(&host, Some("选中文字🙂"), true);
+                // Draft never treats the selected text as an implicit prompt.
+                assert!(writing_fixture_capture(&host, crate::writing::Task::draft()).is_none());
+                let captured = writing_fixture_capture(&host, crate::writing::Task::polish());
+                assert_eq!(captured.is_some(), scope == Some(0));
+                if let Some((_, _, text)) = captured {
+                    assert_eq!(text, "选中文字🙂");
+                }
+                if scope != Some(0) {
+                    continue;
+                }
+                writing_fixture_edit(&host, Some(&"🙂".repeat(500)), true);
+                assert_eq!(
+                    writing_fixture_capture(&host, crate::writing::Task::polish())
+                        .unwrap()
+                        .2
+                        .chars()
+                        .count(),
+                    500
+                );
+                writing_fixture_edit(&host, Some(&"字".repeat(501)), true);
+                assert!(writing_fixture_capture(&host, crate::writing::Task::polish()).is_none());
+                writing_fixture_edit(&host, None, false);
+                assert_eq!(
+                    writing_fixture_capture(&host, crate::writing::Task::draft())
+                        .unwrap()
+                        .2,
+                    ""
+                );
+                let invalid = Rc::new(Cell::new(false));
+                let observation =
+                    WritingObservation::connect(&host.context, Rc::clone(&invalid)).unwrap();
+                assert!(!invalid.get());
+                writing_fixture_edit(&host, None, true);
+                assert!(
+                    invalid.get(),
+                    "selection-only editing permanently invalidates"
+                );
+                writing_fixture_edit(&host, None, false);
+                assert!(
+                    invalid.get(),
+                    "restoring selection cannot restore authority"
+                );
+                drop(observation);
+                let invalid = Rc::new(Cell::new(false));
+                let _observation =
+                    WritingObservation::connect(&host.context, Rc::clone(&invalid)).unwrap();
+                let original = read_document(&host, None);
+                writing_fixture_edit(&host, Some("更改"), false);
+                assert!(invalid.get(), "text editing invalidates");
+                writing_fixture_edit(&host, Some(&original), false);
+                assert!(invalid.get(), "restoring text cannot restore authority");
+            }
+        }
+
+        #[test]
+        fn polish_request_uses_captured_style_and_script_without_settings_io() {
+            use crate::writing::{PolishStyle, Task};
+            use crate::ChineseScript::{Simplified, Traditional};
+            for style in [
+                PolishStyle::Fluent,
+                PolishStyle::Formal,
+                PolishStyle::Concise,
+            ] {
+                for active in [Simplified, Traditional] {
+                    for script in [None, Some(Simplified), Some(Traditional)] {
+                        let mut options = crate::settings::OnlinePolishSettings {
+                            enabled: true,
+                            style,
+                            script,
+                        };
+                        let request = polish_request(&options, active, "合成原文".into());
+                        options.style = PolishStyle::Fluent;
+                        options.script = None;
+                        options.enabled = false;
+                        assert_eq!(options.style, PolishStyle::Fluent);
+                        assert_eq!(options.script, None);
+                        assert!(!options.enabled);
+                        assert_eq!(request.task, Task::Polish { style });
+                        assert_eq!(request.script, script.unwrap_or(active));
+                        assert_eq!(request.input, "合成原文");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[ignore = "owned nonactivating HWND and isolated TSF; no worker/network/global keys"]
+        fn native_polish_owned_single_task_escape_and_deactivation() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let token = shared.borrow().as_ref().unwrap().token;
+            // These are explicit custom chords, not the Ctrl+Alt/Ctrl+Space defaults.
+            shared
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .settings
+                .writing_shortcuts = crate::settings::WritingShortcuts {
+                draft: crate::settings::WritingShortcut::new(0x31, 5),
+                polish: crate::settings::WritingShortcut::new(0x32, 5),
+            };
+            shared
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .settings
+                .online_polish
+                .enabled = true;
+            let _cleanup = WritingPanelCleanup(token);
+            let make_popup = || {
+                crate::platform::polish_ui::open_test_popup(
+                    crate::writing::WritingRequest {
+                        id: 1,
+                        task: crate::writing::Task::polish(),
+                        script: crate::ChineseScript::Simplified,
+                        input: "合成选区".into(),
+                    },
+                    RECT {
+                        left: 100,
+                        top: 100,
+                        right: 101,
+                        bottom: 120,
+                    },
+                    Box::new(|_| panic!("navigation must never apply")),
+                    Box::new(|| true),
+                )
+                .unwrap()
+            };
+            let window = make_popup();
+            let hwnd = window.hwnd();
+            POLISH_POPUPS.with(|p| {
+                p.borrow_mut().insert(
+                    token,
+                    ThreadPolishPopup {
+                        window,
+                        key: context_key(&host.context),
+                        _registration: ObjectRegistration::new(),
+                    },
+                )
+            });
+            WRITING_CAPTURE_CALLS.with(|calls| calls.set(0));
+            open_polish_popup(&shared, &host.context);
+            open_writing_panel(&shared, &host.context, crate::writing::Task::draft());
+            assert!(WRITING_PANELS.with(|p| p.borrow().is_empty()));
+            assert_eq!(
+                POLISH_POPUPS.with(|p| p.borrow()[&token].window.hwnd()),
+                hwnd
+            );
+            WRITING_CAPTURE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+            {
+                let _ctrl = LocalKeyboard::set(Modifiers {
+                    control: true,
+                    shift: true,
+                    alt: false,
+                    meta: false,
+                });
+                for digit in [0x31, 0x32] {
+                    assert!(unsafe {
+                        sink.OnKeyDown(&host.context, WPARAM(digit), LPARAM(1 << 30))
+                    }
+                    .unwrap()
+                    .as_bool());
+                }
+            }
+            let _keys = LocalKeyboard::set(Modifiers::NONE);
+            assert!(
+                unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x1b), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(polish_popup_open(token), "prediction must not close");
+            assert!(
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x1b), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(!polish_popup_open(token));
+            assert!(!unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) }.as_bool());
+            let window = make_popup();
+            let hwnd = window.hwnd();
+            POLISH_POPUPS.with(|p| {
+                p.borrow_mut().insert(
+                    token,
+                    ThreadPolishPopup {
+                        window,
+                        key: context_key(&host.context),
+                        _registration: ObjectRegistration::new(),
+                    },
+                )
+            });
+            let _ = unsafe { service.Deactivate() };
+            assert!(!polish_popup_open(token));
+            assert!(!unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) }.as_bool());
+            WRITING_NOTICES.with(|n| n.borrow_mut().clear());
+        }
+
+        #[test]
+        fn native_polish_disabled_never_captures_or_creates_a_task() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (_service, shared) = basic_service(&host);
+            shared
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .settings
+                .online_polish
+                .enabled = false;
+            assert!(
+                !shared
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .online_polish
+                    .enabled
+            );
+            WRITING_CAPTURE_CALLS.with(|calls| calls.set(0));
+            WRITING_NOTICES.with(|n| n.borrow_mut().clear());
+            for _ in 0..2 {
+                open_polish_popup(&shared, &host.context);
+            }
+            WRITING_CAPTURE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+            assert!(POLISH_POPUPS.with(|p| p.borrow().is_empty()));
+            assert!(WRITING_PANELS.with(|p| p.borrow().is_empty()));
+            WRITING_NOTICES.with(|n| {
+                let notices = n.borrow_mut().drain(..).collect::<Vec<_>>();
+                assert_eq!(
+                    notices,
+                    vec![
+                        "请先在设置中启用在线润色，保存后重新切换 Flower。";
+                        2
+                    ]
+                );
+            });
+        }
+
+        #[test]
+        #[ignore = "isolated Store and owned TSF; FLOWER_CONSENT_TEST_DIR required"]
+        fn native_polish_ctrl_space_private_and_empty_read_no_body() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for (scope, empty) in [(31, false), (0, true)] {
+                let object: IUnknown = TestScope(vec![scope]).into();
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(object)),
+                    calls: Rc::new(Cell::new(0)),
+                    fail: false,
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let (service, shared) = basic_service(&host);
+                let sink: ITfKeyEventSink = service.cast().unwrap();
+                writing_fixture_edit(&host, Some("合成选区"), !empty);
+                let store = writing_settings_store().unwrap();
+                let settings = shared.borrow().as_ref().unwrap().settings.clone();
+                assert!(settings.online_ai_enabled && settings.online_polish.enabled);
+                assert!(crate::writing::config::polish_authorized(
+                    &store,
+                    &settings.model_api.active().unwrap()
+                ));
+                WRITING_CAPTURE_CALLS.with(|c| c.set(0));
+                WRITING_BODY_READS.with(|c| c.set(0));
+                let _keys = LocalKeyboard::set(Modifiers::CONTROL);
+                assert!(
+                    unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x20), LPARAM(1)) }
+                        .unwrap()
+                        .as_bool()
+                );
+                WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 0));
+                assert!(
+                    unsafe { sink.OnKeyDown(&host.context, WPARAM(0x20), LPARAM(1)) }
+                        .unwrap()
+                        .as_bool()
+                );
+                // One read-only edit session is needed to check scope/selection;
+                // neither private nor empty selection may reach GetText.
+                WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 1));
+                WRITING_BODY_READS.with(|c| assert_eq!(c.get(), 0));
+                assert!(POLISH_POPUPS.with(|p| p.borrow().is_empty()));
+                assert!(WRITING_PANELS.with(|p| p.borrow().is_empty()));
+            }
+        }
+
+        #[test]
+        #[ignore = "isolated Store; FLOWER_CONSENT_TEST_DIR required"]
+        fn native_polish_model_authorization_mismatch_never_captures() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (_service, shared) = basic_service(&host);
+            let dir =
+                std::path::PathBuf::from(std::env::var_os("FLOWER_CONSENT_TEST_DIR").unwrap());
+            let store = crate::settings::SettingsStore::new(dir.join("polish-snapshot.json"));
+            let mut settings = crate::settings::Settings {
+                online_ai_enabled: true,
+                ..crate::settings::Settings::default()
+            };
+            settings.online_polish.enabled = true;
+            shared.borrow_mut().as_mut().unwrap().settings = settings.clone();
+            WRITING_CAPTURE_CALLS.with(|calls| calls.set(0));
+            // Latest disabled, latest changed and newly reauthorized target all reject
+            // the stale activation snapshot before any selection capture.
+            for (enabled, model) in [
+                (false, "GLM-4.7-Flash"),
+                (false, "changed"),
+                (true, "changed"),
+            ] {
+                settings.online_polish.enabled = enabled;
+                settings.model_api.profiles[0].model = model.into();
+                store.save(&settings).unwrap();
+                open_polish_popup_with_store(&shared, &host.context, Some(&store));
+            }
+            open_polish_popup_with_store(&shared, &host.context, None);
+            WRITING_CAPTURE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+            assert!(POLISH_POPUPS.with(|p| p.borrow().is_empty()));
+        }
+
+        #[test]
+        fn native_writing_key_prediction_repeat_and_composition_preserved() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let _keys = LocalKeyboard::set(Modifiers::NONE);
+            send_key(&sink, &host.context, b'N');
+            send_key(&sink, &host.context, b'I');
+            let before = read_document(&host, None);
+            let key = context_key(&host.context);
+            let pending = shared.borrow().as_ref().unwrap().contexts[&key]
+                .router
+                .pending_input()
+                .to_owned();
+            let before_snapshot = format!(
+                "{:?}",
+                shared.borrow().as_ref().unwrap().contexts[&key]
+                    .popup_model
+                    .snapshot()
+            );
+            let before_router = format!(
+                "{:?}",
+                shared.borrow().as_ref().unwrap().contexts[&key].router
+            );
+            shared
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .settings
+                .online_polish
+                .enabled = true;
+            let _ctrl = LocalKeyboard::set(Modifiers {
+                control: true,
+                shift: true,
+                alt: false,
+                meta: false,
+            });
+            for shortcuts in [
+                crate::settings::WritingShortcuts {
+                    draft: crate::settings::WritingShortcut::new(0x31, 5),
+                    polish: crate::settings::WritingShortcut::new(0x32, 5),
+                },
+                crate::settings::WritingShortcuts {
+                    draft: crate::settings::WritingShortcut::new(0x41, 5),
+                    polish: crate::settings::WritingShortcut::new(0x7b, 5),
+                },
+            ] {
+                shared
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .settings
+                    .writing_shortcuts = shortcuts;
+                for english in [false, true] {
+                    shared.borrow_mut().as_mut().unwrap().english = english;
+                    {
+                        let _old = LocalKeyboard::set(Modifiers::CONTROL);
+                        for digit in [0x31, 0x32] {
+                            assert!(!unsafe {
+                                sink.OnTestKeyDown(&host.context, WPARAM(digit), LPARAM(0))
+                            }
+                            .unwrap()
+                            .as_bool());
+                            assert!(!unsafe {
+                                sink.OnKeyDown(&host.context, WPARAM(digit), LPARAM(0))
+                            }
+                            .unwrap()
+                            .as_bool());
+                        }
+                    }
+                    if shortcuts.draft.key != 0x31 {
+                        for digit in [0x31, 0x32] {
+                            assert!(!unsafe {
+                                sink.OnTestKeyDown(&host.context, WPARAM(digit), LPARAM(0))
+                            }
+                            .unwrap()
+                            .as_bool());
+                            assert!(!unsafe {
+                                sink.OnKeyDown(&host.context, WPARAM(digit), LPARAM(0))
+                            }
+                            .unwrap()
+                            .as_bool());
+                        }
+                    }
+                    for digit in [
+                        usize::from(shortcuts.draft.key),
+                        usize::from(shortcuts.polish.key),
+                    ] {
+                        for _ in 0..3 {
+                            assert!(unsafe {
+                                sink.OnTestKeyDown(&host.context, WPARAM(digit), LPARAM(0))
+                            }
+                            .unwrap()
+                            .as_bool());
+                        }
+                        WRITING_NOTICES.with(|n| assert!(n.borrow().is_empty()));
+                        assert!(
+                            unsafe { sink.OnKeyDown(&host.context, WPARAM(digit), LPARAM(0)) }
+                                .unwrap()
+                                .as_bool()
+                        );
+                        WRITING_NOTICES.with(|n| {
+                            assert_eq!(
+                                n.borrow_mut().drain(..).collect::<Vec<_>>(),
+                                [if digit == usize::from(shortcuts.draft.key) {
+                                    "请先完成或取消当前拼音输入，再打开 AI 面板。"
+                                } else {
+                                    "请先完成或取消当前拼音输入，再润色所选文字。"
+                                }]
+                            );
+                        });
+                        assert!(unsafe {
+                            sink.OnKeyDown(&host.context, WPARAM(digit), LPARAM(1 << 30))
+                        }
+                        .unwrap()
+                        .as_bool());
+                        assert!(WRITING_PANELS.with(|p| p.borrow().is_empty()));
+                        assert_eq!(read_document(&host, None), before);
+                        assert_eq!(
+                            shared.borrow().as_ref().unwrap().contexts[&key]
+                                .router
+                                .pending_input(),
+                            pending
+                        );
+                        assert_eq!(
+                            format!(
+                                "{:?}",
+                                shared.borrow().as_ref().unwrap().contexts[&key]
+                                    .popup_model
+                                    .snapshot()
+                            ),
+                            before_snapshot
+                        );
+                        assert_eq!(
+                            format!(
+                                "{:?}",
+                                shared.borrow().as_ref().unwrap().contexts[&key].router
+                            ),
+                            before_router
+                        );
+                    }
+                }
+            }
+            assert!(
+                writing_activation_valid(&shared, shared.borrow().as_ref().unwrap().token)
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn native_writing_sync_write_revalidation_and_once() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let scope: IUnknown = TestScope(vec![0]).into();
+            let owner: IUnknown = ScopeOwner {
+                value: RefCell::new(VARIANT::from(scope)),
+                calls: Rc::new(Cell::new(0)),
+                fail: false,
+            }
+            .into();
+            let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+            let (_service, shared) = basic_service(&host);
+            for mutation in 0..3 {
+                writing_fixture_edit(&host, Some("原文🙂"), true);
+                let (range, style, original) =
+                    writing_fixture_capture(&host, crate::writing::Task::polish()).unwrap();
+                let invalid = Rc::new(Cell::new(false));
+                let observation =
+                    WritingObservation::connect(&host.context, Rc::clone(&invalid)).unwrap();
+                let binding = Rc::new(WritingBinding {
+                    context: host.context.clone(),
+                    range,
+                    style,
+                    original,
+                    key: context_key(&host.context),
+                    token: shared.borrow().as_ref().unwrap().token,
+                    owner: std::thread::current().id(),
+                    focus: unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+                    root: Default::default(),
+                    process: 0,
+                    invalid,
+                    used: Cell::new(false),
+                    polish_guard: None,
+                    _observation: observation,
+                });
+                if mutation == 1 {
+                    writing_fixture_edit(&host, None, false);
+                }
+                if mutation == 2 {
+                    writing_fixture_edit(&host, Some("已更改"), true);
+                }
+                // Exercise the synchronous write lock independently of foreground
+                // restoration. No user host, focus manipulation or injected key.
+                let success = Rc::new(Cell::new(false));
+                let session: ITfEditSession = WritingApply {
+                    binding: Rc::clone(&binding),
+                    shared: Rc::downgrade(&shared),
+                    output: "结果".into(),
+                    success: Rc::clone(&success),
+                }
+                .into();
+                let _ = unsafe {
+                    host.context.RequestEditSession(
+                        host.client,
+                        &session,
+                        TF_ES_SYNC | TF_ES_READWRITE,
+                    )
+                };
+                assert_eq!(success.get(), mutation == 0);
+                assert_eq!(
+                    read_document(&host, None),
+                    if mutation == 0 {
+                        "结果"
+                    } else if mutation == 1 {
+                        "原文🙂"
+                    } else {
+                        "已更改"
+                    }
+                );
+                // Inline application cannot borrow Draft's foreground-restore
+                // path. This isolated context has no bound foreground HWND.
+                assert!(apply_polish_binding(
+                    Rc::clone(&binding),
+                    &Rc::downgrade(&shared),
+                    "不可写回"
+                )
+                .is_err());
+                assert!(
+                    !binding.used.get(),
+                    "failed inline focus gate must not start a write"
+                );
+                assert!(apply_writing_binding(
+                    Rc::clone(&binding),
+                    &Rc::downgrade(&shared),
+                    Default::default(),
+                    "再次"
+                )
+                .is_err());
+                assert!(binding.used.get());
+                assert!(apply_writing_binding(
+                    binding,
+                    &Rc::downgrade(&shared),
+                    Default::default(),
+                    "再次"
+                )
+                .is_err());
+                assert_eq!(
+                    read_document(&host, None),
+                    if mutation == 0 {
+                        "结果"
+                    } else if mutation == 1 {
+                        "原文🙂"
+                    } else {
+                        "已更改"
+                    }
+                );
+            }
+        }
         // Native fixtures are known-good COM contexts; production callers must
         // propagate QueryInterface failure instead of using this assertion.
         fn context_key(context: &ITfContext) -> ContextKey {
@@ -3996,6 +6841,19 @@ mod windows_exports {
             let implementation =
                 unsafe { <ITfTextInputProcessor as AsImpl<TextService>>::as_impl(&service) };
             let shared = Rc::clone(&implementation.activation);
+            let fixture_settings = Settings {
+                online_ai_enabled: true,
+                ..Settings::default()
+            };
+            if let Some(directory) = std::env::var_os("FLOWER_CONSENT_TEST_DIR")
+                .or_else(|| std::env::var_os("FLOWER_WRITING_FIXTURE_DIR"))
+            {
+                let store = crate::settings::SettingsStore::new(
+                    std::path::PathBuf::from(directory).join("tsf-writing-authorized.json"),
+                );
+                store.save(&fixture_settings).unwrap();
+                WRITING_TEST_STORE.with(|s| *s.borrow_mut() = Some(store));
+            }
             *shared.borrow_mut() = Some(Activation {
                 ui: Rc::new(UiState::default()),
                 _activation_flags: 0,
@@ -4011,10 +6869,12 @@ mod windows_exports {
                 processing: false,
                 english: false,
                 shift: ShiftGesture::default(),
+                writing_gesture: WritingGesture::default(),
                 settings_worker: None,
+                pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
-                settings: Settings::default(),
+                settings: fixture_settings,
                 lexicon: Lexicon::from_tsv("ni\t你\t100\nhao\t好\t100\nni'hao\t你好\t200").unwrap(),
                 rankings: Arc::new(Vec::new()),
                 auto_phrases: Arc::new(Vec::new()),
@@ -5764,7 +8624,9 @@ mod windows_exports {
                     processing: false,
                     english: false,
                     shift: ShiftGesture::default(),
+                    writing_gesture: WritingGesture::default(),
                     settings_worker: None,
+                    pending_lexicon: None,
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
                     settings: Settings {
@@ -6148,7 +9010,9 @@ mod windows_exports {
                     processing: false,
                     english: false,
                     shift: ShiftGesture::default(),
+                    writing_gesture: WritingGesture::default(),
                     settings_worker: None,
+                    pending_lexicon: None,
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
                     settings: Settings {
@@ -6356,6 +9220,148 @@ mod windows_exports {
             }
         }
 
+        #[test]
+        fn native_local_completion_commits_only_explicit_selection() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            {
+                let mut state = shared.borrow_mut();
+                let active = state.as_mut().unwrap();
+                active.lexicon = Lexicon::from_tsv(
+                    "jun'bu'jian'huang'he\t君不见黄河\t1000\njun'bu'jian'huang'he'zhi'shui'tian'shang'lai\t君不见黄河之水天上来\t100\njun\t君\t100",
+                ).unwrap();
+                active.ai = None;
+            }
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let _keys = LocalKeyboard::set(Modifiers::NONE);
+            for key in b"JUNBUJIANHUANGHE" {
+                send_key(&sink, &host.context, *key);
+            }
+            assert_eq!(read_document(&host, None), "junbujianhuanghe");
+            let key = context_key(&host.context);
+            let index = shared.borrow().as_ref().unwrap().contexts[&key]
+                .router
+                .session()
+                .candidates_on_current_page()
+                .iter()
+                .position(|c| c.is_completion())
+                .unwrap();
+            assert!(index < 9);
+            send_key(&sink, &host.context, b'1' + index as u8);
+            assert_eq!(read_document(&host, None), "君不见黄河之水天上来");
+            assert!(shared.borrow().as_ref().unwrap().contexts[&key]
+                .router
+                .pending_learning()
+                .is_empty());
+            assert!(shared.borrow().as_ref().unwrap().contexts[&key]
+                .router
+                .pending_promotions()
+                .is_empty());
+        }
+
+        #[test]
+        fn native_dormant_lexicon_prediction_and_first_real_input() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let _keys = LocalKeyboard::set(Modifiers::NONE);
+            {
+                let mut state = shared.borrow_mut();
+                let active = state.as_mut().unwrap();
+                active.lexicon = Lexicon::dormant();
+                active.settings.ai_correction_enabled = false;
+                active.pending_lexicon = Some("ni\t拟\t4294967295".into());
+            }
+            for vk in [0x09, 0x31, 0x11, 0x12, b'N' as usize] {
+                let _ =
+                    unsafe { sink.OnTestKeyDown(&host.context, WPARAM(vk), LPARAM(1)) }.unwrap();
+                assert!(shared.borrow().as_ref().unwrap().pending_lexicon.is_some());
+                assert!(shared.borrow().as_ref().unwrap().lexicon.is_empty());
+            }
+            {
+                let _shift = LocalKeyboard::set(Modifiers::SHIFT);
+                send_key(&sink, &host.context, 0xde);
+            }
+            assert_eq!(read_document(&host, None), "“");
+            assert!(shared.borrow().as_ref().unwrap().pending_lexicon.is_some());
+            send_key(&sink, &host.context, b'N');
+            assert!(shared.borrow().as_ref().unwrap().pending_lexicon.is_none());
+            assert_eq!(
+                shared.borrow().as_ref().unwrap().lexicon.lookup("ni")[0].text,
+                "拟"
+            );
+            send_key(&sink, &host.context, b'I');
+            send_key(&sink, &host.context, 0x20);
+            assert_eq!(read_document(&host, None), "“拟");
+            {
+                let _shift = LocalKeyboard::set(Modifiers::SHIFT);
+                send_key(&sink, &host.context, 0xde);
+            }
+            assert_eq!(read_document(&host, None), "“拟”");
+            assert!(shared.borrow().as_ref().unwrap().pending_lexicon.is_none());
+        }
+
+        #[test]
+        #[ignore = "isolated activation resource measurement; FLOWER_CONSENT_TEST_DIR required"]
+        fn native_activation_resource_probe() {
+            assert!(
+                !Lexicon::builtin_initialized(),
+                "run this probe alone in a fresh process"
+            );
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let dir = std::path::PathBuf::from(
+                std::env::var_os("FLOWER_CONSENT_TEST_DIR").expect("isolated directory"),
+            );
+            let settings = SettingsStore::new(dir.join("activation-settings.json"));
+            settings
+                .save(&Settings {
+                    ai_correction_enabled: false,
+                    ..Settings::default()
+                })
+                .unwrap();
+            let dictionary = DictionaryStore::new(dir.join("activation-dictionary.json"));
+            let host = NativeDocument::new().unwrap();
+            let mut object = TextService::new();
+            object.stores = Some((settings, dictionary));
+            let shared = Rc::clone(&object.activation);
+            let processor: ITfTextInputProcessor = object.into();
+            let now = std::time::Instant::now();
+            let ids: windows::Win32::UI::TextServices::ITfClientId = host.manager.cast().unwrap();
+            let service_client = unsafe { ids.GetClientId(&FLOWER_TEXT_SERVICE_CLSID) }.unwrap();
+            assert_ne!(service_client, host.client);
+            let activated = unsafe { processor.Activate(&host.manager, service_client) };
+            println!("activation_elapsed_ms={}", now.elapsed().as_millis());
+            // This unregistered service may not be accepted as a key sink by
+            // the system manager. Measure only initialization before advise,
+            // never claim this fixture proves registered-host activation.
+            match activated {
+                Ok(()) => {
+                    assert!(shared.borrow().as_ref().unwrap().pending_lexicon.is_some());
+                    unsafe { processor.Deactivate() }.unwrap();
+                }
+                Err(error) => {
+                    assert_eq!(error.code(), E_INVALIDARG);
+                    assert!(shared.borrow().is_none(), "failed advise must roll back");
+                    println!("unregistered_advise_rejected=true");
+                }
+            }
+            assert!(
+                !Lexicon::builtin_initialized(),
+                "activation must not load the input table"
+            );
+        }
+
         struct NativeDocument {
             manager: ITfThreadMgr,
             document: ITfDocumentMgr,
@@ -6473,7 +9479,9 @@ mod windows_exports {
                 processing: false,
                 english: false,
                 shift: ShiftGesture::default(),
+                writing_gesture: WritingGesture::default(),
                 settings_worker: None,
+                pending_lexicon: None,
                 context_generation: generation,
                 _thread_events: Some(events),
                 settings: Settings::default(),
@@ -8168,7 +11176,9 @@ mod windows_exports {
                 processing: false,
                 english: false,
                 shift: ShiftGesture::default(),
+                writing_gesture: WritingGesture::default(),
                 settings_worker: None,
+                pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
                 settings: Settings::default(),
@@ -8411,7 +11421,9 @@ mod windows_exports {
                 processing: false,
                 english: false,
                 shift: ShiftGesture::default(),
+                writing_gesture: WritingGesture::default(),
                 settings_worker: None,
+                pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
                 settings: Settings::default(),

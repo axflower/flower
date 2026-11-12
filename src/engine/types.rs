@@ -8,6 +8,7 @@ pub struct Candidate {
 
 impl Candidate {
     pub(crate) const SPELLING_PREFIX: &str = "[Flower Spelling] ";
+    pub(crate) const COMPLETION_PREFIX: &str = "[Flower Completion] ";
     pub fn new(text: impl Into<String>, comment: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -23,12 +24,18 @@ impl Candidate {
         self.comment.starts_with(Self::SPELLING_PREFIX)
     }
 
+    pub fn is_completion(&self) -> bool {
+        self.comment.starts_with(Self::COMPLETION_PREFIX)
+    }
+
     /// Display-only provenance; never part of committed text.
     pub fn display_text(&self) -> std::borrow::Cow<'_, str> {
         if self.is_ai() {
             std::borrow::Cow::Owned(format!("{} ✓ AI", self.text))
         } else if self.is_spelling() {
             std::borrow::Cow::Owned(format!("{} ✓ 拼写", self.text))
+        } else if self.is_completion() {
+            std::borrow::Cow::Owned(format!("{} · 联想", self.text))
         } else {
             std::borrow::Cow::Borrowed(&self.text)
         }

@@ -22,7 +22,12 @@ fn test_key_reports_handled_keys_without_an_active_composition() {
 
     assert_eq!(router.test_key(KeyEvent::plain(Key::Char('n'))), Ok(true));
     assert_eq!(router.test_key(KeyEvent::plain(Key::Char('!'))), Ok(true));
-    assert_eq!(router.test_key(KeyEvent::plain(Key::Char('@'))), Ok(false));
+    // Shift+2 has been a literal symbol since 0.4.23, not a passthrough key.
+    assert_eq!(router.test_key(KeyEvent::plain(Key::Char('@'))), Ok(true));
+    assert_eq!(
+        router.test_key(KeyEvent::plain(Key::Char('\u{7f}'))),
+        Ok(false)
+    );
 
     for key in [
         Key::Backspace,

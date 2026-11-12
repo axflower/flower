@@ -1,7 +1,7 @@
 [package]
 name = "flower"
-description = "Offline Pinyin input method for Windows"
-version = "0.4.23"
+description = "Offline Pinyin input method for Windows with optional online writing"
+version = "0.5.4"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
@@ -35,7 +35,9 @@ windows = { version = "0.58", features = [
     "Win32_System_IO",
     "Win32_System_SystemInformation",
     "Win32_Security",
+    "Win32_Security_Credentials",
     "Win32_Security_Authorization",
+    "Win32_Networking_WinHttp",
     "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
     "Win32_UI_Controls",
