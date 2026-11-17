@@ -1677,6 +1677,7 @@ class ExpandedVocabularyTests(unittest.TestCase):
 
     def test_payload_limits_are_separate(self):
         self.assertEqual(flower_package.MAX_PAYLOAD, 512 * 1024 * 1024)
+        self.assertEqual(flower_package.MAX_TOTAL_PAYLOAD, 1024 * 1024 * 1024)
         self.assertEqual(flower_package.package_ai_assets.MAX_PAYLOAD, 256 * 1024 * 1024)
 
 

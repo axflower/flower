@@ -326,6 +326,21 @@ class InstallerTests(unittest.TestCase):
         digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
         Path(f"{self.archive}.sha256").write_text(f"{digest}  {self.archive.name}\n")
 
+    def test_total_payload_budget_is_separate_from_member_and_archive_limit(self):
+        with zipfile.ZipFile(self.archive) as source:
+            sizes = [entry.file_size for entry in source.infolist()]
+        total = sum(sizes)
+        member_limit = max(max(sizes), self.archive.stat().st_size)
+        self.assertGreater(total, member_limit)
+        with mock.patch.object(installer, "MAX_PAYLOAD", member_limit):
+            with mock.patch.object(installer, "MAX_TOTAL_PAYLOAD", total):
+                installer.verify_package(self.archive)
+            with mock.patch.object(installer, "MAX_TOTAL_PAYLOAD", total - 1):
+                with self.assertRaisesRegex(installer.InstallerError, "payload"):
+                    installer.verify_package(self.archive)
+        self.assertEqual(installer.MAX_PAYLOAD, 512 * 1024 * 1024)
+        self.assertEqual(installer.MAX_TOTAL_PAYLOAD, installer.pack.MAX_TOTAL_PAYLOAD)
+
     def test_valid_package_and_build_hashes_manifest_and_cleanup(self):
         verified = installer.verify_package(self.archive)
         self.assertEqual(verified.version, "0.4.7")

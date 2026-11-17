@@ -7,7 +7,7 @@ use flower::ai::{
     SPELLING_MODEL_CALLS, SPELLING_TIMEOUT_MS,
 };
 use flower::ai::{eligible_text, valid_correction};
-use flower::engine::{Lexicon, SpellingIndex};
+use flower::engine::SpellingIndex;
 use ort::{
     session::Session,
     tensor::TensorElementType,
@@ -94,7 +94,7 @@ impl Corrector {
             session,
             vocab,
             ids,
-            spelling: SpellingIndex::new(&Lexicon::builtin().map_err(failed)?),
+            spelling: SpellingIndex::builtin().map_err(failed)?,
         })
     }
 

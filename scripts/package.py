@@ -523,6 +523,7 @@ def _license_files_for_package(package: dict) -> list[Path]:
 DICTIONARY_SOURCE = "git+https://github.com/axflower/flower-dict.git?branch=main#d01e9ac5f6309e05344017ebce4680cf537854a9"
 DICTIONARY_NOTICE_SHA256 = "689de482c01fb308d0f04b9accc6875452070e2f645907f94f82609d35c82447"
 MAX_PAYLOAD = 512 * 1024 * 1024
+MAX_TOTAL_PAYLOAD = 1024 * 1024 * 1024
 VOCABULARY_PREFIX = "data/pinyin/vocabulary/"
 VOCABULARY_IDENTITIES = {
     "expanded.tsv": (59302671, "12669ecc1bda04813d5fdb9bd8196972ccbdca022f1b03050e217ae477043c34"),
@@ -1783,8 +1784,8 @@ def _build_payloads(
     for relative, data in sorted(payload.items()):
         checksum_lines.append(f"{_sha256(data)}  {relative}")
     payload["SHA256SUMS"] = ("\n".join(checksum_lines) + "\n").encode("utf-8")
-    if any(len(data) > MAX_PAYLOAD for data in payload.values()) or sum(map(len, payload.values())) > MAX_PAYLOAD:
-        raise PackagingError("包内 payload 超过 512 MiB")
+    if any(len(data) > MAX_PAYLOAD for data in payload.values()) or sum(map(len, payload.values())) > MAX_TOTAL_PAYLOAD:
+        raise PackagingError("包内单文件超过 512 MiB 或总 payload 超过 1024 MiB")
     return payload, top_level
 
 

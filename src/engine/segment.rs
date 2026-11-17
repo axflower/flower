@@ -1,4 +1,5 @@
 //! Explicit syllable boundaries; ASCII byte offsets are also raw input offsets.
+#[cfg(test)]
 pub(crate) fn valid_reading(reading: &str) -> bool {
     !reading.is_empty()
         && reading.len() <= 256

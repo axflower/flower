@@ -1,5 +1,222 @@
 # Flower Windows 验证记录
 
+## 0.5.8 完整离线包体积优化
+
+本轮继续基于 `4525227` 及已保留的首键修复，不恢复此前撤销的实验代码。
+合同为 `design/compact-builtin-index.md`，首键与快照边界继承
+`design/instant-first-input.md`。完整输入索引采用列式布局、共享读音、
+连续/显式 ID 和 BFS 隐式 child；运行期仍直接惰性查询，无全表解压或重建。
+设置程序改用完整保留合格记录的后台修复种子，不再携带完整输入索引。
+
+### 数据、功能与实际检查
+
+- 构建逐 entry、bucket、全部树边与终端对照原动态对象。保持 1,754,389 个
+  拼音键、2,088,650 条词条，以及文本、规范读音、权重、常用分类和顺序。
+  V2 索引 204,842,819 字节，SHA-256 为
+  `e6721232fec34ae1ffc0bd8460b58fe3032461fd4bd3bb528a78b38a79698cca`；
+  源 TSV 摘要仍为
+  `1ee69faf37c8a74705991222101ab584a5ad73bddbe77e14147996c429eb2c0b`。
+- 后台种子保留 2,056,201 条记录，原始 UTF-8 为 63,104,557 字节，SHA-256 为
+  `d027619cc393cbcade00965e706a80cf0c48f7e24daa5d29435b45ff3ffdb191`。
+  正式入口使用原文，由外层 ZIP/Inno 压缩；生产不额外解压或复制整份种子。
+  两工厂共用原插入、排序、去重及 top4 算法，构建游标仅复用相邻读音前缀。
+- 显式运行 seed/cursor 的 8 项测试均通过，含完整内置修复树对照。
+  所有节点、child、terminal 文本/读音/分数及顺序的完整指纹均为
+  `e54a1fdde58a82447b5f7bc44919767410ae84ad95f0852100a852def264fc80`。
+  分离计时的纯构建为原 Lexicon 工厂 1.666 秒、种子工厂含校验 1.730 秒；
+  不将指纹遍历和释放时间混入构建耗时。
+- 最终引擎实际命中 53 项：52 通过、1 项完整树对照默认 ignored；
+  该 ignored 项已在上述显式 8 项中执行通过。覆盖惰性正反序、实际访问预算、
+  overlay/学习隔离、宽 label，以及分组首字节探针的完整区间/非空检查。
+  未消费音节的坏 UTF-8 尾字节可延后验证，真正消费时仍拒绝。
+  一次早期错误筛选器命中 0 项，仅作为构建结果；随后已实际运行上述 53 项。
+- 消费者回归为 97 通过、3 项与下方未修改基线相同的失败、1 项真实模型默认 ignored。
+  另显式运行 `ai_inference::real_fixed_model_probe`，实际命中 1 项并通过，
+  用已核验的固定本地模型，无下载或在线 API。
+  原生首键/AI 后台三项通过；共用 Store 的 timer 夹具曾并行 setup 拒绝访问，
+  仅该项串行复测通过，不放宽生产行为或断言。
+- `cargo build --locked --offline --release --lib --bin flower-register
+  --bin flower-settings --example lexicon_probe --target x86_64-pc-windows-msvc`
+  成功；仍有原有导出 `PRIVATE` 的 LNK4104 提示。
+  `cargo clippy --offline --release --lib --tests --example lexicon_probe -- -D warnings`、
+  `cargo fmt --all -- --check` 及适配 CRLF 的 `git diff --check` 均通过。
+  组包/安装器代码未再改变，复用此前 96 通过、1 个符号链接环境跳过的证据。
+
+### 同机交错输入性能
+
+最终发布程序按 BAAB ABBA 顺序各运行四个新进程，固定公开负载，无用户输入。
+V1 探针保留自首键修复基线，原二进制版本为 0.5.4，运行期代码和索引对应
+0.5.7 的 V1；不伪称它是另行构建的 0.5.7 元数据。系统文件缓存未清除。
+
+| 指标（各进程结果的中位数） | V1 | 最终 V2 |
+| --- | ---: | ---: |
+| 基础初始化 | 15 μs | 22 μs |
+| 首个拼音按键 | 2.863 ms | 2.895 ms |
+| 小 overlay | 319 μs | 304.5 μs |
+| 暖查询 P50 | 64.05 μs | 68.40 μs |
+| 暖查询 P95 | 395.95 μs | 426.45 μs |
+| 引擎按键 P95 | 46.1042 ms | 46.28455 ms |
+| 引擎按键最大值 | 54.131 ms | 55.20775 ms |
+| 拼音键数 / 固定负载最大候选数 | 1,754,389 / 930 | 1,754,389 / 930 |
+
+核心输入时延接近基线：首键约增加 0.032 ms，按键 P95 约增加 0.18 ms。
+独立暖查询微基准 P95 增加 30.5 μs，未将其隐藏或声称所有指标零差异。
+V2 首次新进程首键曾测得 7.208 ms，其余三次为 2.869–2.905 ms；
+原始全部运行保留，未删除该值。该测量不是统计等价证明、物理磁盘冷启动
+或真实桌面切换验收。优化前分组重复解码造成约 3% 的按键差异，已局部修正；
+不以这些旧结果替代最终数据，也不将波动当作因果加速证据。
+
+### 完整制品与交付
+
+标准 `scripts/package.py`、`scripts/installer.py` 均成功，沿用 LZMA2、
+32 MiB 字典及 solid compression。未增加安装解压字典内存。
+
+| 制品 | 0.5.7 字节 | 0.5.8 字节 | 减少 |
+| --- | ---: | ---: | ---: |
+| ZIP | 282,245,884 | 168,948,789 | 40.14% |
+| 安装器 EXE | 213,744,496 | 144,439,708 | 32.42% |
+| 171 个文件展开载荷 | 731,045,496 | 437,279,063 | 40.18% |
+
+完整验包通过：外层摘要、包内清单/摘要、171 个文件集合及 164 个非程序/版本说明
+资产与旧包逐字节一致；README 与冻结的 `docs/distribution.md`、Cargo.lock
+逐字节一致。三个 PE 摘要对应最终 x64 Release 构建，DLL 为 207,585,280、
+settings 为 64,407,040、register 为 386,048 字节。完整片段检查确认 DLL
+含 V2 输入索引但无 raw seed，settings 含 raw seed 但无完整输入索引。
+
+两个 EXE 的 `--help` 均退出 0，27 个图标图像与源 ICO 相同。
+settings 独有 Common Controls / PerMonitorV2 / asInvoker 应用清单，
+DLL/register 不携带它；三个 PE 均为 `NotSigned`。
+安装器数值版本 0.5.8.0、图标、外部摘要、构建清单及来源 ZIP 关联均通过，
+安装器同为 `NotSigned`。
+
+| 交付目标 | SHA-256 |
+| --- | --- |
+| `dist/flower-0.5.8-windows-x64.zip` | `a95c2a9cd579e2286b354cbef509e39dd31eb3f02a7978462c4ed6ebdad6bf44` |
+| `dist/flower-0.5.8-windows-x64-setup.exe` | `e5d7a984d9210515973636e2819dad76b565a7a763262bac1bce9975449fcb0e` |
+
+随两制品交付各自 `.sha256` 和安装器 `.manifest.json`，保留 0.5.7 对照。
+复制后重新核对五文件与已验收 artifacts 的摘要一致。
+详细证据为 `package-0.5.8-verification.json`、`package-0.5.8-resources.json`、
+`installer-0.5.8-verification.json`、`compact-size-comparison.json` 和
+`delivery-0.5.8.json`。未运行安装器、注册、切换输入法或改动用户配置；
+实际桌面宿主及安装/卸载仍未验收。
+
+### 方案取舍与证据
+
+未采用额外 FOR 位打包：raw 大幅减少，但 deflate 仅再省约 3.32 MiB，
+不足以支持增加每次查询解码成本。未采用生产 seed 内层 zlib 解压：
+完整结构虽然等价，但增加后台初始化成本；最终改由外层容器压缩原文。
+模型、ORT、词库来源审计、许可及完全离线安装均保留，不降低模型精度。
+
+本 Thread artifacts 的 `compact-source-identities.json`、
+`compact-performance-final.json` 保存最终源文件和探针摘要及全部原始运行；
+`compact-performance.json`、`compact-performance-extended.json` 为局部优化前历史，
+不冒充最终性能结果。未注册、切换用户输入法或读取真实用户文档。
+
+## 切换后首次输入延迟修复
+
+本轮源码基线为 `4525227`（Cargo 版本 0.5.4），合同为
+`design/instant-first-input.md`。用户随后确认 `dist` 中 0.5.5/0.5.6 是已撤销实验修改
+构建的旧包，明确要求清理旧构建、使用当前源码重建。因此本次分发版本标为
+0.5.7，以当前保留的代码和首键修复为准，不恢复被撤销修改。
+
+原 Release `lexicon_probe` 在新进程中测得 `cold_load_us=8914070`，
+`pinyin_keys=1754389`，首个拼音事件同步进入该初始化；非空 overlay
+还会复制基础表并重建简拼/混拼索引。该测量未清除系统文件缓存，
+不是物理磁盘冷启动，也不等于用户宿主各阶段的完整耗时。
+
+修复将基础解析/去重/常用分类/索引生成与完整往返校验放到构建期，
+运行期建立内嵌只读视图。个人词条及学习只更新触及的 bucket/trie 路径。
+离线 AI 安全目录检查及客户端启动使用 activation 持有的后台任务；
+owner timer 非阻塞安装完成结果，失败不随每键重试，退出取消/join。
+
+隔离测试只使用固定公开输入、自有 TSF 文档和注入 Store/初始化器，
+不注册、安装、切换当前用户输入法或注入全局按键；不请求真实模型 API。
+
+### 已验证的结果
+
+- 完整构建逐项验证 1,754,389 个全拼 key、2,088,650 条词条、全部简拼 bucket
+  及 trie 边/终端的顺序与元数据。源 TSV SHA-256 为
+  `1ee69faf37c8a74705991222101ab584a5ad73bddbe77e14147996c429eb2c0b`，
+  索引为 `729da131c7879c2e32de6aa7a58dd83899e897b91f5d365540c756131f82595b`。
+- `cargo test --offline --release --lib engine::`：38 项通过。
+  覆盖完整词典权重/常用分类、字库查词可达、动态/只读索引等价、
+  overlay/学习隔离、混拼/补全统一预算及候选合同。
+  原常用词测试对每个词扫描全表，已改为同条件的一次收集后查询，
+  保留完整词条与分类断言，避免测试自身的重复全表扫描。
+- 原生过滤 `native_ai_startup` 与
+  `native_dormant_lexicon_prediction_and_first_real_input` 命中 3 项并通过。
+  生产首字母排队阻塞的初始化器时仍可提交个人词条；覆盖失败不重试、
+  timer→`ai_idle`、线程未退出不 join、activation 身份、取消及晚成功清理。
+- Release 新进程探针：`cold_load_us=50`、`first_pinyin_key_us=6196`、
+  `small_overlay_load_us=751`。初始约 8.9 秒的基础建表成本已移出运行期；
+  固定后续键工作负载 P95 约 48 ms，未宣称所有按键或实际宿主均达到同一耗时。
+  未清系统文件缓存，未将隔离引擎测量当作完整桌面切换验收。
+- 查询性能独立审查曾发现预算前物化整个 bucket/出边，返修为惰性视图后复审通过。
+  实际访问计数覆盖 8,192 项候选的 limit 0/1/4、4,096 分支的小预算，
+  及 2,050 边的正反序/分组；不是仅断言最终预算数字。
+- 消费者集成测试实际运行 93 项：90 项通过、3 项失败。通过范围包含
+  `lexicon_quality`、`local_completion`、`pinyin_sentence`、`pinyin_session`、
+  `short_spelling`、`single_initial`、`spelling_candidates`、`auto_phrases`、
+  `chinese_script`，以及调序/混拼中其余用例。
+  失败项为 `adaptive_input` 的
+  `builtin_ambiguities_promote_only_one_step_and_keep_raw_domains_separate`
+  （“时间/事件”位置断言），以及 `mixed_composition` 的
+  `core_mixed_ranks_are_measured_not_assumed_first`（`zhesm` 缺“这什么”）和
+  `builtin_cross_word_pairs_commit_full_and_mixed_with_canonical_learning`
+  （`jintianxx` 缺“今天学习”）。
+  已通过 `git archive HEAD` 在隔离副本还原未修改的 `4525227`，
+  使用副本独立 target 复测：同一调序单例失败、混拼 4 项中同样 2 项失败，
+  位置及断言一致。未改这些既有行为或放宽测试，不把整套消费者标为全绿。
+- Release 默认 `panic=abort` 与集成测试 unwind 构建曾触发同名库产物冲突及链接失败；
+  仅在测试命令增加 `--config 'profile.release.panic="unwind"'` 后完成上述运行。
+  产品 Cargo profile 保持原样。`cargo fmt --all -- --check`、
+  `git diff --check` 和
+  `cargo clippy --offline --release --lib --tests --example lexicon_probe -- -D warnings`
+  均通过。复审后仅将测试计数器设为 const 初始化、旧仅供测试的 reading helper
+  标为 `cfg(test)`，不改变生产查询或上述指标的适用性。
+
+只读索引采用未压缩偏移编码，大小为 280,859,706 字节；以较大的内嵌数据
+换取直接查询和共享映射，新包体积见下方重构包记录，不宣称分发包瘦身。
+源码、索引及探针摘要保存在本 Thread artifacts 的 `first-input-after.json`。
+后续按用户授权重建分发包；用户真实宿主、注册/启用/安装/卸载仍属独立验收。
+
+### 0.5.7 清理与重构包
+
+用户明确要求删除旧构建并以当前代码重建，已清理 `dist` 中 44 个旧分发文件。
+清理前对旧 0.5.4 ZIP 完整验包，并将固定九文件 AI 资产单独校验保留；
+没有恢复旧实验代码，也没有重新下载或替换模型。旧文件清单和摘要保存在
+本 Thread artifacts 的 `rebuild-preparation.json`。
+
+`cargo build --locked --offline --release --lib --bin flower-register --bin flower-settings
+--target x86_64-pc-windows-msvc` 及标准 `scripts/package.py`、`scripts/installer.py`
+均成功。三个 PE 合计 566,146,048 字节，完整展开载荷为 731,045,496 字节，
+因此构建器/安装器的总载荷预算调整为 1 GiB；单文件和压缩 ZIP 仍为 512 MiB，
+AI 子载荷仍为 256 MiB，资产白名单、摘要与路径门禁未放宽。
+
+组包/安装器测试实际运行 97 项，96 项通过、1 项因当前环境不能创建符号链接而跳过。
+新增小型 ZIP fixture 验证总预算边界：恰等于预算时通过，少一字节时拒绝，
+独立于单文件/压缩 ZIP 限额。复用上一节未受影响的输入功能与性能证据，
+没有把版本元数据及组包改动当作重跑全仓功能测试的理由。
+
+新 ZIP 的 171 个文件、外层摘要、包内摘要/manifest、词库和 AI 许可均已校验；
+随包 README 与冻结的 `docs/distribution.md`、Cargo.lock 逐字节相同，
+三个程序与此次 Release 构建摘要相同。两个 EXE 的 `--help` 均退出 0，
+27 个图标图像与源 ICO 相同。设置应用清单只存在于 settings，
+不进入 TSF DLL/register；安装器数值版本为 0.5.7.0，图标资源存在。
+三个基础 PE 和安装器均为 `NotSigned`。
+
+| 交付目标 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `dist/flower-0.5.7-windows-x64-setup.exe` | 213,744,496 | `67f9eb977b26ad4773d492ff3be8a0968c1000cbcb13d78213a0d26913edf331` |
+| `dist/flower-0.5.7-windows-x64.zip` | 282,245,884 | `b2aaa166719bbd66b1d183242dcfe73a60ce5d8257a0701a7094f05c252ca29b` |
+
+`dist` 只交付本次版本的 ZIP、EXE、各自 `.sha256` 和安装器来源清单。
+详细验包及资源证据位于本 Thread artifacts 的 `package-0.5.7-verification.json`、
+`package-0.5.7-resources.json`、`installer-0.5.7-verification.json`。
+未运行安装器、未修改注册/用户启用状态，也未覆盖在用 DLL；
+这是未签名测试包，不标为已完成真实桌面或安装/卸载验收的正式发行。
+
 ## 0.5.4 候选间距、AI 功能页与未上屏本地补全
 
 本轮合同为 `design/candidate-spacing-and-local-completion.md`。

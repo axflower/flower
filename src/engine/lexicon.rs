@@ -6,44 +6,27 @@ use super::{Candidate, EngineError};
 #[cfg(test)]
 const BUILTIN_LEXICON: &str = flower_dict::DEFAULT_TSV;
 
-include!(concat!(env!("OUT_DIR"), "/builtin-dictionary.rs"));
-const BUILTIN_COMPRESSED: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/builtin-dictionary.zlib"));
+#[allow(dead_code)]
+#[path = "../../build_support/lexicon_index.rs"]
+mod index;
+use index::rank as rank_entries;
+use index::{Entry, EntryRef as LexiconEntry, Table, Trie as SyllableTrie};
+const BUILTIN_INDEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/builtin-dictionary.idx"));
 
-fn builtin_dictionary_bytes(data: &[u8]) -> Result<Vec<u8>, EngineError> {
-    use sha2::{Digest, Sha256};
-    let bytes = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(data, BUILTIN_SIZE)
-        .map_err(|_| EngineError::InvalidUtf8 {
-            message: "compressed builtin dictionary is corrupt".into(),
-        })?;
-    if bytes.len() != BUILTIN_SIZE || <[u8; 32]>::from(Sha256::digest(&bytes)) != BUILTIN_SHA256 {
-        return Err(EngineError::InvalidUtf8 {
-            message: "builtin dictionary size or digest does not match".into(),
-        });
-    }
-    Ok(bytes)
-}
-
+#[cfg(test)]
 const EVERYDAY_PHRASES: &str = flower_dict::EVERYDAY_TSV;
 
 // Project-maintained usage prior, NOT corpus frequency or new readings.
 // Exact pairs prevent a future additional reading inheriting the classification.
+#[cfg(test)]
 const EVERYDAY_PAIRS: &str = flower_dict::COMMON_USAGE_PAIRS;
 
 const EVERYDAY_RANKING_FLOOR: u32 = 16384;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LexiconEntry {
-    text: String,
-    weight: u32,
-    reading: String,
-    everyday: bool,
-}
-
-impl LexiconEntry {
+impl LexiconEntry<'_> {
     fn choice(&self, consumed: usize) -> super::decoder::Choice {
         let mut choice = super::decoder::Choice::word(
-            Candidate::new(&self.text, &self.reading),
+            Candidate::new(self.text, self.reading),
             consumed,
             self.weight,
         );
@@ -59,21 +42,6 @@ impl LexiconEntry {
     }
 }
 
-fn rank_entries(left: &LexiconEntry, right: &LexiconEntry) -> std::cmp::Ordering {
-    let score = |entry: &LexiconEntry| {
-        if entry.everyday {
-            entry.weight.max(EVERYDAY_RANKING_FLOOR)
-        } else {
-            entry.weight
-        }
-    };
-    score(right)
-        .cmp(&score(left))
-        .then_with(|| right.weight.cmp(&left.weight))
-        .then_with(|| left.text.cmp(&right.text))
-        .then_with(|| left.reading.cmp(&right.reading))
-}
-
 /// A deterministic, exact-match Pinyin lexicon.
 ///
 /// TSV rows use three tab-separated UTF-8 fields:
@@ -82,8 +50,8 @@ fn rank_entries(left: &LexiconEntry, right: &LexiconEntry) -> std::cmp::Ordering
 #[derive(Debug, Clone)]
 pub struct Lexicon {
     dormant: bool,
-    entries: Arc<HashMap<String, Vec<LexiconEntry>>>,
-    initials: Arc<HashMap<String, Vec<LexiconEntry>>>,
+    entries: Arc<Table>,
+    initials: Arc<Table>,
     syllables: Arc<SyllableTrie>,
 }
 
@@ -109,61 +77,6 @@ mod everyday_pair_tests {
 }
 
 const MIXED_BUDGET: usize = 4096;
-
-#[derive(Debug, Clone, Default)]
-struct SyllableNode {
-    edges: std::collections::BTreeMap<u8, Vec<(String, usize)>>,
-    words: Vec<LexiconEntry>,
-}
-
-#[derive(Debug, Clone)]
-struct SyllableTrie {
-    nodes: Vec<SyllableNode>,
-}
-
-impl SyllableTrie {
-    fn build(entries: &HashMap<String, Vec<LexiconEntry>>) -> Self {
-        let mut trie = Self {
-            nodes: vec![SyllableNode::default()],
-        };
-        // Sort before insertion so the bounded traversal is independent of HashMap seeds.
-        let mut words: Vec<_> = entries.values().flatten().collect();
-        words.sort_by(|a, b| a.reading.cmp(&b.reading).then_with(|| rank_entries(a, b)));
-        for word in words {
-            let syllables: Vec<_> = word.reading.split('\'').collect();
-            if syllables.len() < 2 || syllables.len() != word.text.chars().count() {
-                continue;
-            }
-            let mut node = 0;
-            for syllable in syllables {
-                let first = syllable.as_bytes()[0];
-                let next = trie.nodes[node]
-                    .edges
-                    .get(&first)
-                    .and_then(|edges| edges.iter().find(|(s, _)| s == syllable))
-                    .map(|(_, next)| *next);
-                node = match next {
-                    Some(next) => next,
-                    None => {
-                        let next = trie.nodes.len();
-                        trie.nodes.push(SyllableNode::default());
-                        trie.nodes[node]
-                            .edges
-                            .entry(first)
-                            .or_default()
-                            .push((syllable.to_owned(), next));
-                        next
-                    }
-                };
-            }
-            trie.nodes[node].words.push(word.clone());
-        }
-        for node in &mut trie.nodes {
-            node.words.sort_by(rank_entries);
-        }
-        trie
-    }
-}
 
 static BUILTIN: OnceLock<Result<Lexicon, EngineError>> = OnceLock::new();
 
@@ -242,11 +155,14 @@ impl Lexicon {
                 }
                 continue;
             }
-            if let Some(edges) = self.syllables.nodes[node]
-                .edges
-                .get(&raw.as_bytes()[offset])
+            let node_view = self.syllables.node(node);
             {
-                for (syllable, next) in edges.iter().rev() {
+                for (syllable, next) in node_view
+                    .edges
+                    .group(raw.as_bytes()[offset])
+                    .rev()
+                    .take(budget.0)
+                {
                     if budget.0 == 0 {
                         break;
                     }
@@ -257,7 +173,7 @@ impl Lexicon {
                             end += 1;
                         }
                         if prefixes.len() + inspected < PREFIX_BUDGET {
-                            prefixes.push((*next, end, syllables + 1));
+                            prefixes.push((next, end, syllables + 1));
                         }
                     }
                 }
@@ -265,7 +181,7 @@ impl Lexicon {
         }
         let mut stack: Vec<_> = roots.into_iter().map(|n| (n, false)).collect();
         let mut seen = std::collections::HashSet::new();
-        let mut best: Option<&LexiconEntry> = None;
+        let mut best: Option<LexiconEntry<'_>> = None;
         inspected = 0;
         while let Some((node, extended)) = stack.pop() {
             if !seen.insert((node, extended)) {
@@ -277,31 +193,26 @@ impl Lexicon {
             budget.1 -= 1;
             inspected += 1;
             if extended {
-                for entry in &self.syllables.nodes[node].words {
+                for entry in self.syllables.node(node).words.into_iter().take(budget.1) {
                     if budget.1 == 0 {
                         break;
                     }
                     budget.1 -= 1;
                     inspected += 1;
                     if entry.text.chars().count() <= 64
-                        && best.map_or(true, |old| rank_entries(entry, old).is_lt())
+                        && best.map_or(true, |old| rank_entries(&entry, &old).is_lt())
                     {
                         best = Some(entry);
                     }
                 }
             }
-            for (_, next) in self.syllables.nodes[node]
-                .edges
-                .values()
-                .rev()
-                .flat_map(|edges| edges.iter().rev())
-            {
+            for (_, next) in self.syllables.node(node).edges.iter().rev().take(budget.1) {
                 if budget.1 == 0 {
                     break;
                 }
                 budget.1 -= 1;
                 if stack.len() + inspected < DESCENDANT_BUDGET {
-                    stack.push((*next, true));
+                    stack.push((next, true));
                 }
             }
         }
@@ -320,44 +231,23 @@ impl Lexicon {
         self.entries
             .values()
             .flatten()
-            .map(|entry| (entry.reading.as_str(), entry.text.as_str(), entry.weight))
+            .map(|entry| (entry.reading, entry.text, entry.weight))
     }
 
     /// Loads shared base/core/everyday and all curated category tables.
     pub fn builtin() -> Result<Self, EngineError> {
         BUILTIN
             .get_or_init(|| {
-                let bytes = builtin_dictionary_bytes(BUILTIN_COMPRESSED)?;
-                let text =
-                    std::str::from_utf8(&bytes).map_err(|error| EngineError::InvalidUtf8 {
-                        message: error.to_string(),
+                let base =
+                    index::Index::open(BUILTIN_INDEX).ok_or_else(|| EngineError::InvalidUtf8 {
+                        message: "invalid builtin index header".into(),
                     })?;
-                let mut entries = Self::parse_entries(text)?;
-                drop(bytes);
-                let words: std::collections::HashSet<_> = EVERYDAY_PAIRS
-                    .split_whitespace()
-                    .filter_map(|pair| pair.split_once('='))
-                    .collect();
-                let phrases: std::collections::HashSet<_> = EVERYDAY_PHRASES
-                    .lines()
-                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                    .filter_map(|line| {
-                        let mut fields = line.split('\t');
-                        Some((fields.next()?, fields.next()?))
-                    })
-                    .collect();
-                for candidates in entries.values_mut() {
-                    for entry in candidates.iter_mut() {
-                        let syllables = entry.reading.split('\'').count();
-                        entry.everyday = syllables >= 2
-                            && syllables == entry.text.chars().count()
-                            && (words.contains(&(entry.reading.as_str(), entry.text.as_str()))
-                                || phrases
-                                    .contains(&(entry.reading.as_str(), entry.text.as_str())));
-                    }
-                    candidates.sort_by(rank_entries);
-                }
-                Ok(Self::from_entries(entries))
+                Ok(Self {
+                    dormant: false,
+                    entries: Arc::new(Table::indexed(base, 24)),
+                    initials: Arc::new(Table::indexed(base, 32)),
+                    syllables: Arc::new(SyllableTrie::indexed(base)),
+                })
             })
             .clone()
     }
@@ -378,131 +268,20 @@ impl Lexicon {
         self.dormant
     }
 
-    fn parse_entries(tsv: &str) -> Result<HashMap<String, Vec<LexiconEntry>>, EngineError> {
-        let tsv = tsv.strip_prefix('\u{feff}').unwrap_or(tsv);
-        let mut entries: HashMap<String, Vec<LexiconEntry>> = HashMap::new();
-
-        for (index, raw_line) in tsv.lines().enumerate() {
-            let line_number = index + 1;
-            let line = raw_line.trim_end_matches('\r');
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            let mut fields = line.split('\t');
-            let key = fields.next().unwrap_or_default().trim();
-            let text = match fields.next() {
-                Some(value) => value.trim(),
-                None => {
-                    return Err(EngineError::invalid_line(
-                        line_number,
-                        "expected pinyin, text, and weight fields",
-                    ))
-                }
-            };
-            let weight = match fields.next() {
-                Some(value) => value.trim(),
-                None => {
-                    return Err(EngineError::invalid_line(
-                        line_number,
-                        "missing weight field",
-                    ))
-                }
-            };
-            if fields.next().is_some() {
-                return Err(EngineError::invalid_line(
-                    line_number,
-                    "expected exactly three tab-separated fields",
-                ));
-            }
-
-            if !super::segment::valid_reading(key) {
-                return Err(EngineError::invalid_line(
-                    line_number,
-                    "pinyin must contain lowercase ASCII syllables separated by apostrophes",
-                ));
-            }
-            if text.is_empty() {
-                return Err(EngineError::invalid_line(
-                    line_number,
-                    "candidate text must not be empty",
-                ));
-            }
-            if text.chars().any(char::is_control) {
-                return Err(EngineError::invalid_line(
-                    line_number,
-                    "candidate text must not contain control characters",
-                ));
-            }
-
-            let weight: u32 = weight.parse().map_err(|_| {
-                EngineError::invalid_line(line_number, "weight must be an unsigned 32-bit integer")
-            })?;
-            if weight == 0 {
-                return Err(EngineError::invalid_line(
-                    line_number,
-                    "weight must be greater than zero",
-                ));
-            }
-
-            entries
-                .entry(key.replace('\'', ""))
-                .or_default()
-                .push(LexiconEntry {
-                    text: text.to_owned(),
-                    weight,
-                    reading: key.to_owned(),
-                    everyday: false,
-                });
-        }
-
-        if entries.is_empty() {
-            return Err(EngineError::EmptyLexicon);
-        }
-
-        for candidates in entries.values_mut() {
-            // Group equal text before weight ordering: equal text with different
-            // weights need not be adjacent in a weight-first sorted list.
-            candidates.sort_by(|left, right| {
-                left.text
-                    .cmp(&right.text)
-                    .then_with(|| left.reading.cmp(&right.reading))
-                    .then_with(|| right.weight.cmp(&left.weight))
-            });
-            candidates
-                .dedup_by(|left, right| left.text == right.text && left.reading == right.reading);
-            candidates.sort_by(rank_entries);
-        }
-
-        Ok(entries)
+    fn parse_entries(tsv: &str) -> Result<HashMap<String, Vec<Entry>>, EngineError> {
+        index::parse(tsv).map_err(|error| match error {
+            index::ParseError::Empty => EngineError::EmptyLexicon,
+            index::ParseError::Line(line, message) => EngineError::invalid_line(line, message),
+        })
     }
 
-    fn from_entries(entries: HashMap<String, Vec<LexiconEntry>>) -> Self {
+    fn from_entries(entries: HashMap<String, Vec<Entry>>) -> Self {
         Self {
             dormant: false,
-            initials: Arc::new(Self::build_initials(&entries)),
+            initials: Arc::new(Table::dynamic(index::initials(&entries))),
             syllables: Arc::new(SyllableTrie::build(&entries)),
-            entries: Arc::new(entries),
+            entries: Arc::new(Table::dynamic(entries)),
         }
-    }
-
-    fn build_initials(
-        entries: &HashMap<String, Vec<LexiconEntry>>,
-    ) -> HashMap<String, Vec<LexiconEntry>> {
-        let mut initials: HashMap<String, Vec<LexiconEntry>> = HashMap::new();
-        for entry in entries.values().flatten() {
-            let syllables: Vec<_> = entry.reading.split('\'').collect();
-            if syllables.len() != entry.text.chars().count() {
-                continue;
-            }
-            let key: String = syllables.iter().map(|s| s.as_bytes()[0] as char).collect();
-            initials.entry(key).or_default().push(entry.clone());
-        }
-        for words in initials.values_mut() {
-            words.sort_by(rank_entries);
-        }
-        initials
     }
 
     pub(crate) fn initial_choices(&self, raw: &str) -> Vec<super::decoder::Choice> {
@@ -578,28 +357,33 @@ impl Lexicon {
                 continue;
             }
             if abbreviated > 0 && matches.len() < MIXED_BUDGET {
-                for entry in &self.syllables.nodes[node].words {
+                for entry in self
+                    .syllables
+                    .node(node)
+                    .words
+                    .into_iter()
+                    .take(MIXED_BUDGET - matches.len())
+                {
                     if matches.len() == MIXED_BUDGET {
                         break;
                     }
                     matches.push((entry, abbreviated, offset));
                 }
             }
-            if offset == raw.len() {
+            if offset == raw.len() || admitted == MIXED_BUDGET || *expanded == total_limit {
                 continue;
             }
-            let Some(edges) = self.syllables.nodes[node]
-                .edges
-                .get(&raw.as_bytes()[offset])
-            else {
-                continue;
-            };
-            for (syllable, next) in edges {
+            let node_view = self.syllables.node(node);
+            let mut edges = node_view.edges.group(raw.as_bytes()[offset]);
+            while admitted < MIXED_BUDGET && *expanded < total_limit {
+                let Some((syllable, next)) = edges.next() else {
+                    break;
+                };
                 for abbreviated_edge in [true, false] {
                     let token = if abbreviated_edge {
                         &syllable[..1]
                     } else {
-                        syllable.as_str()
+                        syllable
                     };
                     // A one-letter syllable is full, not an abbreviation.
                     if abbreviated_edge && syllable.len() == 1 {
@@ -618,7 +402,7 @@ impl Lexicon {
                     admitted += 1;
                     *expanded += 1;
                     stack.push((
-                        *next,
+                        next,
                         end,
                         full + usize::from(!abbreviated_edge),
                         abbreviated + usize::from(abbreviated_edge),
@@ -634,7 +418,7 @@ impl Lexicon {
         let mut seen = std::collections::HashSet::new();
         matches
             .into_iter()
-            .filter(|(entry, _, end)| seen.insert((&entry.text, &entry.reading, *end)))
+            .filter(|(entry, _, end)| seen.insert((entry.text, entry.reading, *end)))
             .map(|(entry, abbreviated, end)| {
                 let mut choice = entry.choice(end);
                 choice.abbreviated = abbreviated;
@@ -808,7 +592,7 @@ impl Lexicon {
         raw: &str,
         queries: &mut usize,
         limit: usize,
-    ) -> Vec<&LexiconEntry> {
+    ) -> Vec<LexiconEntry<'_>> {
         if !(4..=24).contains(&raw.len())
             || !raw.bytes().all(|b| b.is_ascii_lowercase())
             || *queries >= limit
@@ -850,14 +634,14 @@ impl Lexicon {
             *queries += 1;
             let key = std::str::from_utf8(key).expect("lowercase ASCII spelling");
             if let Some(entries) = self.entries.get(key) {
-                words.extend(entries.iter().filter(|entry| {
+                words.extend(entries.into_iter().filter(|entry| {
                     (2..=4).contains(&entry.text.chars().count())
                         && entry
                             .text
                             .chars()
                             .all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
                         && entry.reading.split('\'').count() == entry.text.chars().count()
-                        && super::single_spelling_edit(raw, &entry.reading)
+                        && super::single_spelling_edit(raw, entry.reading)
                 }));
             }
         }
@@ -865,7 +649,7 @@ impl Lexicon {
         let mut seen = std::collections::HashSet::new();
         words
             .into_iter()
-            .filter(|entry| seen.insert(entry.text.as_str()))
+            .filter(|entry| seen.insert(entry.text))
             .take(4)
             .collect()
     }
@@ -880,7 +664,7 @@ impl Lexicon {
         if self.entries.contains_key(raw) {
             return Vec::new();
         }
-        let eligible = |entry: &&LexiconEntry| {
+        let eligible = |entry: &LexiconEntry<'_>| {
             (1..=4).contains(&entry.text.chars().count())
                 && entry
                     .text
@@ -898,13 +682,13 @@ impl Lexicon {
             if self
                 .entries
                 .get(&raw[..split])
-                .is_some_and(|words| words.iter().any(|word| eligible(&word)))
+                .is_some_and(|words| words.into_iter().any(|word| eligible(&word)))
             {
                 queries += 1;
                 if self
                     .entries
                     .get(&raw[split..])
-                    .is_some_and(|words| words.iter().any(|word| eligible(&word)))
+                    .is_some_and(|words| words.into_iter().any(|word| eligible(&word)))
                 {
                     return Vec::new();
                 }
@@ -923,7 +707,7 @@ impl Lexicon {
                 }
                 queries += 1;
                 if let Some(entries) = self.entries.get(exact) {
-                    let entries: Vec<_> = entries.iter().filter(eligible).take(4).collect();
+                    let entries: Vec<_> = entries.into_iter().filter(eligible).take(4).collect();
                     if !entries.is_empty() {
                         splits.push((exact.len(), split, exact_first, entries));
                     }
@@ -965,7 +749,7 @@ impl Lexicon {
                             entry.text.chars().count(),
                         )
                     };
-                    candidates.push((score(left) + score(right), text, reading));
+                    candidates.push((score(&left) + score(&right), text, reading));
                 }
             }
         }
@@ -992,50 +776,83 @@ impl Lexicon {
         if tsv.trim().is_empty() {
             return Ok(self.clone());
         }
-        let overlay = Self::from_tsv(tsv)?;
+        let overlay = Self::parse_entries(tsv)?;
         let mut result = self.clone();
-        let table = Arc::make_mut(&mut result.entries);
-        for (key, additions) in overlay.entries.iter() {
-            let entries = table.entry(key.clone()).or_default();
-            for addition in additions {
-                if let Some(existing) = entries
-                    .iter_mut()
-                    .find(|entry| entry.text == addition.text && entry.reading == addition.reading)
-                {
-                    existing.weight = existing.weight.max(addition.weight);
-                } else {
-                    entries.push(addition.clone());
-                }
+        let mut additions: Vec<_> = overlay.into_values().flatten().collect();
+        additions.sort_by(|a, b| {
+            a.reading
+                .cmp(&b.reading)
+                .then_with(|| index::rank_owned(a, b))
+        });
+        for mut addition in additions {
+            if let Some(old) = result
+                .entries
+                .get(&addition.reading.replace('\'', ""))
+                .and_then(|words| {
+                    words
+                        .into_iter()
+                        .find(|e| e.text == addition.text && e.reading == addition.reading)
+                })
+            {
+                addition.weight = addition.weight.max(old.weight);
+                addition.everyday = old.everyday;
             }
-            entries.sort_by(rank_entries);
+            result.replace_entry(addition);
         }
-        result.initials = Arc::new(Self::build_initials(table));
-        result.syllables = Arc::new(SyllableTrie::build(table));
         Ok(result)
+    }
+
+    /// Replace a single logical word in all lanes, copying only touched buckets
+    /// and trie paths; no layer gets an independent traversal budget.
+    fn replace_entry(&mut self, entry: Entry) {
+        let key = entry.reading.replace('\'', "");
+        let replace = |table: &mut Table, key: String| {
+            let mut words: Vec<_> = table
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .map(LexiconEntry::owned)
+                .collect();
+            if let Some(old) = words
+                .iter_mut()
+                .find(|e| e.text == entry.text && e.reading == entry.reading)
+            {
+                *old = entry.clone();
+            } else {
+                words.push(entry.clone());
+            }
+            words.sort_by(index::rank_owned);
+            table.replace(key, words);
+        };
+        replace(Arc::make_mut(&mut self.entries), key);
+        let syllables: Vec<_> = entry.reading.split('\'').collect();
+        if syllables.len() == entry.text.chars().count() {
+            let key = syllables.iter().map(|s| s.as_bytes()[0] as char).collect();
+            replace(Arc::make_mut(&mut self.initials), key);
+        }
+        Arc::make_mut(&mut self.syllables).put(entry);
     }
 
     /// Bounded local adjustment; never creates a word absent from the active dictionary.
     pub fn with_learning(&self, events: &[(super::LearningEvent, u32)]) -> Self {
-        if events.is_empty() {
-            return self.clone();
-        }
         let mut result = self.clone();
-        let table = Arc::make_mut(&mut result.entries);
         for (event, count) in events {
-            if let Some(entries) = table.get_mut(&event.pinyin.replace('\'', "")) {
-                for entry in entries
-                    .iter_mut()
-                    .filter(|e| e.text == event.text && e.reading == event.pinyin)
-                {
-                    entry.weight = entry
-                        .weight
-                        .saturating_add(count.saturating_mul(512).min(8192));
-                }
-                entries.sort_by(rank_entries);
+            let word = result
+                .entries
+                .get(&event.pinyin.replace('\'', ""))
+                .and_then(|words| {
+                    words
+                        .into_iter()
+                        .find(|e| e.text == event.text && e.reading == event.pinyin)
+                })
+                .map(LexiconEntry::owned);
+            if let Some(mut word) = word {
+                word.weight = word
+                    .weight
+                    .saturating_add(count.saturating_mul(512).min(8192));
+                result.replace_entry(word);
             }
         }
-        result.initials = Arc::new(Self::build_initials(table));
-        result.syllables = Arc::new(SyllableTrie::build(table));
         result
     }
 
@@ -1050,8 +867,8 @@ impl Lexicon {
             .get(&compact)
             .into_iter()
             .flatten()
-            .filter(|entry| super::segment::boundaries_match(raw, &entry.reading))
-            .filter(|entry| seen.insert(entry.text.clone()))
+            .filter(|entry| super::segment::boundaries_match(raw, entry.reading))
+            .filter(|entry| seen.insert(entry.text))
             .take(limit)
             .map(|entry| entry.choice(raw.len()))
             .collect()
@@ -1096,20 +913,188 @@ impl Lexicon {
 mod tests {
     use super::*;
 
+    fn indexed_fixture(tsv: &str) -> Lexicon {
+        let bytes = index::encode(&Lexicon::parse_entries(tsv).unwrap());
+        // Fixture lifetime only: production uses include_bytes, not a leaked allocation.
+        let base = index::Index::open(Box::leak(bytes.into_boxed_slice())).unwrap();
+        Lexicon {
+            dormant: false,
+            entries: Arc::new(Table::indexed(base, 24)),
+            initials: Arc::new(Table::indexed(base, 32)),
+            syllables: Arc::new(SyllableTrie::indexed(base)),
+        }
+    }
+
+    fn assert_queries_equal(a: &Lexicon, b: &Lexicon) {
+        let keys: std::collections::BTreeSet<_> =
+            a.entries.keys().chain(b.entries.keys()).collect();
+        for key in keys {
+            assert_eq!(a.lookup(key), b.lookup(key), "{key}");
+        }
+        for raw in [
+            "nh",
+            "nih",
+            "ni'h",
+            "nhao",
+            "junbj",
+            "junbujian",
+            "jun'bu'jian",
+            "aoe",
+            "xian",
+            "xi'an",
+        ] {
+            assert_eq!(
+                format!("{:?}", a.initial_choices(raw)),
+                format!("{:?}", b.initial_choices(raw)),
+                "initial {raw}"
+            );
+            assert_eq!(
+                format!("{:?}", a.single_initial_choices(raw)),
+                format!("{:?}", b.single_initial_choices(raw)),
+                "single initial {raw}"
+            );
+            for limit in [1, 4, 17, MIXED_BUDGET] {
+                let (mut ae, mut be) = (0, 0);
+                assert_eq!(
+                    format!("{:?}", a.mixed_prefix_choices(raw, &mut ae, limit)),
+                    format!("{:?}", b.mixed_prefix_choices(raw, &mut be, limit)),
+                    "mixed {raw} {limit}"
+                );
+                assert_eq!(ae, be);
+            }
+            for budget in [(512, 4096), (3, 7), (30, 12)] {
+                let (mut ab, mut bb) = (budget, budget);
+                assert_eq!(
+                    format!("{:?}", a.completion_choice(raw, &mut ab)),
+                    format!("{:?}", b.completion_choice(raw, &mut bb)),
+                    "completion {raw} {budget:?}"
+                );
+                assert_eq!(ab, bb);
+            }
+            assert_eq!(
+                format!("{:?}", a.graph_choices(raw, 4)),
+                format!("{:?}", b.graph_choices(raw, 4))
+            );
+        }
+    }
+
     #[test]
-    fn compressed_builtin_preserves_exact_bytes_and_rejects_corruption() {
-        let bytes = builtin_dictionary_bytes(BUILTIN_COMPRESSED).unwrap();
-        assert_eq!(bytes, BUILTIN_LEXICON.as_bytes());
-        assert!(BUILTIN_COMPRESSED.len() < bytes.len() / 2);
-        assert!(
-            builtin_dictionary_bytes(&BUILTIN_COMPRESSED[..BUILTIN_COMPRESSED.len() / 2]).is_err()
+    fn indexed_fixture_preserves_dynamic_queries_and_layered_budgets() {
+        let tsv = "ni'hao\t你好\t100\nni'hao\t拟好\t40\nni'hao\t你好\t2\nni\t你\t90\nna\t那\t80\njun'bu'jian'ren\t君不见人\t300\njun'bu'jian'tian\t君不见天\t200\na'o'e'he\t阿哦额和\t10\nxi'an\t西安\t20\nxian\t先\t21";
+        let indexed = indexed_fixture(tsv);
+        assert!(indexed.entries.pristine_index());
+        assert!(indexed.initials.pristine_index());
+        assert!(indexed.syllables.pristine_index());
+        let dynamic = Lexicon::from_tsv(tsv).unwrap();
+        assert_queries_equal(&indexed, &dynamic);
+        let overlay = "ni'hao\t你好\t400\nni'hao\t私好\t500\njun'bo'jian'ren\t君拨见人\t600\njun'bu'jian'di\t君不见地\t700";
+        let patched = indexed.with_overlay(overlay).unwrap();
+        assert_eq!(patched.entries.patch_len(), 3);
+        assert!(indexed.entries.pristine_index());
+        assert!(indexed.initials.pristine_index());
+        assert!(indexed.syllables.pristine_index());
+        let rebuilt = Lexicon::from_tsv(&format!("{tsv}\n{overlay}")).unwrap();
+        assert_queries_equal(&patched, &rebuilt);
+        assert_queries_equal(&indexed, &dynamic);
+        assert_eq!(patched.len(), rebuilt.len());
+        let events = [(
+            super::super::LearningEvent {
+                pinyin: "ni'hao".into(),
+                text: "拟好".into(),
+            },
+            2,
+        )];
+        assert_queries_equal(
+            &patched.with_learning(&events),
+            &rebuilt.with_learning(&events),
         );
-        let wrong = miniz_oxide::deflate::compress_to_vec_zlib(b"wrong dictionary", 1);
-        assert!(builtin_dictionary_bytes(&wrong).is_err());
-        let mut corrupt = BUILTIN_COMPRESSED.to_vec();
-        let last = corrupt.len() - 1;
-        corrupt[last] ^= 1;
-        assert!(builtin_dictionary_bytes(&corrupt).is_err());
+        assert_queries_equal(&indexed, &dynamic);
+        assert_eq!(patched.lookup("nihao")[0].text, "私好");
+        let repeated = patched.with_overlay("ni'hao\t你好\t1").unwrap();
+        assert_eq!(
+            repeated
+                .entries
+                .get("nihao")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.text == "你好")
+                .unwrap()
+                .weight,
+            400
+        );
+    }
+
+    #[test]
+    fn lazy_large_buckets_decode_only_requested_candidates() {
+        let mut tsv = String::new();
+        for i in 0..8192u32 {
+            let character = char::from_u32(0x4e00 + i).unwrap();
+            tsv.push_str(&format!("ni'hao\t你{character}\t{}\n", i + 1));
+        }
+        let indexed = indexed_fixture(&tsv);
+        let dynamic = Lexicon::from_tsv(&tsv).unwrap();
+        let patched = indexed.with_overlay("ni'hao\t你好\t99999").unwrap();
+        for lexicon in [&indexed, &dynamic, &patched] {
+            for limit in [0, 1, 4] {
+                index::metrics::reset();
+                let choices = lexicon.initial_choices_limited("nh", limit);
+                assert_eq!(choices.len(), limit);
+                assert_eq!(index::metrics::get().words, limit, "initial limit {limit}");
+                index::metrics::reset();
+                let choices = lexicon.exact_choices_limited("nihao", limit);
+                assert_eq!(choices.len(), limit);
+                assert_eq!(index::metrics::get().words, limit, "exact limit {limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_large_fanout_decoding_obeys_small_query_budgets() {
+        let mut tsv = String::new();
+        for i in 0..4096u32 {
+            let (a, b, c) = ((i / 676) as u8, ((i / 26) % 26) as u8, (i % 26) as u8);
+            let suffix = [b'h', b'a' + a, b'a' + b, b'a' + c];
+            let syllable = std::str::from_utf8(&suffix).unwrap();
+            let character = char::from_u32(0x4e00 + i).unwrap();
+            tsv.push_str(&format!(
+                "jun'bu'jian'{syllable}\t君不见{character}\t{}\n",
+                i + 1
+            ));
+        }
+        let indexed = indexed_fixture(&tsv);
+        let dynamic = Lexicon::from_tsv(&tsv).unwrap();
+        for descendant in [1, 4] {
+            let mut results = Vec::new();
+            for lexicon in [&indexed, &dynamic] {
+                let mut budget = (512, descendant);
+                index::metrics::reset();
+                results.push(format!(
+                    "{:?}",
+                    lexicon.completion_choice("junbujian", &mut budget)
+                ));
+                let reads = index::metrics::get();
+                assert_eq!(reads.words, 0);
+                assert_eq!(reads.edges, 3 + descendant - 1, "{reads:?}");
+                assert!(reads.probes <= 64, "{reads:?}");
+                assert_eq!(budget.1, 0);
+            }
+            assert_eq!(results[0], results[1]);
+        }
+        let mut results = Vec::new();
+        for lexicon in [&indexed, &dynamic] {
+            let mut expanded = 0;
+            index::metrics::reset();
+            results.push(format!(
+                "{:?}",
+                lexicon.mixed_prefix_choices("jbjh", &mut expanded, 6)
+            ));
+            let reads = index::metrics::get();
+            assert!(reads.edges <= 6, "{reads:?}");
+            assert!(reads.words <= 2, "{reads:?}");
+            assert!(reads.probes <= 64, "{reads:?}");
+            assert_eq!(expanded, 6);
+        }
+        assert_eq!(results[0], results[1]);
     }
 
     #[test]
@@ -1168,8 +1153,9 @@ mod tests {
         let builtin = Lexicon::builtin().unwrap();
         assert_eq!(raw.len(), builtin.len());
         let mut classified = std::collections::HashSet::new();
+        let mut eligible_text = std::collections::HashSet::new();
         for (key, entries) in raw.entries.iter() {
-            let ranked = &builtin.entries[key];
+            let ranked: Vec<_> = builtin.entries.get(key).unwrap().into_iter().collect();
             assert_eq!(entries.len(), ranked.len());
             for entry in entries {
                 let actual = ranked
@@ -1178,13 +1164,18 @@ mod tests {
                     .unwrap();
                 assert_eq!(actual.weight, entry.weight);
                 assert!(!entry.everyday, "custom TSV must remain unclassified");
+                if entry.reading.contains('\'')
+                    && entry.reading.split('\'').count() == entry.text.chars().count()
+                {
+                    eligible_text.insert(entry.text);
+                }
                 if actual.everyday {
                     assert!(actual.reading.contains('\''));
                     assert_eq!(
                         actual.reading.split('\'').count(),
                         actual.text.chars().count()
                     );
-                    classified.insert(actual.text.clone());
+                    classified.insert(actual.text);
                 }
             }
             assert!(ranked
@@ -1200,22 +1191,17 @@ mod tests {
                     .filter(|line| !line.is_empty() && !line.starts_with('#'))
                     .map(|line| line.split('\t').nth(1).unwrap()),
             )
-            .filter(|text| {
-                raw.entries.values().flatten().any(|entry| {
-                    entry.text == *text
-                        && entry.reading.contains('\'')
-                        && entry.reading.split('\'').count() == entry.text.chars().count()
-                })
-            })
+            .filter(|text| eligible_text.contains(*text))
             .collect();
         assert_eq!(
             classified
                 .iter()
-                .map(String::as_str)
+                .copied()
                 .collect::<std::collections::HashSet<_>>(),
             expected
         );
         for words in builtin.initials.values() {
+            let words: Vec<_> = words.into_iter().collect();
             assert!(words
                 .windows(2)
                 .all(|w| !rank_entries(&w[0], &w[1]).is_gt()));
@@ -1229,7 +1215,7 @@ mod tests {
         let overlay = base
             .with_overlay("ni'hao\t你好\t4294967295\nni'hao\t私词\t4294967295")
             .unwrap();
-        let entries = &overlay.entries["nihao"];
+        let entries = overlay.entries.get("nihao").unwrap();
         let hello = entries.iter().find(|e| e.text == "你好").unwrap();
         let private = entries.iter().find(|e| e.text == "私词").unwrap();
         assert!(hello.everyday);
@@ -1244,7 +1230,20 @@ mod tests {
             },
             u32::MAX,
         )]);
-        assert_eq!(learned.entries["nihao"], overlay.entries["nihao"]);
+        assert_eq!(
+            learned
+                .entries
+                .get("nihao")
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            overlay
+                .entries
+                .get("nihao")
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        );
         assert_eq!(base.lookup("nihao"), before);
         assert_eq!(Lexicon::builtin().unwrap().lookup("nihao"), before);
     }
@@ -1252,6 +1251,9 @@ mod tests {
     #[test]
     fn builtin_and_clones_share_the_read_only_table() {
         let first = Lexicon::builtin().unwrap();
+        assert!(first.entries.pristine_index());
+        assert!(first.initials.pristine_index());
+        assert!(first.syllables.pristine_index());
         let second = Lexicon::builtin().unwrap();
         let snapshot = first.clone();
         assert!(Arc::ptr_eq(&first.entries, &second.entries));
@@ -1270,7 +1272,17 @@ mod tests {
         let candidates = lexicon.lookup("ni");
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].text, "你");
-        assert_eq!(lexicon.entries["ni"][0].weight, 100);
+        assert_eq!(
+            lexicon
+                .entries
+                .get("ni")
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .weight,
+            100
+        );
     }
 
     #[test]
@@ -1339,7 +1351,7 @@ mod tests {
         let reading = vec!["shen"; 40].join("'");
         let text = "什".repeat(40);
         let lexicon = Lexicon::from_tsv(&format!("{reading}\t{text}\t1")).unwrap();
-        assert_eq!(lexicon.syllables.nodes.len(), 41);
+        assert_eq!(lexicon.syllables.len(), 41);
         assert_eq!(lexicon.mixed_choices(&"s".repeat(40)).len(), 1);
         assert!(lexicon.mixed_choices(&"s".repeat(128)).is_empty());
         let mut tsv = String::new();

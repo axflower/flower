@@ -46,6 +46,8 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 ## 环境与构建
 
+- Release 的 `panic=abort` 与集成测试的 unwind 构建可能为同一 cdylib/rlib 写出同名产物，出现 Cargo filename collision 及 LNK2019/LNK1120；先核对实际双构建证据。可仅在测试命令使用 `--config 'profile.release.panic="unwind"'` 统一策略，不修改产品 profile、不把未链接的测试当通过，也不为此盲目清空整个 target。
+
 - 构包前冻结真正的随包说明输入：当前`package.py`将`docs/distribution.md`打包为README，不是根README；补版本、在线外发/费用和测试边界后再启动组包，最终逐字节比较，不能让编译期间追加的文档漏入包。已生成的旧快照不覆盖，另目录重构并只交付已验新版。
 - Windows会话目录很深时，为Python夹具选择本Thread scratch下短临时目录名；FileNotFound恰在260字符处先核路径长度与实际源码，不盲改断言或移到未知系统临时目录。只重验受影响失败单例，复用其它有效套件结果。
 - 基础Rust PE的版本身份按实际RC与manifest/SHA核对，不假定一定有FileVersion资源；安装器数值版本单独检查。资源探针错误地要求不存在的可选资源不是功能回归，也不能把空元数据伪写为当前版本。
@@ -57,6 +59,8 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 实际组包使用 `scripts/package.py`，保留仓库正常 Cargo 输出入口。新输出目录使用本 Thread 最新 artifacts 事实，避免覆盖已有 ZIP。
 
 ## 包与安装
+
+- 多个程序各自内嵌大索引时，先按真实 PE 和完整资产统计展开总量，再区分单文件、压缩 ZIP、展开总量与 AI 子载荷预算。构建器与安装器共享总预算，扩大总量不连带放宽其余上限；用小型真实 ZIP fixture 验证总量恰等于预算时通过、少一字节时拒绝，避免向所有合成测试塞入大文件。用户明确清理旧 dist 时，先校验保留仍需复用的固定资产并记录清单，再在该授权范围内清理；新包先在会话产物目录验收后交付。
 
 - Git词库改用`license-file`时，先核对真实Cargo source/版本与完整通知；仅对已审定固定身份、路径和正文摘要做窄支持，manifest保留真实空SPDX及NOASSERTION/本地测试状态，不伪造MIT或泛化接受任意文件。扩充词库须同步构建器与安装器的精确资产白名单、可信大小/SHA和版本化必需记录，旧包携带新资产时也须完整验证；不能信包内自签摘要。载荷上限依据实际展开量有界调整，AI子载荷上限独立保留，勿为新大表向所有历史小fixture复制巨量数据。
 
@@ -71,6 +75,8 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 ## EXE 安装器
 
 - 瘦身先统计压缩后的文件贡献，再用同一完整payload隔离比较；展开文件或PE变小不代表最终solid安装器变小。保留模型、词库与许可的逐文件摘要，区分编译耗时、解压字典估计、实测安装和运行性能；没有实际收益时不发布名义上的瘦身包。
+- 多个 PE 重复内嵌完整输入索引时，先确认各消费者实际所需字段。后台纠错可用构建期专用种子保留全部合格记录与顺序，以完整树节点/边/终端及分数指纹对照原工厂，不能提前裁剪候选。原始 UTF-8 交由外层 ZIP/Inno 压缩可能同时避免运行期解压和双层压缩损失；须用最终包和纯构建计时决定，不凭内嵌字节数选方案。位打包同样以最终压缩收益及查询成本验收。
+- 紧凑索引的分组二分只需首字节时，避免每个探针重复构造完整字符串；明确并保留 label、完整区间、非空及实际消费时 UTF-8 检查，用未消费坏尾字节和消费拒绝的 fixture 验证惰性边界。完整索引等价与新进程交错时延分别取证，不能以词条数相同或单次波动代替性能验收。
 - Inno压缩等级的名字不等于所有参数变化；核对实际字典/FastBytes/MatchFinder/Algorithm及安装解压内存成本。Rust profile实验须记录实际rustc参数，不能仅凭环境变量声称cdylib和EXE都启用LTO；固定负载交错比较，进程首次初始化不冒称磁盘冷启动。
 - 定制ORT精简需区分非minimal reduced-operator与minimal模型格式限制，原图op列表不能覆盖运行时融合内核。未核验C API、固定模型、图优化与CPU路径前不替换官方固定运行库，也不把未测体积作为可交付收益。
 
@@ -183,6 +189,9 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - `tests/user_dictionary_process.rs` 的 `killed_writer_before_atomic_publish_preserves_old_bytes_and_allows_recovery` 是定向入口。此类证据只覆盖同步完成但尚未发布时的进程结束，不证明写入中途、真实磁盘满、系统崩溃或掉电耐久性；不要为扩大表述而自动执行危险注入。
 
 ## 运行期路径与原生设置视觉
+
+- 切换后数秒不能输入，先测新进程的基础词典初始化、首个真实拼音键、个人 overlay 和 AI 安全检查，不能把延到首键称为消除冷启动。完整大词典可在构建期生成并逐 bucket/节点验证只读索引，运行期直接查询；overlay/学习仅 patch 触及的 bucket/trie 路径，保留全部词条、权重、排序、规范读音及快照隔离。当前合同见 `design/instant-first-input.md`，覆盖下方历史首字母全量初始化约定。
+- 查询预算必须约束实际解码/分配。只在完整 collect 候选 bucket 或复制整个节点出边后 take(limit)/扣 budget，会在大 bucket/fanout 下引入线性开销；用惰性 words/edges 视图保留原正反序，并以大集合、小预算的实际访问计数回归，不只断言最终预算数字。AI 启动后台任务需覆盖生产首次排队、真实 timer→owner poll、消息已到但线程未退出、activation 身份、取消 join 和晚成功结果清理；后台化不授权跳过安装树安全校验。
 
 - 设置黑框先分清PE控制台子系统与真正cmd进程；GUI入口可用GUI子系统，CLI仅附着已有父控制台且保留重定向stdout/stderr，不AllocConsole；AI/登录静默路径仍不附着。发布验GUI PE子系统及重定向help/错误退出码，不自动启动真实用户GUI作探针。
 - 设置响应慢还要检查输入法在设置进程中的自激活：TSF Activate同步构建完整词表/混拼索引或启动离线broker，可使只打开数字设置控件也付出大量CPU/内存。输入资源可延到首次真实拼音字母，OnTest只预测；不因Tab/数字/在线快捷键加载词表。先分类常用词再一次性构建索引，勿构建后立即重建。延迟安装词表时保留各context的引号/标点状态，新增真实首次输入及overlay回归；明确首次输入仍有成本且共享缓存不因窗口关闭自动释放。设置自身词典管理读取可延到首入该分类，保持加载中禁写/错误不覆盖/cancel join。

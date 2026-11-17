@@ -1,26 +1,69 @@
+#[allow(dead_code)]
+#[path = "build_support/lexicon_index.rs"]
+mod lexicon_index;
+#[allow(dead_code)]
+#[path = "build_support/spelling_seed.rs"]
+mod spelling_seed;
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Store the exact source dictionary once in a compact representation in
-    // each consumer. The runtime restores and verifies it before using the
-    // unchanged parser; this never removes words or changes ranking inputs.
     use sha2::{Digest, Sha256};
-    let source = flower_dict::DEFAULT_TSV.as_bytes();
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(source, 9);
+    let mut entries =
+        lexicon_index::parse(flower_dict::DEFAULT_TSV).expect("parse builtin dictionary");
+    lexicon_index::classify(
+        &mut entries,
+        flower_dict::COMMON_USAGE_PAIRS,
+        flower_dict::EVERYDAY_TSV,
+    );
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    std::fs::write(output.join("builtin-dictionary.zlib"), &compressed)
-        .expect("write compressed builtin dictionary");
-    std::fs::write(
-        output.join("builtin-dictionary.rs"),
-        format!(
-            "const BUILTIN_SIZE: usize = {};\nconst BUILTIN_SHA256: [u8; 32] = {:?};\n",
-            source.len(),
-            <[u8; 32]>::from(Sha256::digest(source))
-        ),
-    )
-    .expect("write builtin dictionary identity");
+    {
+        let mut keys: Vec<_> = entries.keys().collect();
+        keys.sort();
+        let seed = spelling_seed::encode(keys.iter().flat_map(|key| {
+            entries[*key]
+                .iter()
+                .map(|entry| (entry.reading.as_str(), entry.text.as_str(), entry.weight))
+        }));
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&seed, 9);
+        std::fs::write(output.join("builtin-spelling.tsv"), &seed)
+            .expect("write builtin raw spelling seed");
+        std::fs::write(output.join("builtin-spelling.zlib"), &compressed)
+            .expect("write builtin spelling seed");
+        let digest: [u8; 32] = Sha256::digest(&seed).into();
+        std::fs::write(
+            output.join("builtin-spelling.rs"),
+            format!(
+                "const BUILTIN_SPELLING_SIZE: usize = {};\nconst BUILTIN_SPELLING_SHA256: [u8; 32] = {:?};\n",
+                seed.len(), digest
+            ),
+        )
+        .expect("write builtin spelling seed identity");
+        println!(
+            "cargo:warning=builtin spelling seed: {} rows, {} bytes, {} compressed bytes, sha256 {:x}",
+            seed.iter().filter(|&&byte| byte == b'\n').count(),
+            seed.len(),
+            compressed.len(),
+            Sha256::digest(&seed)
+        );
+    }
+    let bytes = lexicon_index::encode(&entries);
+    std::fs::write(output.join("builtin-dictionary.idx"), &bytes).expect("write builtin index");
+    println!(
+        "cargo:warning=builtin index: {} keys, {} entries, {} bytes, sha256 {:x}",
+        entries.len(),
+        entries.values().map(Vec::len).sum::<usize>(),
+        bytes.len(),
+        Sha256::digest(&bytes)
+    );
+    println!(
+        "cargo:warning=builtin TSV source sha256 {:x}; all exact/initial buckets and trie nodes round-trip verified",
+        Sha256::digest(flower_dict::DEFAULT_TSV.as_bytes())
+    );
+    println!("cargo:rerun-if-changed=build_support/lexicon_index.rs");
+    println!("cargo:rerun-if-changed=build_support/spelling_seed.rs");
     for file in [
         "assets/flower.rc",
         "assets/flower.ico",

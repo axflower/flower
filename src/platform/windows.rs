@@ -348,6 +348,7 @@ mod windows_exports {
         shift: ShiftGesture,
         writing_gesture: WritingGesture,
         settings_worker: Option<SettingsLaunchWorker>,
+        ai_startup: Option<AiStartupWorker>,
         /// Validated personal overlay; base indexes are loaded only for real input.
         pending_lexicon: Option<String>,
         context_generation: Rc<Cell<u64>>,
@@ -386,12 +387,13 @@ mod windows_exports {
         active.lexicon = lexicon;
         active.pending_lexicon = None;
         // Retain each dormant router's punctuation/quote state.
-        if active.settings.ai_correction_enabled && active.ai.is_none() {
-            match protected_ai_helper().and_then(|helper| {
-                crate::ai::ipc::AiClient::start(helper).map_err(|_| AiStatus::ClientFailed)
-            }) {
-                Ok(client) => active.ai = Some(AiScheduler::new(Box::new(client))),
-                Err(reason) => active.ai_unavailable = reason,
+        if active.settings.ai_correction_enabled
+            && active.ai.is_none()
+            && active.ai_startup.is_none()
+        {
+            match AiStartupWorker::start_protected() {
+                Ok(worker) => active.ai_startup = Some(worker),
+                Err(_) => active.ai_unavailable = AiStatus::ClientFailed,
             }
         }
         Ok(())
@@ -1581,6 +1583,117 @@ mod windows_exports {
         completed
     }
 
+    type AiStartupResult = std::result::Result<Box<dyn AiTransport + Send>, AiStatus>;
+
+    #[cfg(test)]
+    thread_local! {
+        static AI_STARTUP_TEST_INITIALIZER:
+            RefCell<Option<Box<dyn FnOnce() -> AiStartupResult + Send>>> =
+                const { RefCell::new(None) };
+    }
+
+    /// Installation checks and client setup never run in a key callback.
+    /// The pin outlives the joined worker and every unconsumed transport result.
+    struct AiStartupWorker {
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        result: std::sync::mpsc::Receiver<AiStartupResult>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        _registration: ObjectRegistration,
+    }
+
+    impl AiStartupWorker {
+        fn start_protected() -> std::io::Result<Self> {
+            #[cfg(test)]
+            if let Some(initialize) = AI_STARTUP_TEST_INITIALIZER.with(|s| s.borrow_mut().take()) {
+                return Self::start(initialize);
+            }
+            Self::start(|| {
+                let helper = protected_ai_helper()?;
+                let client =
+                    crate::ai::ipc::AiClient::start(helper).map_err(|_| AiStatus::ClientFailed)?;
+                Ok(Box::new(client))
+            })
+        }
+
+        fn start(
+            initialize: impl FnOnce() -> AiStartupResult + Send + 'static,
+        ) -> std::io::Result<Self> {
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancelled = Arc::clone(&cancel);
+            let (sender, result) = std::sync::mpsc::channel();
+            let registration = ObjectRegistration::new();
+            let thread = std::thread::Builder::new()
+                .name("flower-ai-startup".into())
+                .spawn(move || {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    let result = initialize();
+                    if !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = sender.send(result);
+                    }
+                })?;
+            Ok(Self {
+                cancel,
+                result,
+                thread: Some(thread),
+                _registration: registration,
+            })
+        }
+    }
+
+    impl Drop for AiStartupWorker {
+        fn drop(&mut self) {
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn poll_ai_startup(shared: &SharedActivation, token: ActivationToken, owner: ThreadId) {
+        if std::thread::current().id() != owner {
+            return;
+        }
+        let Ok(mut state) = shared.try_borrow_mut() else {
+            return;
+        };
+        let Some(active) = state.as_mut().filter(|a| a.token == token && !a.processing) else {
+            return;
+        };
+        let Some(worker) = active.ai_startup.as_ref() else {
+            return;
+        };
+        if !active.settings.ai_correction_enabled {
+            worker
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // A message may arrive before the sending thread exits. Do not join
+        // from this timer until the worker is known to have finished.
+        if !worker.thread.as_ref().is_some_and(|t| t.is_finished()) {
+            return;
+        }
+        if !worker.cancel.load(std::sync::atomic::Ordering::Acquire) {
+            match worker
+                .result
+                .try_recv()
+                .unwrap_or(Err(AiStatus::ClientFailed))
+            {
+                Ok(transport) => {
+                    let mut ai = AiScheduler::new(transport);
+                    // Input may already be composing by the time setup ends.
+                    ai.input();
+                    active.ai = Some(ai);
+                }
+                Err(reason) => active.ai_unavailable = reason,
+            }
+        }
+        // Scheduler acquires its independent pin before startup releases its pin.
+        active.ai_startup = None;
+    }
+
     include!("ui_element.rs");
 
     trait AiTransport {
@@ -2037,6 +2150,7 @@ mod windows_exports {
     /// Timer callback only queues read sessions. It never writes host text.
     fn ai_idle(shared: &SharedActivation, token: ActivationToken, owner: ThreadId) {
         settings_idle(shared, token, owner);
+        poll_ai_startup(shared, token, owner);
         if std::thread::current().id() != owner {
             return;
         }
@@ -4463,6 +4577,7 @@ mod windows_exports {
                         shift: ShiftGesture::default(),
                         writing_gesture: WritingGesture::default(),
                         settings_worker: None,
+                        ai_startup: None,
                         pending_lexicon: Some(pending_lexicon),
                         context_generation: Rc::clone(&context_generation),
                         _thread_events: Some(thread_events),
@@ -6871,6 +6986,7 @@ mod windows_exports {
                 shift: ShiftGesture::default(),
                 writing_gesture: WritingGesture::default(),
                 settings_worker: None,
+                ai_startup: None,
                 pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
@@ -8626,6 +8742,7 @@ mod windows_exports {
                     shift: ShiftGesture::default(),
                     writing_gesture: WritingGesture::default(),
                     settings_worker: None,
+                    ai_startup: None,
                     pending_lexicon: None,
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
@@ -9012,6 +9129,7 @@ mod windows_exports {
                     shift: ShiftGesture::default(),
                     writing_gesture: WritingGesture::default(),
                     settings_worker: None,
+                    ai_startup: None,
                     pending_lexicon: None,
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
@@ -9307,6 +9425,7 @@ mod windows_exports {
             }
             assert_eq!(read_document(&host, None), "“拟”");
             assert!(shared.borrow().as_ref().unwrap().pending_lexicon.is_none());
+            assert!(shared.borrow().as_ref().unwrap().ai_startup.is_none());
         }
 
         #[test]
@@ -9481,6 +9600,7 @@ mod windows_exports {
                 shift: ShiftGesture::default(),
                 writing_gesture: WritingGesture::default(),
                 settings_worker: None,
+                ai_startup: None,
                 pending_lexicon: None,
                 context_generation: generation,
                 _thread_events: Some(events),
@@ -9747,6 +9867,182 @@ mod windows_exports {
             }
             assert_eq!(read_document(&host, None), expected);
             shared.borrow_mut().take();
+        }
+
+        #[test]
+        fn native_ai_startup_does_not_block_first_input_or_retry_failure() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let _keys = LocalKeyboard::set(Modifiers::NONE);
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (entered, started) = std::sync::mpsc::channel();
+            let (token, owner) = {
+                let mut state = shared.borrow_mut();
+                let active = state.as_mut().unwrap();
+                active.lexicon = Lexicon::dormant();
+                active.pending_lexicon = Some("ni\t拟\t4294967295".into());
+                active.settings.ai_correction_enabled = true;
+                AI_STARTUP_TEST_INITIALIZER.with(|s| {
+                    *s.borrow_mut() = Some(Box::new(move || {
+                        entered.send(()).unwrap();
+                        blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Err(AiStatus::UnsafeDirectory)
+                    }));
+                });
+                (active.token, active.owner_thread)
+            };
+            // The initializer cannot finish until explicitly released, yet the
+            // production first-key/edit path must complete and retain overlay.
+            send_key(&sink, &host.context, b'N');
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(AI_STARTUP_TEST_INITIALIZER.with(|s| s.borrow().is_none()));
+            send_key(&sink, &host.context, b'I');
+            send_key(&sink, &host.context, 0x20);
+            assert_eq!(read_document(&host, None), "拟");
+            poll_ai_startup(&shared, token, owner);
+            assert!(shared.borrow().as_ref().unwrap().ai_startup.is_some());
+            release.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while shared.borrow().as_ref().unwrap().ai_startup.is_some() {
+                assert!(Instant::now() < deadline);
+                poll_ai_startup(&shared, token, owner);
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                shared.borrow().as_ref().unwrap().ai_unavailable,
+                AiStatus::UnsafeDirectory
+            );
+            send_key(&sink, &host.context, b'N');
+            send_key(&sink, &host.context, b'I');
+            send_key(&sink, &host.context, 0x20);
+            assert_eq!(read_document(&host, None), "拟拟");
+            assert!(shared.borrow().as_ref().unwrap().ai_startup.is_none());
+        }
+
+        #[test]
+        fn native_ai_startup_timer_identity_exit_gate_and_cancel_join() {
+            use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+            };
+            struct StartupTransport(Arc<AtomicBool>);
+            impl AiTransport for StartupTransport {
+                fn submit(&self, _: Request) -> bool {
+                    false
+                }
+                fn try_result(&self) -> Option<Response> {
+                    None
+                }
+                fn shutdown(&mut self) {
+                    self.0.store(true, AtomicOrdering::Release);
+                }
+            }
+            impl Drop for StartupTransport {
+                fn drop(&mut self) {
+                    self.shutdown();
+                }
+            }
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (_service, shared) = basic_service(&host);
+            let stopped = Arc::new(AtomicBool::new(false));
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (sent, received) = std::sync::mpsc::channel();
+            let (sender, result) = std::sync::mpsc::channel();
+            let transport_stopped = stopped.clone();
+            // Deliberately send before thread exit to test the nonblocking gate.
+            let worker = AiStartupWorker {
+                cancel: Arc::new(AtomicBool::new(false)),
+                result,
+                thread: Some(std::thread::spawn(move || {
+                    let transport: Box<dyn AiTransport + Send> =
+                        Box::new(StartupTransport(transport_stopped));
+                    sender.send(Ok(transport)).ok().unwrap();
+                    sent.send(()).unwrap();
+                    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                })),
+                _registration: ObjectRegistration::new(),
+            };
+            let (token, owner) = {
+                let mut state = shared.borrow_mut();
+                let active = state.as_mut().unwrap();
+                active.ai = None;
+                active.settings.ai_correction_enabled = true;
+                active.ai_startup = Some(worker);
+                (active.token, active.owner_thread)
+            };
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            poll_ai_startup(&shared, token, owner);
+            assert!(shared.borrow().as_ref().unwrap().ai.is_none());
+            assert!(shared.borrow().as_ref().unwrap().ai_startup.is_some());
+            release.send(()).unwrap();
+            {
+                let mut state = shared.borrow_mut();
+                // Startup belongs to the activation, not to its original context.
+                state.as_mut().unwrap().context_generation.set(10);
+                state.as_mut().unwrap().focus_epoch += 1;
+            }
+            poll_ai_startup(&shared, token.wrapping_add(1), owner);
+            assert!(shared.borrow().as_ref().unwrap().ai_startup.is_some());
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let weak = Rc::downgrade(&shared);
+            popup
+                .set_idle_sink(Some(Rc::new(move || {
+                    if let Some(shared) = weak.upgrade() {
+                        ai_idle(&shared, token, owner);
+                    }
+                })))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while shared.borrow().as_ref().unwrap().ai_startup.is_some() {
+                assert!(Instant::now() < deadline);
+                let mut message = MSG::default();
+                unsafe {
+                    while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                std::thread::yield_now();
+            }
+            assert!(shared.borrow().as_ref().unwrap().ai.is_some());
+            assert!(!stopped.load(AtomicOrdering::Acquire));
+            shared.borrow_mut().as_mut().unwrap().ai = None;
+            assert!(stopped.load(AtomicOrdering::Acquire));
+
+            // Drop signals cancellation, waits for the in-flight initializer,
+            // and destroys a late successful transport before releasing its pin.
+            let stopped = Arc::new(AtomicBool::new(false));
+            let transport_stopped = stopped.clone();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (entered, started) = std::sync::mpsc::channel();
+            let worker = AiStartupWorker::start(move || {
+                entered.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(Box::new(StartupTransport(transport_stopped)))
+            })
+            .unwrap();
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            let cancelled = worker.cancel.clone();
+            let releaser = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !cancelled.load(AtomicOrdering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                release.send(()).unwrap();
+            });
+            drop(worker);
+            releaser.join().unwrap();
+            assert!(stopped.load(AtomicOrdering::Acquire));
         }
 
         #[test]
@@ -11178,6 +11474,7 @@ mod windows_exports {
                 shift: ShiftGesture::default(),
                 writing_gesture: WritingGesture::default(),
                 settings_worker: None,
+                ai_startup: None,
                 pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
@@ -11423,6 +11720,7 @@ mod windows_exports {
                 shift: ShiftGesture::default(),
                 writing_gesture: WritingGesture::default(),
                 settings_worker: None,
+                ai_startup: None,
                 pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,

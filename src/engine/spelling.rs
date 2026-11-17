@@ -1,7 +1,12 @@
 //! Bounded, background-only full-pinyin repair candidate generation.
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{decoder::lexical_score, Lexicon, SpellingCandidate};
+use super::{decoder::lexical_score, EngineError, Lexicon, SpellingCandidate};
+use sha2::{Digest, Sha256};
+
+#[allow(dead_code)] // Shared with build.rs; encoding is used only there and by tests.
+#[path = "../../build_support/spelling_seed.rs"]
+mod spelling_seed;
 
 const STATE_LIMIT: usize = 16_384;
 const BEAM: usize = 8;
@@ -19,6 +24,50 @@ struct Word {
 
 pub struct SpellingIndex {
     nodes: Vec<Node>,
+}
+
+/// Construction-only cache: path[i] is the node after i compact bytes.
+struct BuildCursor {
+    previous: Vec<u8>,
+    current: Vec<u8>,
+    path: Vec<usize>,
+}
+
+impl BuildCursor {
+    fn new() -> Self {
+        Self {
+            previous: Vec::new(),
+            current: Vec::new(),
+            path: vec![0],
+        }
+    }
+
+    fn terminal(&mut self, nodes: &mut Vec<Node>, reading: &str) -> usize {
+        self.current.clear();
+        self.current.extend(reading.bytes().filter(|&b| b != b'\''));
+        let common = self
+            .previous
+            .iter()
+            .zip(&self.current)
+            .take_while(|(a, b)| a == b)
+            .count();
+        self.path.truncate(common + 1);
+        let mut node = self.path[common];
+        for &byte in &self.current[common..] {
+            let next = if let Some(&next) = nodes[node].children.get(&byte) {
+                next
+            } else {
+                let next = nodes.len();
+                nodes.push(Node::default());
+                nodes[node].children.insert(byte, next);
+                next
+            };
+            node = next;
+            self.path.push(node);
+        }
+        std::mem::swap(&mut self.previous, &mut self.current);
+        node
+    }
 }
 
 #[derive(Clone)]
@@ -96,48 +145,81 @@ pub fn single_spelling_edit(raw: &str, reading: &str) -> bool {
 }
 
 impl SpellingIndex {
+    /// Background-only factory. Embedded seed bytes are referenced only here.
+    pub fn builtin() -> Result<Self, EngineError> {
+        mod metadata {
+            include!(concat!(env!("OUT_DIR"), "/builtin-spelling.rs"));
+            pub fn values() -> (usize, [u8; 32]) {
+                (BUILTIN_SPELLING_SIZE, BUILTIN_SPELLING_SHA256)
+            }
+        }
+        let (size, sha) = metadata::values();
+        Self::from_raw_seed(
+            include_str!(concat!(env!("OUT_DIR"), "/builtin-spelling.tsv")),
+            size,
+            &sha,
+        )
+    }
+
+    #[cfg(test)]
+    fn from_seed(compressed: &[u8], size: usize, sha: &[u8; 32]) -> Result<Self, EngineError> {
+        let invalid = || EngineError::invalid_line(0, "invalid builtin spelling seed");
+        let bytes = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, size)
+            .map_err(|_| invalid())?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+        Self::from_raw_seed(text, size, sha)
+    }
+
+    fn from_raw_seed(text: &str, size: usize, sha: &[u8; 32]) -> Result<Self, EngineError> {
+        let invalid = || EngineError::invalid_line(0, "invalid builtin spelling seed");
+        if text.len() != size || Sha256::digest(text.as_bytes()).as_slice() != sha {
+            return Err(invalid());
+        }
+        if text.is_empty() || !text.ends_with('\n') {
+            return Err(invalid());
+        }
+        let mut result = Self {
+            nodes: vec![Node::default()],
+        };
+        let mut cursor = BuildCursor::new();
+        for row in text[..text.len() - 1].split('\n') {
+            let (reading, text, weight) = spelling_seed::parse_row(row).ok_or_else(invalid)?;
+            result.insert(&mut cursor, reading, text, weight);
+        }
+        Ok(result)
+    }
+
     pub fn new(lexicon: &Lexicon) -> Self {
         let mut result = Self {
             nodes: vec![Node::default()],
         };
+        let mut cursor = BuildCursor::new();
         for (reading, text, weight) in lexicon.spelling_entries() {
-            let characters = text.chars().count();
-            if characters == 0
-                || characters > 64
-                || !text.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
-                || reading.split('\'').count() != characters
-                || !canonical_reading(reading)
-            {
+            if !spelling_seed::eligible(reading, text) {
                 continue;
             }
-            let mut node = 0;
-            for byte in reading.bytes().filter(|&b| b != b'\'') {
-                let next = if let Some(&next) = result.nodes[node].children.get(&byte) {
-                    next
-                } else {
-                    let next = result.nodes.len();
-                    result.nodes.push(Node::default());
-                    result.nodes[node].children.insert(byte, next);
-                    next
-                };
-                node = next;
-            }
-            let words = &mut result.nodes[node].words;
-            words.push(Word {
-                text: text.into(),
-                reading: reading.into(),
-                score: lexical_score(weight, characters),
-            });
-            words.sort_by(|a, b| {
-                b.score
-                    .cmp(&a.score)
-                    .then(a.text.cmp(&b.text))
-                    .then(a.reading.cmp(&b.reading))
-            });
-            words.dedup_by(|a, b| a.text == b.text && a.reading == b.reading);
-            words.truncate(4);
+            result.insert(&mut cursor, reading, text, weight);
         }
         result
+    }
+
+    fn insert(&mut self, cursor: &mut BuildCursor, reading: &str, text: &str, weight: u32) {
+        let characters = text.chars().count();
+        let node = cursor.terminal(&mut self.nodes, reading);
+        let words = &mut self.nodes[node].words;
+        words.push(Word {
+            text: text.into(),
+            reading: reading.into(),
+            score: lexical_score(weight, characters),
+        });
+        words.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then(a.text.cmp(&b.text))
+                .then(a.reading.cmp(&b.reading))
+        });
+        words.dedup_by(|a, b| a.text == b.text && a.reading == b.reading);
+        words.truncate(4);
     }
 
     pub fn candidates(&self, raw: &str, limit: usize) -> Vec<SpellingCandidate> {
@@ -382,6 +464,268 @@ fn complete_ok(p: &Path, guide: Option<(&str, &str)>, raw: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fingerprint(index: &SpellingIndex) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update((index.nodes.len() as u64).to_le_bytes());
+        for node in &index.nodes {
+            hash.update((node.children.len() as u64).to_le_bytes());
+            for (&byte, &child) in &node.children {
+                hash.update([byte]);
+                hash.update((child as u64).to_le_bytes());
+            }
+            hash.update((node.words.len() as u64).to_le_bytes());
+            for word in &node.words {
+                for value in [&word.text, &word.reading] {
+                    hash.update((value.len() as u64).to_le_bytes());
+                    hash.update(value.as_bytes());
+                }
+                hash.update(word.score.to_le_bytes());
+            }
+        }
+        hash.finalize().into()
+    }
+
+    fn fixture_seed(raw: &[u8]) -> Result<SpellingIndex, EngineError> {
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(raw, 6);
+        SpellingIndex::from_seed(&compressed, raw.len(), &Sha256::digest(raw).into())
+    }
+
+    // Independent original algorithm, deliberately not using BuildCursor or insert.
+    fn root_walk_oracle(rows: &[(&str, &str, u32)]) -> SpellingIndex {
+        let mut result = SpellingIndex {
+            nodes: vec![Node::default()],
+        };
+        for &(reading, text, weight) in rows {
+            let characters = text.chars().count();
+            if characters == 0
+                || characters > 64
+                || !text.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+                || reading.split('\'').count() != characters
+                || !canonical_reading(reading)
+            {
+                continue;
+            }
+            let mut node = 0;
+            for byte in reading.bytes().filter(|&b| b != b'\'') {
+                let next = if let Some(&next) = result.nodes[node].children.get(&byte) {
+                    next
+                } else {
+                    let next = result.nodes.len();
+                    result.nodes.push(Node::default());
+                    result.nodes[node].children.insert(byte, next);
+                    next
+                };
+                node = next;
+            }
+            let words = &mut result.nodes[node].words;
+            words.push(Word {
+                text: text.into(),
+                reading: reading.into(),
+                score: lexical_score(weight, characters),
+            });
+            words.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then(a.text.cmp(&b.text))
+                    .then(a.reading.cmp(&b.reading))
+            });
+            words.dedup_by(|a, b| a.text == b.text && a.reading == b.reading);
+            words.truncate(4);
+        }
+        result
+    }
+
+    #[test]
+    fn build_cursor_matches_independent_root_walk_in_any_order() {
+        let rows = [
+            ("ni'hao", "你好", 100),
+            ("ni", "你", 20),
+            ("ni'hen", "你很", 30),
+            ("ni", "尼", 25),
+            ("ni", "你", 40),
+            ("ni", "泥", 24),
+            ("ni", "拟", 23),
+            ("ni", "逆", 22),
+            ("ni", "妮", 21),
+            ("nian", "年", 15),
+            ("ni'an", "你安", 16), // Same compact bytes, different reading.
+            ("a", "啊", 5),
+            ("zai", "在", 6),
+            ("n", "你", 7), // Rejected row must not disturb the cursor.
+            ("ni'hao", "你好", 101),
+        ];
+        let mut variants = vec![rows.to_vec()];
+        variants.push(rows.iter().copied().rev().collect());
+        let mut sorted = rows.to_vec();
+        sorted.sort_by(|a, b| b.0.cmp(a.0));
+        variants.push(sorted);
+        for rows in variants {
+            let expected = fingerprint(&root_walk_oracle(&rows));
+            let mut index = SpellingIndex {
+                nodes: vec![Node::default()],
+            };
+            let mut cursor = BuildCursor::new();
+            for &(reading, text, weight) in &rows {
+                if spelling_seed::eligible(reading, text) {
+                    index.insert(&mut cursor, reading, text, weight);
+                }
+            }
+            assert_eq!(fingerprint(&index), expected);
+            let seed = spelling_seed::encode(rows.iter().copied());
+            assert_eq!(fingerprint(&fixture_seed(&seed).unwrap()), expected);
+            let tsv: String = rows
+                .iter()
+                .filter(|(r, t, _)| spelling_seed::eligible(r, t))
+                .map(|(r, t, w)| format!("{r}\t{t}\t{w}\n"))
+                .collect();
+            let lexicon = Lexicon::from_tsv(&tsv).unwrap();
+            let ordered: Vec<_> = lexicon.spelling_entries().collect();
+            assert_eq!(
+                fingerprint(&SpellingIndex::new(&lexicon)),
+                fingerprint(&root_walk_oracle(&ordered))
+            );
+        }
+    }
+
+    #[test]
+    fn seed_factory_matches_lexicon_factory() {
+        let lexicon = Lexicon::from_tsv(
+            "ni\t你\t100\nni\t尼\t90\nni\t泥\t80\nni\t拟\t70\nni\t逆\t60\n\
+             ni'hao\t你好\t1000\nnv\t女\t20\n",
+        )
+        .unwrap();
+        let seed = spelling_seed::encode(lexicon.spelling_entries());
+        let old = SpellingIndex::new(&lexicon);
+        let new = fixture_seed(&seed).unwrap();
+        assert_eq!(fingerprint(&old), fingerprint(&new));
+        assert_eq!(old.candidates("nihaoo", 8), new.candidates("nihaoo", 8));
+    }
+
+    #[test]
+    fn raw_seed_factory_validates_and_matches_root_walk() {
+        let rows = [
+            ("ni'hao", "你好", 1000),
+            ("ni", "你", 100),
+            ("ni", "尼", 90),
+        ];
+        let bytes = spelling_seed::encode(rows);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let sha = Sha256::digest(&bytes).into();
+        let index = SpellingIndex::from_raw_seed(text, text.len(), &sha).unwrap();
+        assert_eq!(fingerprint(&index), fingerprint(&root_walk_oracle(&rows)));
+        let error = || EngineError::invalid_line(0, "invalid builtin spelling seed");
+        for (size, digest) in [
+            (text.len() - 1, sha),
+            (text.len() + 1, sha),
+            (text.len(), [0; 32]),
+        ] {
+            assert_eq!(
+                SpellingIndex::from_raw_seed(text, size, &digest).err(),
+                Some(error())
+            );
+        }
+        // Correct size and SHA must not bypass framing, fields or eligibility.
+        for text in [
+            "",
+            "\n",
+            "ni\t你\t1",
+            "ni\t你\t1\r\n",
+            "ni\t你\t1\n\n",
+            "ni\t\t1\n",
+            "ni\tbad\t1\n",
+            "n\t你\t1\n",
+            "ni'hao\t你\t1\n",
+            "ni\t你\t0\n",
+            "ni\t你\t4294967296\n",
+            "ni\t你\t+1\n",
+            "ni\t你\n",
+            "ni\t你\t1\textra\n",
+        ] {
+            assert_eq!(
+                SpellingIndex::from_raw_seed(
+                    text,
+                    text.len(),
+                    &Sha256::digest(text.as_bytes()).into()
+                )
+                .err(),
+                Some(error()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_factory_rejects_corruption() {
+        let raw = b"ni\t\xe4\xbd\xa0\t1\n";
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(raw, 6);
+        let sha = Sha256::digest(raw).into();
+        let error = || EngineError::invalid_line(0, "invalid builtin spelling seed");
+        for (data, size, digest) in [
+            (&b"invalid"[..], raw.len(), sha),
+            (&compressed[..], raw.len() - 1, sha),
+            (&compressed[..], raw.len() + 1, sha),
+            (&compressed[..], raw.len(), [0; 32]),
+        ] {
+            assert_eq!(
+                SpellingIndex::from_seed(data, size, &digest).err(),
+                Some(error())
+            );
+        }
+        for raw in [
+            &b""[..],
+            &b"\xff\n"[..],
+            &b"\n"[..],
+            &b"ni\tbad\t1\n"[..],
+            &b"ni\t\xe4\xbd\xa0\t0\n"[..],
+            &b"ni\t\xe4\xbd\xa0\t1\textra\n"[..],
+            &b"ni\t\xe4\xbd\xa0\t1"[..],
+            &b"ni\t\xe4\xbd\xa0\t4294967296\n"[..],
+        ] {
+            assert_eq!(fixture_seed(raw).err(), Some(error()), "{raw:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "full builtin trie comparison; explicitly run with --ignored --nocapture"]
+    fn builtin_seed_full_structure_matches_lexicon() {
+        use std::time::Instant;
+        const BASELINE: [u8; 32] = [
+            0xe5, 0x4a, 0x1f, 0xdd, 0xe5, 0x8a, 0x82, 0x44, 0x7b, 0x5f, 0x7b, 0xc4, 0x49, 0x19,
+            0x76, 0x74, 0x10, 0xae, 0x84, 0xad, 0x95, 0xf0, 0x85, 0x21, 0x00, 0xa8, 0x52, 0xde,
+            0xf2, 0x64, 0xfc, 0x80,
+        ];
+        let start = Instant::now();
+        let lexicon = Lexicon::builtin().unwrap();
+        eprintln!("Lexicon builtin load: {:?}", start.elapsed());
+        let start = Instant::now();
+        let index = SpellingIndex::new(&lexicon);
+        eprintln!("Lexicon spelling trie build only: {:?}", start.elapsed());
+        let start = Instant::now();
+        let expected = fingerprint(&index);
+        eprintln!("Lexicon trie fingerprint only: {:?}", start.elapsed());
+        let start = Instant::now();
+        drop(index);
+        drop(lexicon);
+        eprintln!("Lexicon + trie drop only: {:?}", start.elapsed());
+        let start = Instant::now();
+        let index = SpellingIndex::builtin().unwrap();
+        eprintln!(
+            "Raw seed builtin build only (including validation): {:?}",
+            start.elapsed()
+        );
+        let start = Instant::now();
+        let actual = fingerprint(&index);
+        eprintln!("Raw seed trie fingerprint only: {:?}", start.elapsed());
+        let start = Instant::now();
+        drop(index);
+        eprintln!("Raw seed trie drop only: {:?}", start.elapsed());
+        eprintln!("Spelling trie SHA256: {actual:02x?}");
+        assert_eq!(expected, BASELINE);
+        assert_eq!(actual, BASELINE);
+        assert_eq!(expected, actual);
+    }
+
     #[test]
     fn guided_delete_and_swap_share_budget() {
         let index = SpellingIndex::new(

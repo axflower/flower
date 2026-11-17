@@ -9,6 +9,16 @@ fn main() {
     let lexicon = Lexicon::builtin().expect("embedded dictionary");
     println!("cold_load_us={}", start.elapsed().as_micros());
     println!("pinyin_keys={}", lexicon.len());
+    let mut first = EngineRouter::from_lexicon(lexicon.clone(), 7).unwrap();
+    let start = Instant::now();
+    let update = first.process_key(KeyEvent::plain(Key::Char('n'))).unwrap();
+    assert!(update.handled && !first.session().candidates_on_current_page().is_empty());
+    println!("first_pinyin_key_us={}", start.elapsed().as_micros());
+    let start = Instant::now();
+    let personal = lexicon.with_overlay("ni\t拟\t4294967295").unwrap();
+    println!("small_overlay_load_us={}", start.elapsed().as_micros());
+    assert_eq!(personal.lookup("ni")[0].text, "拟");
+    assert_ne!(lexicon.lookup("ni")[0].text, "拟");
     let fixed_keys = ["ni", "hao", "shi", "yi", "lv", "nv", "chong", "he", "xyz"];
     let mut samples = Vec::new();
     let mut max_candidates = 0;

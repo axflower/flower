@@ -37,6 +37,7 @@ ROOT_FILES = pack.CATEGORY_FILES | frozenset({
 })
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?\Z")
 MAX_PAYLOAD = 512 * 1024 * 1024
+MAX_TOTAL_PAYLOAD = pack.MAX_TOTAL_PAYLOAD
 Runner = Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]]
 InstallerError = pack.PackagingError
 
@@ -130,7 +131,7 @@ def verify_package(archive: Path) -> VerifiedPackage:
             ):
                 raise InstallerError("许可证目录不能包含可执行文件")
             total += entry.file_size
-            if entry.file_size > MAX_PAYLOAD or total > MAX_PAYLOAD or entry.flag_bits & 1:
+            if entry.file_size > MAX_PAYLOAD or total > MAX_TOTAL_PAYLOAD or entry.flag_bits & 1:
                 raise InstallerError("ZIP payload 过大或已加密")
             payload[relative] = source.read(entry)
     if not ROOT_FILES.issubset(payload):
