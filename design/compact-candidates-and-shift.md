@@ -26,6 +26,10 @@
 
 ## Shift 行为（用户已明确选择）
 
+0.5.11 的 Shift+字母、Caps Lock、原生透传及物理手势观察以
+[候选简化与按键合同](input-commands-case-and-clean-candidates.md) 为准，
+替代历史上为观察手势而预测接管原生键的实现。
+
 - 默认中文。单独按下再松开 Shift 切换中英文；左右 Shift 等价，
   与其他按键搭配、Ctrl/Alt/Win 组合、重复按下均不得误切换。
   OnTestKeyDown/Up 为纯预测，不改变模式或提交；只在真实回调落实。

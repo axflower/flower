@@ -529,6 +529,8 @@ fn valid_input(input: &str) -> bool {
 }
 fn can_apply(page: &Page) -> bool {
     page.bound
+        && (!matches!(page.task, Task::Expand { .. })
+            || (page.selection && valid_page_input(&page.input, page.task)))
         && page.result.as_ref().is_some_and(|r| {
             r.complete
                 && !r.consumed
@@ -539,8 +541,7 @@ fn can_apply(page: &Page) -> bool {
                 && r.origin.binding_id == page.binding_id
                 && r.origin.bound
                 && r.origin.selection == page.selection
-                && !r.text.trim().is_empty()
-                && r.text.chars().count() <= 800
+                && page.task.validate_output(&page.input, &r.text).is_ok()
         })
 }
 impl Page {
@@ -601,16 +602,29 @@ pub(crate) fn open_panel_with_store(
     if !crate::writing::config::online_enabled(preference_store.as_ref()) {
         return Err(crate::writing::WritingError::OnlineDisabled.to_string());
     }
-    require_draft(task)?;
+    require_panel_task(task)?;
     let insertion = matches!(source, PanelSource::Insertion);
-    let bound = insertion && apply.is_some();
+    let expanding = matches!(task, Task::Expand { .. });
+    let input = expansion_source(task, &source, apply.is_some())?;
+    let task = if expanding {
+        Task::Expand {
+            target_chars: if input.chars().count() >= 500 {
+                800
+            } else {
+                500
+            },
+        }
+    } else {
+        task
+    };
+    let bound = (insertion || expanding) && apply.is_some();
     // A selection is not an insertion grant. Never reuse replacement authority.
     let page = Page {
         binding_id: u64::from(bound),
         task,
         script,
-        input: String::new(),
-        selection: false,
+        input,
+        selection: expanding,
         bound,
         result: None,
     };
@@ -655,7 +669,11 @@ pub(crate) fn open_panel_with_store(
         let created = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             CLASS,
-            w!("AI 帮写"),
+            if expanding {
+                w!("AI扩写")
+            } else {
+                w!("AI 帮写")
+            },
             WS_OVERLAPPED
                 | WS_CAPTION
                 | WS_SYSMENU
@@ -696,14 +714,18 @@ impl WritingPanel {
         alive(&self.state)
     }
     pub fn show(&self, task: Task) -> Result<(), String> {
-        require_draft(task)?;
+        require_panel_task(task)?;
         if !self.is_open() {
             return Err("面板已关闭。".into());
+        }
+        if matches!(task, Task::Expand { .. })
+            != matches!(self.state.borrow().page.task, Task::Expand { .. })
+        {
+            return Err("请先关闭当前写作窗口，再打开另一类任务。".into());
         }
         if busy(&self.state.borrow()) {
             notice(&self.state, "请先停止当前生成，再切换任务。");
         } else {
-            require_draft(task)?;
             render(&self.state);
         }
         unsafe {
@@ -728,6 +750,7 @@ impl Drop for WritingPanel {
 }
 /// Standalone manual entry only. Never posts thread-wide WM_QUIT.
 pub fn run_writing_app(task: Task) -> Result<(), String> {
+    require_draft(task)?;
     let panel = open_panel(task, ChineseScript::Simplified, PanelSource::Manual, None)?;
     unsafe {
         let mut msg = MSG::default();
@@ -971,6 +994,41 @@ fn require_draft(task: Task) -> Result<(), String> {
     } else {
         Err("润色请使用原文旁候选浮层；AI帮写窗口不接受润色任务。".into())
     }
+}
+fn require_panel_task(task: Task) -> Result<(), String> {
+    if matches!(task, Task::Expand { .. }) {
+        Ok(())
+    } else {
+        require_draft(task)
+    }
+}
+fn expansion_source(task: Task, source: &PanelSource, bound: bool) -> Result<String, String> {
+    if !matches!(task, Task::Expand { .. }) {
+        return Ok(String::new());
+    }
+    match source {
+        PanelSource::Selection(input) if bound && valid_input(input) => Ok(input.clone()),
+        _ => Err("AI扩写需要1至500字的安全选区及有效替换绑定，不能使用手动来源。".into()),
+    }
+}
+fn expansion_target(value: &str, input: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let target = value.parse::<usize>().ok()?;
+    ((crate::writing::MIN_EXPANSION_CHARS..=crate::writing::MAX_EXPANSION_TARGET_CHARS)
+        .contains(&target)
+        && target > input.chars().count())
+    .then_some(target)
+}
+fn valid_page_input(input: &str, task: Task) -> bool {
+    valid_input(input)
+        && match task {
+            Task::Expand { target_chars } => {
+                expansion_target(&target_chars.to_string(), input).is_some()
+            }
+            _ => true,
+        }
 }
 fn content_height(width: i32, _connection: bool) -> i32 {
     1000 + if width < 620 { 176 } else { 0 }
@@ -1275,6 +1333,8 @@ fn replace_font(s: &Shared) {
 }
 fn build(s: &Shared) -> Result<(), String> {
     unsafe {
+        let expanding = matches!(s.borrow().page.task, Task::Expand { .. });
+        let output_limit = s.borrow().page.task.output_limit();
         let hwnd = s.borrow().hwnd;
         let dpi = s.borrow().dpi;
         let scale = |v: i32| v * dpi / 96;
@@ -1329,7 +1389,16 @@ fn build(s: &Shared) -> Result<(), String> {
             Ok(h)
         };
         let button = WS_TABSTOP.0 | BS_OWNERDRAW as u32;
-        add(10, w!("STATIC"), "AI 帮写", 24, 20, 200, 32, 0)?;
+        add(
+            10,
+            w!("STATIC"),
+            if expanding { "AI扩写" } else { "AI 帮写" },
+            24,
+            20,
+            200,
+            32,
+            0,
+        )?;
         add(HELP, w!("BUTTON"), "使用帮助", 560, 20, 136, 32, button)?;
         add(
             11,
@@ -1341,7 +1410,20 @@ fn build(s: &Shared) -> Result<(), String> {
             24,
             0,
         )?;
-        add(1, w!("STATIC"), "01  写下要点", 40, 112, 620, 24, 0)?;
+        add(
+            1,
+            w!("STATIC"),
+            if expanding {
+                "01  原文（只读）"
+            } else {
+                "01  写下要点"
+            },
+            40,
+            112,
+            620,
+            24,
+            0,
+        )?;
         add(
             12,
             w!("STATIC"),
@@ -1364,8 +1446,16 @@ fn build(s: &Shared) -> Result<(), String> {
             (TONE, "语气", vec!["自然", "正式", "礼貌"]),
             (
                 LENGTH,
-                "长度",
-                vec!["简短（50–100字）", "适中（100–200字）"],
+                if expanding {
+                    "目标字数（100–2000）"
+                } else {
+                    "长度"
+                },
+                if expanding {
+                    vec!["100", "300", "500", "800", "1200", "2000"]
+                } else {
+                    vec!["简短（50–100字）", "适中（100–200字）"]
+                },
             ),
             (SCRIPT, "输出字形", vec!["简体中文", "通用繁体中文"]),
         ] {
@@ -1378,8 +1468,21 @@ fn build(s: &Shared) -> Result<(), String> {
                 336,
                 180,
                 160,
-                WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0,
+                WS_TABSTOP.0
+                    | if expanding && id == LENGTH {
+                        CBS_DROPDOWN as u32
+                    } else {
+                        CBS_DROPDOWNLIST as u32
+                    }
+                    | WS_VSCROLL.0,
             )?;
+            if expanding && id == LENGTH {
+                if let Ok(edit) = GetWindow(h, GW_CHILD) {
+                    if !SetWindowSubclass(edit, Some(keys), id, hwnd.0 as usize).as_bool() {
+                        return Err("无法设置目标字数键盘导航。".into());
+                    }
+                }
+            }
             for item in items {
                 let item = wide(item);
                 SendMessageW(h, CB_ADDSTRING, WPARAM(0), LPARAM(item.as_ptr() as isize));
@@ -1401,7 +1504,7 @@ fn build(s: &Shared) -> Result<(), String> {
         add(
             13,
             w!("STATIC"),
-            "尚无结果 · 完成后可编辑，最多800字",
+            &format!("尚无结果 · 完成后可编辑，最多{}字", output_limit),
             40,
             488,
             640,
@@ -1409,7 +1512,13 @@ fn build(s: &Shared) -> Result<(), String> {
             0,
         )?;
         let output = add(OUTPUT, w!("EDIT"), "", 40, 520, 640, 152, edit)?;
-        SendMessageW(output, EM_SETLIMITTEXT, WPARAM(32767), LPARAM(0));
+        // Win32 counts UTF-16 units; the model validates Unicode scalar counts.
+        SendMessageW(
+            output,
+            EM_SETLIMITTEXT,
+            WPARAM(s.borrow().page.task.output_limit() * 2),
+            LPARAM(0),
+        );
         add(COPY, w!("BUTTON"), "复制结果", 40, 688, 140, 36, button)?;
         add(
             APPLY,
@@ -1474,17 +1583,29 @@ fn render(s: &Shared) {
         let p = &state.page;
         let running = busy(&state);
         let mut status = format!(
-            "要点 {}/500 字 · 结果 {}/800 字\n{}",
+            "{} {}/500 字 · 结果 {}/{} 字\n{}",
+            if matches!(p.task, Task::Expand { .. }) {
+                "原文"
+            } else {
+                "要点"
+            },
             p.input.chars().count(),
             p.result.as_ref().map_or(0, |r| r.text.chars().count()),
+            p.task.output_limit(),
             state.status
         );
+        if let Task::Expand { target_chars } = p.task {
+            status.push_str(&format!(" 目标约{target_chars}字。"));
+            if !valid_page_input(&p.input, p.task) {
+                status.push_str(" 目标无效：请输入100至2000的完整整数，且须大于原文字数。");
+            }
+        }
         if p.input.chars().count() > 500 {
             status.push_str(" 原输入已保留：超过500字，请缩短后生成。");
         }
         if let Some(r) = &p.result {
-            if r.text.chars().count() > 800 {
-                status.push_str(" 编辑结果超过800字，请缩短后应用。");
+            if let Err(error) = p.task.validate_output(&p.input, &r.text) {
+                status.push_str(&format!(" {error}"));
             }
             if r.stale {
                 status.push_str(" 上次结果：输入或选项已变化；请点“恢复原任务”后核对目标。");
@@ -1540,13 +1661,15 @@ fn render(s: &Shared) {
             STATUS => set_text(h, &status),
             13 => set_text(
                 h,
-                if running {
-                    "正在生成 · 完成前不可编辑或插入"
-                } else if result.is_empty() {
-                    "尚无结果 · 完成后可编辑，最多800字"
-                } else {
-                    "请核对事实 · 可以编辑，最多800字"
-                },
+                &format!(
+                    "{} · 最多{}字",
+                    if running {
+                        "正在生成，完成前不可应用"
+                    } else {
+                        "请核对事实 · 完整结果可编辑"
+                    },
+                    task.output_limit()
+                ),
             ),
             GENERATE => {
                 set_text(
@@ -1554,15 +1677,19 @@ fn render(s: &Shared) {
                     if running {
                         "停止生成"
                     } else {
-                        "生成草稿"
+                        if matches!(task, Task::Expand { .. }) {
+                            "开始扩写"
+                        } else {
+                            "生成草稿"
+                        }
                     },
                 );
                 unsafe {
-                    enable_changed(h, running || valid_input(&input));
+                    enable_changed(h, running || valid_page_input(&input, task));
                 }
             }
             AGAIN => unsafe {
-                enable_changed(h, !running && valid_input(&input));
+                enable_changed(h, !running && valid_page_input(&input, task));
             },
             RESTORE => {
                 let available = {
@@ -1581,7 +1708,14 @@ fn render(s: &Shared) {
                 enable_changed(h, !running && !result.is_empty());
             },
             APPLY => {
-                set_text(h, "插入到原位置（一次）");
+                set_text(
+                    h,
+                    if matches!(task, Task::Expand { .. }) {
+                        "替换原选区"
+                    } else {
+                        "插入到原位置（一次）"
+                    },
+                );
                 unsafe {
                     enable_changed(h, !running && apply_ok);
                 }
@@ -1605,8 +1739,13 @@ fn render(s: &Shared) {
                 if let Task::Draft { length, .. } = task {
                     select(h, if length == Length::Short { 0 } else { 1 });
                 }
+                if let Task::Expand { target_chars } = task {
+                    if target_chars != 0 && text(h) != target_chars.to_string() {
+                        set_text(h, &target_chars.to_string());
+                    }
+                }
                 unsafe {
-                    enable_changed(h, !running && matches!(task, Task::Draft { .. }));
+                    enable_changed(h, !running);
                 }
             }
             SCRIPT => {
@@ -1635,6 +1774,10 @@ fn command(s: &Shared, id: usize, notification: u32) {
         return;
     }
     if notification == EN_CHANGE && (id == INPUT || id == OUTPUT) {
+        if busy(&s.borrow()) || (id == INPUT && s.borrow().page.selection) {
+            render(s);
+            return;
+        }
         let value = text(control(s, id));
         {
             let mut state = s.borrow_mut();
@@ -1652,27 +1795,48 @@ fn command(s: &Shared, id: usize, notification: u32) {
         render(s);
         return;
     }
-    if notification == CBN_SELCHANGE && [TONE, LENGTH, SCRIPT].contains(&id) {
+    if (notification == CBN_SELCHANGE || (notification == CBN_EDITCHANGE && id == LENGTH))
+        && [TONE, LENGTH, SCRIPT].contains(&id)
+    {
         let tone = selection(control(s, TONE));
         let length = selection(control(s, LENGTH));
         let script = selection(control(s, SCRIPT));
+        let expanding = matches!(s.borrow().page.task, Task::Expand { .. });
+        let target_value = if expanding && id == LENGTH && notification == CBN_SELCHANGE {
+            [100, 300, 500, 800, 1200, 2000]
+                .get(length)
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        } else {
+            text(control(s, LENGTH))
+        };
         {
             let mut state = s.borrow_mut();
             if busy(&state) {
                 return;
             }
             let p = &mut state.page;
-            p.task = Task::Draft {
-                tone: match tone {
-                    1 => Tone::Formal,
-                    2 => Tone::Polite,
-                    _ => Tone::Natural,
-                },
-                length: if length == 0 {
-                    Length::Short
+            p.task = if expanding {
+                if id == LENGTH {
+                    Task::Expand {
+                        target_chars: expansion_target(&target_value, &p.input).unwrap_or(0),
+                    }
                 } else {
-                    Length::Medium
-                },
+                    p.task
+                }
+            } else {
+                Task::Draft {
+                    tone: match tone {
+                        1 => Tone::Formal,
+                        2 => Tone::Polite,
+                        _ => Tone::Natural,
+                    },
+                    length: if length == 0 {
+                        Length::Short
+                    } else {
+                        Length::Medium
+                    },
+                }
             };
             p.script = if script == 0 {
                 ChineseScript::Simplified
@@ -1795,9 +1959,12 @@ fn generate_with(
     let request = {
         let mut state = s.borrow_mut();
         let p = &state.page;
-        if !valid_input(&p.input) {
+        if !valid_page_input(&p.input, p.task) {
             drop(state);
-            notice(s, "请输入1至500字；超限原文不会被截断发送。");
+            notice(
+                s,
+                "请输入1至500字；扩写目标须为100至2000的完整整数且大于原文，不能发送无效参数。",
+            );
             return;
         }
         let task = p.task;
@@ -2308,7 +2475,7 @@ mod tests {
         source: PanelSource,
         apply: Option<ApplyCallback>,
     ) -> Result<WritingPanel, String> {
-        require_draft(task)?;
+        require_panel_task(task)?;
         let directory = std::env::var_os("FLOWER_WRITING_FIXTURE_DIR")
             .or_else(|| std::env::var_os("FLOWER_CONSENT_TEST_DIR"))
             .expect("explicit isolated fixture directory");
@@ -2461,6 +2628,176 @@ mod tests {
             edited: false,
         });
         p
+    }
+    #[test]
+    fn expansion_source_requires_selection_and_binding() {
+        let task = Task::expand();
+        assert!(require_panel_task(task).is_ok());
+        assert!(require_draft(task).is_err());
+        assert!(expansion_source(task, &PanelSource::Manual, true).is_err());
+        assert!(expansion_source(task, &PanelSource::Insertion, true).is_err());
+        for input in ["".into(), " ".into(), "字".repeat(501)] {
+            assert!(expansion_source(task, &PanelSource::Selection(input), true).is_err());
+        }
+        let source = PanelSource::Selection("原文".into());
+        assert!(expansion_source(task, &source, false).is_err());
+        assert_eq!(expansion_source(task, &source, true).unwrap(), "原文");
+    }
+    #[test]
+    fn expansion_target_complete_integer_boundaries() {
+        for value in [
+            "",
+            " 500",
+            "500 ",
+            "+500",
+            "-500",
+            "500字",
+            "500.0",
+            "５００",
+            "99",
+            "2001",
+            "999999999999999999999999",
+        ] {
+            assert_eq!(expansion_target(value, "原文"), None, "{value}");
+        }
+        for target in [100, 300, 500, 800, 1200, 2000] {
+            assert_eq!(expansion_target(&target.to_string(), "原文"), Some(target));
+        }
+        assert_eq!(expansion_target("500", &"字".repeat(500)), None);
+        assert_eq!(expansion_target("501", &"字".repeat(500)), Some(501));
+    }
+    fn expanded_page() -> Page {
+        let mut p = completed_page();
+        p.task = Task::expand();
+        p.selection = true;
+        let origin = p.origin();
+        let r = p.result.as_mut().unwrap();
+        r.origin = origin;
+        r.text = "字".repeat(801);
+        p
+    }
+    #[test]
+    fn expansion_output_limit_growth_and_once() {
+        let mut p = expanded_page();
+        assert!(can_apply(&p));
+        p.result.as_mut().unwrap().text = "字".repeat(2400);
+        assert!(can_apply(&p));
+        p.result.as_mut().unwrap().text.push('字');
+        assert!(!can_apply(&p));
+        p.result.as_mut().unwrap().text = p.input.clone();
+        assert!(!can_apply(&p));
+        p.result.as_mut().unwrap().text = "字".repeat(801);
+        assert!(p.consume().is_some());
+        assert!(p.consume().is_none());
+        let mut draft = completed_page();
+        draft.result.as_mut().unwrap().text = "字".repeat(800);
+        assert!(can_apply(&draft));
+        draft.result.as_mut().unwrap().text.push('字');
+        assert!(!can_apply(&draft));
+    }
+    #[test]
+    fn expansion_params_and_restore_do_not_regrant_binding() {
+        let mut p = expanded_page();
+        for target_chars in [800, 0] {
+            p.task = Task::Expand { target_chars };
+            assert!(!can_apply(&p));
+        }
+        assert!(p.restore());
+        assert!(can_apply(&p));
+        p.bound = false;
+        p.binding_id = 0;
+        assert!(p.restore());
+        assert!(!can_apply(&p));
+        assert!(p.consume().is_none());
+    }
+    #[test]
+    #[ignore = "owned native window and isolated Store; FLOWER_WRITING_FIXTURE_DIR required"]
+    fn expansion_native_owned_controls() {
+        let applied = Rc::new(std::cell::Cell::new(0));
+        let writes = applied.clone();
+        let mut panel = open_panel(
+            Task::expand(),
+            ChineseScript::Simplified,
+            PanelSource::Selection("公开原文".into()),
+            Some(Box::new(move |_| {
+                writes.set(writes.get() + 1);
+                Ok(())
+            })),
+        )
+        .unwrap();
+        let s = &panel.state;
+        assert!(s.borrow().page.selection && s.borrow().page.bound);
+        assert!(panel.show(Task::draft()).is_err());
+        panel.show(Task::Expand { target_chars: 1200 }).unwrap();
+        assert_eq!(s.borrow().page.task, Task::expand());
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("FLOWER_WRITING_FIXTURE_DIR").unwrap());
+        write_client_bitmap(panel.hwnd(), &directory.join("expansion-initial.bmp"));
+        set_text(control(s, INPUT), "不得修改");
+        command(s, INPUT, EN_CHANGE);
+        assert_eq!(s.borrow().page.input, "公开原文");
+        assert_eq!(text(control(s, INPUT)), "公开原文");
+        set_text(control(s, LENGTH), "1234");
+        command(s, LENGTH, CBN_EDITCHANGE);
+        assert_eq!(s.borrow().page.task, Task::Expand { target_chars: 1234 });
+        assert!(s.borrow().job.is_none() && !s.borrow().pending);
+        set_text(control(s, LENGTH), "1234x");
+        command(s, LENGTH, CBN_EDITCHANGE);
+        assert!(!valid_page_input(
+            &s.borrow().page.input,
+            s.borrow().page.task
+        ));
+        assert!(s.borrow().job.is_none());
+        select(control(s, LENGTH), 3);
+        command(s, LENGTH, CBN_SELCHANGE);
+        assert_eq!(s.borrow().page.task, Task::Expand { target_chars: 800 });
+        {
+            let mut state = s.borrow_mut();
+            let origin = state.page.origin();
+            state.page.result = Some(ResultText {
+                origin,
+                id: 1,
+                text: "字".repeat(900),
+                complete: true,
+                consumed: false,
+                stale: false,
+                edited: false,
+            });
+        }
+        render(s);
+        assert_eq!(applied.get(), 0);
+        assert!(can_apply(&s.borrow().page));
+        for dpi in [96, 144, 192] {
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 600,
+                bottom: 540,
+            };
+            unsafe {
+                SendMessageW(
+                    panel.hwnd(),
+                    WM_DPICHANGED,
+                    WPARAM(dpi | (dpi << 16)),
+                    LPARAM((&rect as *const RECT) as isize),
+                );
+            }
+            for id in [INPUT, LENGTH, SCRIPT, GENERATE, OUTPUT, APPLY, CONNECTION] {
+                reveal(s, control(s, id));
+                assert_control_visible(s, id);
+            }
+            let directory =
+                std::path::PathBuf::from(std::env::var_os("FLOWER_WRITING_FIXTURE_DIR").unwrap());
+            write_client_bitmap(
+                panel.hwnd(),
+                &directory.join(format!("expansion-owned-{dpi}.bmp")),
+            );
+        }
+        apply_result(s);
+        assert_eq!(applied.get(), 1);
+        apply_result(s);
+        assert_eq!(applied.get(), 1);
+        panel.close();
     }
     #[test]
     fn changed_input_restore_preserves_existing_authority() {

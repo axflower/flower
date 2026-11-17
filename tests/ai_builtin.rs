@@ -29,10 +29,7 @@ fn builtin_question_corrects_and_commits_without_learning() {
     assert_eq!(update.candidates[0], original);
     assert_eq!(update.candidates[1].text, EXPECTED);
     assert!(update.candidates[1].is_ai());
-    assert_eq!(
-        update.candidates[1].display_text(),
-        format!("{EXPECTED} ✓ AI")
-    );
+    assert_eq!(update.candidates[1].display_text(), format!("{EXPECTED} √"));
     assert!(router.pending_learning().is_empty());
     assert!(router.pending_promotions().is_empty());
 
@@ -56,7 +53,7 @@ fn builtin_question_corrects_and_commits_without_learning() {
     }
     let committed = router.select_candidate(1).unwrap();
     assert_eq!(committed.commit.as_deref(), Some(EXPECTED));
-    assert!(!committed.commit.as_deref().unwrap().contains("✓ AI"));
+    assert!(!committed.commit.as_deref().unwrap().contains('√'));
     assert!(!router.is_composing());
     assert!(router.pending_learning().is_empty());
     assert!(router.pending_promotions().is_empty());

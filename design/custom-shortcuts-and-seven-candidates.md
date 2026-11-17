@@ -1,5 +1,9 @@
 # 自定义快捷键、七项候选与界面精修
 
+最新默认 Ctrl+Shift+1/2、旧设置迁移及编辑式润色以
+`editorial-polish-and-default-shortcuts.md` 为准。下文旧默认组合仅为历史记录；
+自定义录制、纯修饰手势及系统冲突规则继续有效。
+
 0.5.2反馈后的在线总开关（默认关闭）、首屏词/单字配额、状态行移除、
 齿轮居中与旧默认9迁7以`general-online-ai-and-candidate-quotas.md`为准。
 

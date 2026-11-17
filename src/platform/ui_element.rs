@@ -115,7 +115,7 @@ impl ITfCandidateListUIElement_Impl for CandidateUi_Impl {
             .borrow()
             .candidates
             .get(index as usize)
-            .map(|candidate| BSTR::from(candidate.text.as_str()))
+            .map(|candidate| BSTR::from(candidate.display_text().as_ref()))
             .ok_or_else(|| E_INVALIDARG.into())
     }
     fn GetPageIndex(&self, index: *mut u32, size: u32, count: *mut u32) -> Result<()> {

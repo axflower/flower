@@ -121,6 +121,23 @@ impl PinyinSession {
             return Ok(self.snapshot(false));
         }
 
+        if let Key::Char(character) = event.key {
+            if event.modifiers.shift && character.is_ascii_alphabetic() {
+                // Preserve all original spelling rather than silently accepting
+                // a Chinese candidate when the user types an uppercase literal.
+                self.pending_learning.clear();
+                self.pending_promotions.clear();
+                self.pending_phrase_learning.clear();
+                let mut update = self.commit_raw();
+                update.handled = true;
+                update
+                    .commit
+                    .get_or_insert_with(String::new)
+                    .push(character.to_ascii_uppercase());
+                return Ok(update);
+            }
+        }
+
         // Platform-neutral callers can also supply Shift plus a digit directly.
         let key = match event.key {
             Key::Char(c) if event.modifiers.shift && c.is_ascii_digit() => {

@@ -106,19 +106,21 @@ const CARDS: [[i32; 4]; 1] = [[28, 72, 704, 304]];
 const CATEGORY_ID: i32 = 400;
 const DRAFT_SHORTCUT_ID: i32 = 410;
 const RESET_SHORTCUTS_ID: i32 = 412;
+const EXPAND_SHORTCUT_ID: i32 = 413;
+const SHORTCUT_IDS: [i32; 3] = [DRAFT_SHORTCUT_ID, 411, EXPAND_SHORTCUT_ID];
 
 fn select_shortcuts(c: SettingsControls, shortcuts: WritingShortcuts) {
-    for (control, value) in c
-        .shortcuts
-        .into_iter()
-        .zip([shortcuts.draft, shortcuts.polish])
-    {
-        let text = wide_null(&value.label());
+    for (control, value) in c.shortcuts.into_iter().zip([
+        Some(shortcuts.draft),
+        Some(shortcuts.polish),
+        shortcuts.expand,
+    ]) {
+        let text = wide_null(&value.map_or_else(|| "未设置".into(), |s| s.label()));
         unsafe {
             SetWindowLongPtrW(
                 control,
                 GWLP_USERDATA,
-                value.key as isize | ((value.modifiers as isize) << 16),
+                value.map_or(0, |s| s.key as isize | ((s.modifiers as isize) << 16)),
             );
             let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
                 control,
@@ -154,8 +156,10 @@ fn category_controls(c: SettingsControls) -> [Vec<HWND>; 4] {
         vec![
             c.shortcut_labels[0],
             c.shortcut_labels[1],
+            c.shortcut_labels[2],
             c.shortcuts[0],
             c.shortcuts[1],
+            c.shortcuts[2],
             c.reset_shortcuts,
             c.shortcut_hint,
         ],
@@ -669,7 +673,14 @@ fn settings_key_route(
         // handle from another window may determine a settings action.
         match unsafe { GetDlgCtrlID(message.hwnd) } {
             id @ (CANCEL_BUTTON_ID | CLEAR_LEARNING_ID | LEARNING_ID | DOMAIN_ENABLED_ID) => id,
-            id @ (390 | 391 | 392 | DRAFT_SHORTCUT_ID | 411 | RESET_SHORTCUTS_ID | 400..=403) => id,
+            id @ (390
+            | 391
+            | 392
+            | DRAFT_SHORTCUT_ID
+            | 411
+            | EXPAND_SHORTCUT_ID
+            | RESET_SHORTCUTS_ID
+            | 400..=403) => id,
             _ => SAVE_BUTTON_ID,
         }
     };
@@ -736,19 +747,18 @@ fn capture_shortcut(hwnd: HWND, state: &RefCell<SettingsUiState>, message: &MSG)
         None
     };
     if let Some(value) = value {
-        let mut values = read_shortcuts(c).unwrap_or_default();
-        let other = if index == 0 {
-            values.polish
-        } else {
-            values.draft
+        let Ok(mut values) = read_shortcuts(c) else {
+            restore();
+            return true;
         };
         restore();
-        if value.is_supported() && value != other {
-            if index == 0 {
-                values.draft = value;
-            } else {
-                values.polish = value;
-            }
+        match index {
+            0 => values.draft = value,
+            1 => values.polish = value,
+            2 => values.expand = Some(value),
+            _ => return true,
+        }
+        if values.is_valid() {
             select_shortcuts(c, values);
         } else {
             let text = wide_null("组合不支持、为系统保留或与另一功能冲突；原值未更改。");
@@ -814,8 +824,8 @@ struct SettingsControls {
     scroll_x: i32,
     scroll_y: i32,
     categories: [HWND; 4],
-    shortcuts: [HWND; 2],
-    shortcut_labels: [HWND; 2],
+    shortcuts: [HWND; 3],
+    shortcut_labels: [HWND; 3],
     reset_shortcuts: HWND,
     shortcut_hint: HWND,
     online_settings: HWND,
@@ -908,11 +918,12 @@ unsafe fn handle_settings_message(
                 if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
                     show_category(state, (control_id - CATEGORY_ID) as usize);
                 }
-            } else if (DRAFT_SHORTCUT_ID..DRAFT_SHORTCUT_ID + 2).contains(&control_id)
-                && notification == BN_CLICKED
-            {
+            } else if SHORTCUT_IDS.contains(&control_id) && notification == BN_CLICKED {
                 if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
-                    let index = (control_id - DRAFT_SHORTCUT_ID) as usize;
+                    let index = SHORTCUT_IDS
+                        .iter()
+                        .position(|id| *id == control_id)
+                        .unwrap();
                     let c = state.borrow().controls;
                     if let Ok(values) = read_shortcuts(c) {
                         select_shortcuts(c, values);
@@ -1499,7 +1510,7 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         )?;
         state.borrow_mut().controls.categories[index] = control;
     }
-    for (index, caption) in ["帮写", "润色"].into_iter().enumerate() {
+    for (index, caption) in ["AI帮写", "AI润色", "AI扩写"].into_iter().enumerate() {
         let text = wide_null(caption);
         let label = create_control(
             hwnd,
@@ -1507,7 +1518,7 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
             windows::core::w!("STATIC"),
             PCWSTR(text.as_ptr()),
             WS_CHILD.0 | WS_VISIBLE.0,
-            420 + index as i32,
+            [420, 421, 423][index],
         )?;
         let combo = create_control(
             hwnd,
@@ -1515,7 +1526,7 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
             windows::core::w!("BUTTON"),
             PCWSTR::null(),
             WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0,
-            DRAFT_SHORTCUT_ID + index as i32,
+            SHORTCUT_IDS[index],
         )?;
         state.borrow_mut().controls.shortcuts[index] = combo;
         state.borrow_mut().controls.shortcut_labels[index] = label;
@@ -1767,8 +1778,10 @@ fn control_layout(c: SettingsControls) -> Vec<(HWND, [i32; 4])> {
         (c.shortcut_labels[1], [48, 224, 100, 28]),
         (c.shortcuts[0], [164, 172, 280, 36]),
         (c.shortcuts[1], [164, 220, 280, 36]),
-        (c.reset_shortcuts, [480, 220, 224, 36]),
-        (c.shortcut_hint, [48, 296, 656, 112]),
+        (c.shortcut_labels[2], [48, 272, 100, 28]),
+        (c.shortcuts[2], [164, 268, 280, 36]),
+        (c.reset_shortcuts, [480, 268, 224, 36]),
+        (c.shortcut_hint, [48, 320, 656, 112]),
         (c.online_settings, [364, 264, 300, 40]),
         (c.model_api_settings, [48, 264, 280, 40]),
         (c.headings[2], [48, 172, 292, 28]),
@@ -1833,8 +1846,10 @@ fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), Window
         controls.categories[3],
         controls.shortcuts[0],
         controls.shortcuts[1],
+        controls.shortcuts[2],
         controls.shortcut_labels[0],
         controls.shortcut_labels[1],
+        controls.shortcut_labels[2],
         controls.reset_shortcuts,
         controls.shortcut_hint,
         controls.online_settings,
@@ -1987,6 +2002,7 @@ fn theme_dropdown_open(state: &RefCell<SettingsUiState>) -> bool {
     [
         controls.shortcuts[0],
         controls.shortcuts[1],
+        controls.shortcuts[2],
         controls.theme_combo,
         controls.domain_combo,
         controls.script_combo,
@@ -2463,9 +2479,10 @@ fn read_shortcuts(controls: SettingsControls) -> Result<WritingShortcuts, String
     let shortcuts = WritingShortcuts {
         draft: selected[0],
         polish: selected[1],
+        expand: (selected[2] != WritingShortcut::new(0, 0)).then_some(selected[2]),
     };
     if !shortcuts.is_valid() {
-        return Err("帮写与润色不能使用相同快捷键，且不能使用保留组合。".into());
+        return Err("帮写、润色与AI扩写不能使用相同快捷键，且不能使用保留组合。".into());
     }
     Ok(shortcuts)
 }
@@ -3227,6 +3244,7 @@ mod tests {
                     c.domain_combo,
                     c.shortcuts[0],
                     c.shortcuts[1],
+                    c.shortcuts[2],
                 ]
                 .contains(control)
                 {
@@ -3256,11 +3274,34 @@ mod tests {
         let custom = WritingShortcuts {
             draft: WritingShortcut::new(0x41, 5),
             polish: WritingShortcut::new(0x7b, 5),
+            ..WritingShortcuts::default()
         };
         select_shortcuts(c, custom);
-        for (control, value) in c.shortcuts.into_iter().zip([custom.draft, custom.polish]) {
+        for (control, value) in
+            c.shortcuts
+                .into_iter()
+                .zip([custom.draft, custom.polish, custom.expand.unwrap()])
+        {
             assert_eq!(read_control_text(control).unwrap(), value.label());
         }
+        let disabled = WritingShortcuts {
+            expand: None,
+            ..custom
+        };
+        select_shortcuts(c, disabled);
+        assert_eq!(read_control_text(c.shortcuts[2]).unwrap(), "未设置");
+        assert_eq!(read_form(state).unwrap().writing_shortcuts, disabled);
+        for expand in [custom.draft, custom.polish] {
+            select_shortcuts(
+                c,
+                WritingShortcuts {
+                    expand: Some(expand),
+                    ..custom
+                },
+            );
+            assert!(read_form(state).is_err());
+        }
+        select_shortcuts(c, custom);
         let store = state.borrow().store.clone();
         for enabled in [true, false] {
             set_checked(c.online_ai, enabled);
@@ -3279,6 +3320,7 @@ mod tests {
             WritingShortcuts {
                 draft: custom.draft,
                 polish: custom.draft,
+                ..custom
             },
         );
         assert!(read_form(state).is_err());
@@ -3415,10 +3457,31 @@ mod tests {
             SendMessageW(
                 hwnd,
                 WM_COMMAND,
-                WPARAM((DRAFT_SHORTCUT_ID as usize) + index),
+                WPARAM(SHORTCUT_IDS[index] as usize),
                 LPARAM(0),
             );
         };
+        select_shortcuts(c, WritingShortcuts::default());
+        begin(2);
+        assert!(send(2, 0x41, 5, true));
+        assert_eq!(
+            read_shortcuts(c).unwrap().expand,
+            Some(WritingShortcut::new(0x41, 5))
+        );
+        let expanded = read_shortcuts(c).unwrap();
+        // Neither direction of a collision may replace the previous chords.
+        begin(0);
+        assert!(send(0, 0x41, 5, true));
+        assert_eq!(read_shortcuts(c).unwrap(), expanded);
+        begin(2);
+        assert!(send(2, 0x31, 5, true));
+        assert_eq!(read_shortcuts(c).unwrap(), expanded);
+        for cancel in [0x1b, 0x0d, 0x09] {
+            begin(2);
+            assert_eq!(send(2, cancel, 0, true), cancel != 0x09);
+            assert!(state.borrow().controls.recording.is_none());
+            assert_eq!(read_shortcuts(c).unwrap(), expanded);
+        }
         select_shortcuts(c, WritingShortcuts::default());
         begin(0);
         assert!(send(0, 0x11, 1, true));
@@ -3482,13 +3545,14 @@ mod tests {
             (controls.save_button, SAVE_BUTTON_ID),
             (controls.categories[2], CATEGORY_ID + 2),
             (controls.reset_shortcuts, RESET_SHORTCUTS_ID),
+            (controls.shortcuts[2], EXPAND_SHORTCUT_ID),
             (controls.online_settings, 390),
             (controls.model_api_settings, 392),
             (controls.restore_send_confirmation, 391),
         ] {
             if target == controls.clear_learning {
                 show_category(state, 3);
-            } else if target == controls.reset_shortcuts {
+            } else if target == controls.reset_shortcuts || target == controls.shortcuts[2] {
                 show_category(state, 2);
             } else if target == controls.online_settings
                 || target == controls.model_api_settings
@@ -3744,6 +3808,9 @@ mod tests {
             c.save_button,
             c.cancel_button,
             c.reset_shortcuts,
+            c.shortcuts[0],
+            c.shortcuts[1],
+            c.shortcuts[2],
             c.online_settings,
             c.model_api_settings,
             c.ai_correction,

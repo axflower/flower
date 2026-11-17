@@ -28,16 +28,64 @@ impl Candidate {
         self.comment.starts_with(Self::COMPLETION_PREFIX)
     }
 
-    /// Display-only provenance; never part of committed text.
+    /// Display-only correction marker; never part of committed text.
     pub fn display_text(&self) -> std::borrow::Cow<'_, str> {
-        if self.is_ai() {
-            std::borrow::Cow::Owned(format!("{} ✓ AI", self.text))
-        } else if self.is_spelling() {
-            std::borrow::Cow::Owned(format!("{} ✓ 拼写", self.text))
-        } else if self.is_completion() {
-            std::borrow::Cow::Owned(format!("{} · 联想", self.text))
+        if self.is_ai() || self.is_spelling() {
+            std::borrow::Cow::Owned(format!("{} √", self.text))
         } else {
             std::borrow::Cow::Borrowed(&self.text)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Candidate;
+    use std::borrow::Cow;
+
+    #[test]
+    fn candidate_display_format_preserves_text_and_internal_identity() {
+        for (comment, flags, expected) in [
+            ("ni'hao".to_string(), (false, false, false), "你好"),
+            (
+                crate::ai::AI_COMMENT.to_string(),
+                (true, false, false),
+                "你好 √",
+            ),
+            (
+                format!("{}ni'hao", Candidate::SPELLING_PREFIX),
+                (false, true, false),
+                "你好 √",
+            ),
+            (
+                format!("{}ni'hao", Candidate::COMPLETION_PREFIX),
+                (false, false, true),
+                "你好",
+            ),
+        ] {
+            let candidate = Candidate::new("你好", comment.clone());
+            let original = candidate.clone();
+            let display = candidate.display_text();
+            assert_eq!(display, expected);
+            if flags.0 || flags.1 {
+                assert!(matches!(display, Cow::Owned(_)));
+            } else {
+                let Cow::Borrowed(text) = display else {
+                    panic!("ordinary and completion display must borrow the original text");
+                };
+                assert!(std::ptr::eq(text, candidate.text.as_str()));
+            }
+            assert_eq!(candidate, original);
+            assert_eq!(candidate.text, "你好");
+            assert_eq!(candidate.comment, comment);
+            assert_eq!(
+                (
+                    candidate.is_ai(),
+                    candidate.is_spelling(),
+                    candidate.is_completion()
+                ),
+                flags
+            );
         }
     }
 }

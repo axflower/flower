@@ -1,7 +1,7 @@
 //! Bounded SSE decoding. No provider diagnostics are exposed to the UI.
 
 use super::config::ApiProtocol;
-use super::{WritingError, MAX_EVENT_BYTES, MAX_OUTPUT_CHARS, MAX_RESPONSE_BYTES};
+use super::{Task, WritingError, MAX_EVENT_BYTES, MAX_OUTPUT_CHARS, MAX_RESPONSE_BYTES};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -18,9 +18,31 @@ pub struct SseDecoder {
     item_index: Option<u64>,
     reasoning_items: Vec<(u64, String)>,
     failure: Option<WritingError>,
+    output_limit: Option<usize>,
 }
 
 impl SseDecoder {
+    pub fn for_task(protocol: ApiProtocol, bigmodel: bool, task: Task) -> Self {
+        Self {
+            output_limit: Some(task.output_limit()),
+            ..Self::with_protocol(protocol, bigmodel)
+        }
+    }
+
+    fn output_limit(&self) -> usize {
+        self.output_limit.unwrap_or(MAX_OUTPUT_CHARS)
+    }
+
+    fn check_snapshot(&self, text: &Value) -> Result<(), WritingError> {
+        if text
+            .as_str()
+            .is_some_and(|text| text.chars().count() > self.output_limit())
+        {
+            return Err(WritingError::TooLarge);
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::with_protocol(ApiProtocol::ChatCompletions, true)
     }
@@ -159,7 +181,7 @@ impl SseDecoder {
             {
                 return Err(WritingError::Protocol);
             }
-            if self.text.chars().count() + content.chars().count() > MAX_OUTPUT_CHARS {
+            if self.text.chars().count() + content.chars().count() > self.output_limit() {
                 return Err(WritingError::TooLarge);
             }
             if !content.is_empty() {
@@ -204,11 +226,15 @@ impl SseDecoder {
                     if parts.len() != 1 || parts[0]["type"] != "output_text" {
                         return Err(WritingError::Rejected);
                     }
+                    self.check_snapshot(&parts[0]["text"])?;
                     if parts[0]["text"].as_str() != Some(self.text.as_str()) {
                         return Err(WritingError::Protocol);
                     }
                 }
                 if let Some(parts) = item["content"].as_array() {
+                    for part in parts {
+                        self.check_snapshot(&part["text"])?;
+                    }
                     if parts.iter().any(|p| p["type"] != "output_text") {
                         return Err(WritingError::Rejected);
                     }
@@ -247,6 +273,7 @@ impl SseDecoder {
                 Ok(())
             }
             "response.content_part.added" | "response.content_part.done" => {
+                self.check_snapshot(&event["part"]["text"])?;
                 self.response_identity(event, event["item_id"].as_str())?;
                 if event["content_index"] != 0 || event["part"]["type"] != "output_text" {
                     return Err(WritingError::Rejected);
@@ -264,6 +291,7 @@ impl SseDecoder {
                     return Err(WritingError::Protocol);
                 }
                 if kind.ends_with(".done") {
+                    self.check_snapshot(&event["text"])?;
                     return if event["text"].as_str() == Some(self.text.as_str()) {
                         Ok(())
                     } else {
@@ -277,7 +305,7 @@ impl SseDecoder {
                 {
                     return Err(WritingError::Protocol);
                 }
-                if self.text.chars().count() + text.chars().count() > MAX_OUTPUT_CHARS {
+                if self.text.chars().count() + text.chars().count() > self.output_limit() {
                     return Err(WritingError::TooLarge);
                 }
                 self.text.push_str(text);
@@ -334,6 +362,7 @@ impl SseDecoder {
                 if parts.len() != 1 || parts[0]["type"] != "output_text" {
                     return Err(WritingError::Rejected);
                 }
+                self.check_snapshot(&parts[0]["text"])?;
                 if parts[0]["text"].as_str() != Some(self.text.as_str()) {
                     return Err(WritingError::Protocol);
                 }
@@ -547,6 +576,103 @@ mod tests {
     }
     fn responses() -> SseDecoder {
         SseDecoder::with_protocol(ApiProtocol::Responses, false)
+    }
+
+    fn task_wire(protocol: ApiProtocol, text: &str, complete: bool) -> String {
+        if protocol == ApiProtocol::ChatCompletions {
+            if complete {
+                normal(text)
+            } else {
+                event(text, None)
+            }
+        } else {
+            let mut wire = response_wire(response_delta(text));
+            if complete {
+                wire += &response_normal_done(text, 0);
+                wire += &response_wire(response_complete(text));
+            }
+            wire
+        }
+    }
+
+    #[test]
+    fn task_budgets_allow_expansion_boundaries_but_keep_old_tasks_bounded() {
+        for protocol in [ApiProtocol::ChatCompletions, ApiProtocol::Responses] {
+            for count in [801, 2400] {
+                let text = "花".repeat(count);
+                let wire = task_wire(protocol, &text, true);
+                let mut decoder = SseDecoder::for_task(protocol, false, Task::expand());
+                let mut chunks = String::new();
+                for bytes in wire.as_bytes().chunks(37) {
+                    chunks.extend(decoder.push(bytes).unwrap());
+                }
+                assert_eq!(chunks, text);
+                assert_eq!(decoder.finish().unwrap(), text);
+            }
+            for task in [Task::draft(), Task::polish()] {
+                let mut decoder = SseDecoder::for_task(protocol, false, task);
+                assert_eq!(
+                    decoder.push(task_wire(protocol, &"花".repeat(801), true).as_bytes()),
+                    Err(WritingError::TooLarge)
+                );
+            }
+            let mut decoder = SseDecoder::with_protocol(protocol, false);
+            assert_eq!(
+                decoder.push(task_wire(protocol, &"花".repeat(801), true).as_bytes()),
+                Err(WritingError::TooLarge)
+            );
+        }
+        for mut decoder in [SseDecoder::new(), SseDecoder::default()] {
+            assert_eq!(
+                decoder.push(normal(&"花".repeat(801)).as_bytes()),
+                Err(WritingError::TooLarge)
+            );
+        }
+    }
+
+    #[test]
+    fn expansion_overflow_is_latched_after_2400_visible_characters() {
+        for protocol in [ApiProtocol::ChatCompletions, ApiProtocol::Responses] {
+            let mut decoder = SseDecoder::for_task(protocol, false, Task::expand());
+            decoder
+                .push(task_wire(protocol, &"花".repeat(2400), false).as_bytes())
+                .unwrap();
+            assert_eq!(
+                decoder.push(task_wire(protocol, "多", false).as_bytes()),
+                Err(WritingError::TooLarge)
+            );
+            assert_eq!(
+                decoder.push(task_wire(protocol, "", true).as_bytes()),
+                Err(WritingError::TooLarge)
+            );
+            assert_eq!(decoder.finish(), Err(WritingError::TooLarge));
+        }
+    }
+
+    #[test]
+    fn responses_expansion_snapshots_cannot_bypass_budget_or_failure_latch() {
+        let text = "花".repeat(2401);
+        let snapshots = [
+            response_complete(&text),
+            response_item_done(&text, 0),
+            response_part_done(&text, 0),
+            json!({"type":"response.output_text.done","item_id":"msg1","output_index":0,"content_index":0,"text":text}),
+        ];
+        for snapshot in snapshots {
+            let mut decoder = SseDecoder::for_task(ApiProtocol::Responses, false, Task::expand());
+            decoder
+                .push(response_wire(response_delta("正文")).as_bytes())
+                .unwrap();
+            assert_eq!(
+                decoder.push(response_wire(snapshot).as_bytes()),
+                Err(WritingError::TooLarge)
+            );
+            assert_eq!(
+                decoder.push(response_wire(response_complete("正文")).as_bytes()),
+                Err(WritingError::TooLarge)
+            );
+            assert_eq!(decoder.finish(), Err(WritingError::TooLarge));
+        }
     }
 
     #[test]

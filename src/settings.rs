@@ -142,18 +142,39 @@ impl WritingShortcut {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WritingShortcuts {
     pub draft: WritingShortcut,
     pub polish: WritingShortcut,
+    pub expand: Option<WritingShortcut>,
 }
 
 impl Default for WritingShortcuts {
     fn default() -> Self {
         Self {
-            draft: WritingShortcut::new(0, SHORTCUT_CTRL | SHORTCUT_ALT),
-            polish: WritingShortcut::new(0x20, SHORTCUT_CTRL),
+            draft: WritingShortcut::new(0x31, SHORTCUT_CTRL | SHORTCUT_SHIFT),
+            polish: WritingShortcut::new(0x32, SHORTCUT_CTRL | SHORTCUT_SHIFT),
+            expand: Some(WritingShortcut::new(0x33, SHORTCUT_CTRL | SHORTCUT_SHIFT)),
         }
+    }
+}
+
+impl Serialize for WritingShortcuts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire {
+            version: u8,
+            draft: WritingShortcut,
+            polish: WritingShortcut,
+            expand: Option<WritingShortcut>,
+        }
+        Wire {
+            version: 2,
+            draft: self.draft,
+            polish: self.polish,
+            expand: self.expand,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -162,8 +183,10 @@ impl<'de> Deserialize<'de> for WritingShortcuts {
         #[derive(Deserialize, Default)]
         #[serde(default)]
         struct Raw {
+            version: u8,
             draft: Option<RawShortcut>,
             polish: Option<RawShortcut>,
+            expand: Option<WritingShortcut>,
         }
         #[derive(Deserialize)]
         struct RawShortcut {
@@ -179,10 +202,17 @@ impl<'de> Deserialize<'de> for WritingShortcuts {
             }
         }
         let raw = Raw::deserialize(deserializer)?;
-        let legacy_pair = raw.draft.as_ref().is_some_and(|s| s.modifiers.is_none())
-            && raw.polish.as_ref().is_some_and(|s| s.modifiers.is_none());
+        let legacy_pair = raw.version == 0
+            && raw
+                .draft
+                .as_ref()
+                .is_some_and(|s| s.key == 0 && s.modifiers == Some(3))
+            && raw
+                .polish
+                .as_ref()
+                .is_some_and(|s| s.key == 0x20 && s.modifiers == Some(1));
         let defaults = Self::default();
-        let value = Self {
+        let mut value = Self {
             draft: raw
                 .draft
                 .map(RawShortcut::shortcut)
@@ -191,21 +221,105 @@ impl<'de> Deserialize<'de> for WritingShortcuts {
                 .polish
                 .map(RawShortcut::shortcut)
                 .unwrap_or(defaults.polish),
+            expand: raw.expand,
         };
-        if legacy_pair
-            && value.draft == WritingShortcut::new(0x31, 5)
-            && value.polish == WritingShortcut::new(0x32, 5)
-        {
-            Ok(defaults)
-        } else {
-            Ok(value)
+        if legacy_pair {
+            value.draft = defaults.draft;
+            value.polish = defaults.polish;
         }
+        if raw.version < 2 && value.expand.is_none() {
+            value.expand = defaults
+                .expand
+                .filter(|s| *s != value.draft && *s != value.polish);
+        }
+        Ok(value)
     }
 }
 
 impl WritingShortcuts {
     pub fn is_valid(self) -> bool {
-        self.draft.is_supported() && self.polish.is_supported() && self.draft != self.polish
+        self.draft.is_supported()
+            && self.polish.is_supported()
+            && self.draft != self.polish
+            && self.expand.map_or(true, |s| {
+                s.is_supported() && s != self.draft && s != self.polish
+            })
+    }
+}
+
+#[cfg(test)]
+mod expansion_shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn old_versions_add_expansion_without_overwriting_custom_chords() {
+        for version in [0, 1] {
+            let defaults: WritingShortcuts =
+                serde_json::from_value(serde_json::json!({"version": version})).unwrap();
+            assert_eq!(defaults, WritingShortcuts::default());
+            let custom: WritingShortcuts = serde_json::from_value(serde_json::json!({
+                "version": version, "draft": {"key": 51, "modifiers": 5}
+            }))
+            .unwrap();
+            assert_eq!(custom.draft, WritingShortcut::new(51, 5));
+            assert_eq!(custom.polish, defaults.polish);
+            assert_eq!(custom.expand, None);
+            assert!(custom.is_valid());
+        }
+        let explicit: WritingShortcuts = serde_json::from_str(
+            r#"{"version":1,"draft":{"key":0,"modifiers":3},"polish":{"key":32,"modifiers":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.draft, WritingShortcut::new(0, 3));
+        assert_eq!(explicit.polish, WritingShortcut::new(32, 1));
+        assert_eq!(explicit.expand, WritingShortcuts::default().expand);
+    }
+
+    #[test]
+    fn version_two_disabled_expansion_stays_disabled_on_round_trip() {
+        for wire in [r#"{"version":2}"#, r#"{"version":2,"expand":null}"#] {
+            let value: WritingShortcuts = serde_json::from_str(wire).unwrap();
+            assert_eq!(value.expand, None);
+            assert!(value.is_valid());
+            let saved = serde_json::to_value(value).unwrap();
+            assert_eq!(saved["version"], 2);
+            assert!(saved["expand"].is_null());
+            assert_eq!(
+                serde_json::from_value::<WritingShortcuts>(saved).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_expansion_preserves_custom_value_and_rejects_all_collisions() {
+        let custom = WritingShortcut::new(0x41, 3);
+        let value: WritingShortcuts =
+            serde_json::from_str(r#"{"version":1,"expand":{"key":65,"modifiers":3}}"#).unwrap();
+        assert_eq!(value.expand, Some(custom));
+        assert!(value.is_valid());
+        let defaults = WritingShortcuts::default();
+        for expand in [
+            defaults.draft,
+            defaults.polish,
+            WritingShortcut::new(0x46, 5),
+        ] {
+            assert!(!WritingShortcuts {
+                expand: Some(expand),
+                ..defaults
+            }
+            .is_valid());
+        }
+        assert!(!WritingShortcuts {
+            draft: custom,
+            ..value
+        }
+        .is_valid());
+        assert!(!WritingShortcuts {
+            polish: custom,
+            ..value
+        }
+        .is_valid());
     }
 }
 
@@ -650,8 +764,8 @@ mod tests {
     fn writing_shortcuts_migrate_to_custom_chords_and_round_trip() {
         let old: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(old.writing_shortcuts, WritingShortcuts::default());
-        assert_eq!(old.writing_shortcuts.draft.label(), "Ctrl+Alt");
-        assert_eq!(old.writing_shortcuts.polish.label(), "Ctrl+Space");
+        assert_eq!(old.writing_shortcuts.draft.label(), "Ctrl+Shift+1");
+        assert_eq!(old.writing_shortcuts.polish.label(), "Ctrl+Shift+2");
         let legacy: Settings = serde_json::from_str(
             r#"{"writing_shortcuts":{"draft":{"key":49},"polish":{"key":50}}}"#,
         )
@@ -675,6 +789,7 @@ mod tests {
             writing_shortcuts: WritingShortcuts {
                 draft: WritingShortcut::new(0x41, 3),
                 polish: WritingShortcut::new(0x72, 9),
+                ..WritingShortcuts::default()
             },
             ..Settings::default()
         };
@@ -684,6 +799,92 @@ mod tests {
             custom
         );
         assert_eq!(custom.writing_shortcuts.polish.label(), "Ctrl+Win+F3");
+    }
+
+    #[test]
+    fn writing_shortcuts_migrate_only_complete_unversioned_default_pair() {
+        let legacy = r#"{"draft":{"key":0,"modifiers":3},"polish":{"key":32,"modifiers":1}}"#;
+        assert_eq!(
+            serde_json::from_str::<WritingShortcuts>(legacy).unwrap(),
+            WritingShortcuts::default()
+        );
+        for (wire, expected) in [
+            (
+                r#"{"draft":{"key":0,"modifiers":3}}"#,
+                WritingShortcuts {
+                    draft: WritingShortcut::new(0, 3),
+                    ..WritingShortcuts::default()
+                },
+            ),
+            (
+                r#"{"polish":{"key":32,"modifiers":1}}"#,
+                WritingShortcuts {
+                    polish: WritingShortcut::new(32, 1),
+                    ..WritingShortcuts::default()
+                },
+            ),
+            (
+                r#"{"draft":{"key":65,"modifiers":3},"polish":{"key":32,"modifiers":1}}"#,
+                WritingShortcuts {
+                    draft: WritingShortcut::new(65, 3),
+                    polish: WritingShortcut::new(32, 1),
+                    ..WritingShortcuts::default()
+                },
+            ),
+            ("{}", WritingShortcuts::default()),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<WritingShortcuts>(wire).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn writing_shortcuts_versioned_old_pair_round_trip_and_load_does_not_write() {
+        let store = temporary_store();
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        let wire = br#"{"online_ai_enabled":false,"online_polish":{"enabled":false},"writing_shortcuts":{"draft":{"key":0,"modifiers":3},"polish":{"key":32,"modifiers":1}}}"#;
+        fs::write(store.path(), wire).unwrap();
+        let migrated = store.load().unwrap();
+        assert_eq!(migrated.writing_shortcuts, WritingShortcuts::default());
+        assert!(!migrated.online_ai_enabled);
+        assert!(!migrated.online_polish.enabled);
+        assert_eq!(fs::read(store.path()).unwrap(), wire);
+        for version in [0, 1] {
+            let wire = serde_json::to_vec(&serde_json::json!({
+                "online_ai_enabled": false,
+                "online_polish": {"enabled": false},
+                "writing_shortcuts": {
+                    "version": version,
+                    "draft": {"key": 51, "modifiers": 5},
+                    "polish": {"key": 65, "modifiers": 3}
+                }
+            }))
+            .unwrap();
+            fs::write(store.path(), &wire).unwrap();
+            let loaded = store.load().unwrap();
+            assert_eq!(loaded.writing_shortcuts.draft, WritingShortcut::new(51, 5));
+            assert_eq!(loaded.writing_shortcuts.polish, WritingShortcut::new(65, 3));
+            assert_eq!(loaded.writing_shortcuts.expand, None);
+            assert!(!loaded.online_ai_enabled);
+            assert!(!loaded.online_polish.enabled);
+            assert_eq!(fs::read(store.path()).unwrap(), wire);
+        }
+        let explicit = Settings {
+            writing_shortcuts: WritingShortcuts {
+                draft: WritingShortcut::new(0, 3),
+                polish: WritingShortcut::new(32, 1),
+                ..WritingShortcuts::default()
+            },
+            ..migrated
+        };
+        let saved = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(saved["writing_shortcuts"]["version"], 2);
+        assert_eq!(serde_json::from_value::<Settings>(saved).unwrap(), explicit);
+        store.save(&explicit).unwrap();
+        assert_eq!(store.load().unwrap(), explicit);
+        fs::remove_dir_all(store.path().parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -729,8 +930,17 @@ mod tests {
         let before = fs::read(store.path()).unwrap();
         for pair in [
             WritingShortcuts {
+                expand: Some(WritingShortcuts::default().draft),
+                ..WritingShortcuts::default()
+            },
+            WritingShortcuts {
+                expand: Some(WritingShortcuts::default().polish),
+                ..WritingShortcuts::default()
+            },
+            WritingShortcuts {
                 draft: WritingShortcut::new(0x31, 5),
                 polish: WritingShortcut::new(0x31, 5),
+                ..WritingShortcuts::default()
             },
             WritingShortcuts {
                 draft: WritingShortcut::new(0x46, 5),

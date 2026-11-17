@@ -3011,7 +3011,7 @@ mod windows_impl {
                             .all(|s| !s.starts_with(&format!("{}. ", i + 1))));
                     }
                     assert!(layout.lines[0].last().unwrap().ends_with('字'));
-                    assert!(layout.lines[1].concat().ends_with("✓ AI"));
+                    assert!(layout.lines[1].concat().ends_with(" √"));
                     for (index, row) in layout.candidates.candidates.iter().enumerate() {
                         for y in row.top..row.bottom {
                             assert_eq!(

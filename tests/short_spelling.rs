@@ -43,7 +43,7 @@ fn short_word_edit_types_are_visible_and_commit_without_learning() {
         let (i, c) = find(&mut s, gold);
         assert!(c.is_spelling(), "{raw}: {c:?}");
         assert!(!c.is_ai());
-        assert_eq!(c.display_text(), format!("{gold} ✓ 拼写"));
+        assert_eq!(c.display_text(), format!("{gold} √"));
         let update = s.select_candidate(i).unwrap();
         assert_eq!(update.commit.as_deref(), Some(gold));
         assert!(s.pending_input().is_empty());

@@ -1,5 +1,219 @@
 # Flower Windows 验证记录
 
+## 0.5.11 本地完整包与默认交付规则
+
+用户明确要求以后修改验证完成后直接打包、不要直接发布。项目约定已记录于
+`design/local-build-and-publication.md`，本次继续构建刚完成修复的 0.5.11，
+旧版完整包保留，不自动发布、安装或注册。
+
+- ZIP：`dist/flower-0.5.11-windows-x64.zip`，168,963,362 字节；
+  SHA-256 `438281a7add90789b6443102f36fe7bb2a48468bee9961b3dbc39f0c7f6b6dc0`。
+- EXE：`dist/flower-0.5.11-windows-x64-setup.exe`，144,448,677 字节；
+  SHA-256 `9d4db322aa6d48d6d0ba87b9c135cae201b0a9bcc9b233a73c82456573a21170`。
+- 两个 `.sha256` 和安装器 `.manifest.json` 同目录交付。完整 ZIP 共 171 个文件，
+  展开 437,319,425 字节，164 项固定资产与 0.5.10 逐字节一致；
+  两 EXE 的 `--help` 返回 0，包内 README、Cargo.lock 与冻结源码身份一致。
+- 完整扩写/润色规范仍内嵌于 DLL 和设置程序；完整输入索引仅在 DLL、
+  后台原始种子仅在设置程序，大小及摘要未变化。三个 PE 共 27 项图标与源 ICO 一致，
+  应用 manifest 仅存在于设置程序。
+- 安装器数值版本为 `0.5.11.0`，图标、清单、外部摘要和来源 ZIP 摘要核对通过。
+  构包过程采用正常产品 profile，复用源码阶段 83 项定向检查及 Clippy 等有效证据，
+  未重新执行未变化的全仓功能测试。
+
+以上为未签名本地测试包，未执行安装器，未安装/卸载、注册或发布，
+不将隔离 Trace 夹具等同于用户实际应用的系统键盘投递验收。
+本次会话证据为 `package-0.5.11-inputs.json`、`package-0.5.11-verification.json`、
+`package-0.5.11-resources.json`、`installer-0.5.11-verification.json` 及 `delivery-0.5.11.json`。
+
+## 0.5.11 候选简化与原生按键源码验证
+
+用户要求隐藏候选来源文字、统一 AI 快捷键标题，并修复复制粘贴、
+中文 Shift 大写、Caps Lock 和英文符号。合同见
+`design/input-commands-case-and-clean-candidates.md`。本节记录 0.5.11 源码阶段，
+后续本地构包见上节；未安装/注册，不覆盖已交付 0.5.10 包。
+
+- 普通/联想候选直接显示正文，AI/拼写纠正仅尾带 `√`；内部来源、正文、
+  排名与学习身份保留，原生布局及 UIElement GetString 使用同一显示格式。
+  设置页标题为 AI帮写、AI润色、AI扩写，已检查实际窗口截图和键盘操作。
+- 原实现为观察手势，对修饰键及 pending 下的原生键预测 TRUE，实际又返回 FALSE。
+  现通过线程管理器的 ITfKeyTraceEventSink 记录真实按键历史；预测只声明确实消费的键。
+  Ctrl+C/V 等宿主命令、英文/Caps 状态的普通键与符号、修饰键释放原生透传，
+  精确 Flower 写作快捷键和 Ctrl+Shift+F 保留。
+- Trace 订阅使用弱 activation、token、owner 及 RAII Unadvise，不形成 COM 环；
+  订阅失败不回退吞键，失焦/上下文代际/重复等检查保持。
+  中文 Shift+字母直接输出大写，原拼音先完整还原、不学习，基础模式不切换。
+  Caps Lock 读系统 toggle 位覆盖基础模式，关闭后恢复；组词原始提交不切基础模式。
+- 定向检查最终 **83 项通过**：57 项引擎/字符映射/显示/补全/拼写/布局集成检查，
+  以及 26 项原生 Trace、Shift、修饰手势、快捷键、UIElement、真实窗口和设置检查。
+  修饰观察测试按 Trace→Test→仅 TRUE 调实际回调执行；另检查实际订阅/解除和旧 token 失效。
+  单独补验纯修饰扩写快捷键的两种释放顺序与夹键取消、在线开关实时启停及焦点恢复。
+- Release 原生链接和 Clippy（lib/bins/tests，`-D warnings`）通过；
+  测试命令显式用 `--config 'profile.release.panic="unwind"'`，避免既有 cdylib/集成测试
+  abort/unwind 同名产物冲突，产品 profile 没有更改。词典与种子摘要均未变化。
+- 旧手势夹具已改为先观察物理事件；release helper 的返回值表示动作结果，
+  不是原生按键消费。适配中曾出现不安全接口 downcast，已改为显式传已有 SharedActivation，
+  相关夹具重验通过。UIElement 夹具取消延迟 builtin 覆盖；长文分页数据改为一个完整长项和
+  部分前缀项，满足当前只保留一个完整长候选的合同，不放宽长文/分页/失效断言。
+
+这是源码和隔离原生接口证据：Trace 回调由夹具直接驱动，不等于已验证所有真实系统投递。
+未读写用户剪贴板、用户文档/真实配置/凭据，未请求真实模型 API；未安装到用户实际应用复测。
+未执行整个仓库全部测试，历史无关失败未以此标为已修复。详细源码身份及日志在本次会话
+`input-0.5.11-verification.json` 和 `p11` 验证产物中。
+
+## 0.5.10 本地完整包
+
+用户在扩写源码验收后明确要求“打包0.5.10”。使用标准
+`scripts/package.py --ai-assets … --output-dir …` 构建完整 ZIP，再用
+`scripts/installer.py --package … --output-dir … --iscc …` 构建 EXE。
+沿用既有完整 AI 资产与 Inno Setup 6 压缩设置，未重跑未受影响的全仓功能测试。
+
+- `dist/flower-0.5.10-windows-x64.zip`：168,958,149 字节；
+  SHA-256 `76558518784635cffe08da6ac7aa198a50381f9c128acb2bd18edd37c41c3911`。
+- `dist/flower-0.5.10-windows-x64-setup.exe`：144,493,178 字节；
+  SHA-256 `b99ced025ad5ad0e47326736750358d76b7978c501f2cf7026a1e2f071296f7d`。
+- 两个外部 `.sha256` 及安装器 `.manifest.json` 同目录交付。
+  ZIP 共 171 个文件，展开 437,316,834 字节；164 项固定资产与 0.5.9
+  逐字节一致。随包 README、Cargo.lock 及冻结源码身份核对通过，
+  两个 EXE 的 `--help` 返回 0，设置帮助包含 Ctrl+Shift+1/2/3。
+- DLL 与设置程序实际内嵌完整扩写和润色规范；完整词典索引仅在 DLL，
+  后台原始种子仅在设置程序，摘要与此前版本一致。
+  三个 PE 共 27 项图标图像与源 ICO 一致，应用 manifest 仅附于设置程序。
+- 安装器数值版本为 `0.5.10.0`，图标、外部摘要、清单及来源 ZIP 的摘要核对通过。
+  ZIP/EXE 分别比 0.5.9 增加 5,208 / 47,347 字节，保留全部旧包。
+- 包含 AI 扩写及 Ctrl+Shift+3；源码阶段 118 项通过、1 项前台夹具受系统限制的
+  边界继续保留，随包说明已明确。未调用真实模型 API 评测效果。
+
+这是未签名本地测试包，未执行安装器、安装/卸载、注册、用户启用或实际应用宿主验收，
+未创建 Git 提交/标签或发布到 GitHub。构包证据为本次会话的
+`package-0.5.10-inputs.json`、`package-0.5.10-verification.json`、
+`package-0.5.10-resources.json`、`installer-0.5.10-verification.json`；
+复制后的交付摘要另记于 `delivery-0.5.10.json`。
+
+## 0.5.10 选区 AI 扩写源码验证
+
+用户要求根据主动选区扩写、可选字数、默认 Ctrl+Shift+3。
+合同见 `design/ai-expansion.md`，源码版本 0.5.10；本节记录源码阶段，后续本地构包见上节。
+已交付的 0.5.9 ZIP/EXE 保留，未将新源码能力归入旧包。
+
+- 独立扩写窗口只接受安全非空单选区及可靠替换绑定，原文只读；
+  目标总字数为 100–2000 的完整整数，须大于原文，默认 500，
+  原文已有 500 字则默认 800。选择字数不生成，完整预览后明确替换一次。
+  空选区、私密范围、只读或绑定失效不转为手动/插入任务。
+- 两协议共用内嵌扩写规范，只发送显式材料；允许主题相关一般解释和明确假设示例，
+  保留事实、立场、否定、条件和承诺，不虚构真实数据、经历、原因或期限。
+  扩写输出上限独立为 2400，旧任务仍为 800；SSE、worker、窗口和 TSF 同步写回均校验。
+- Wire version 2 记录可选扩写快捷键；旧设置无冲突时补默认 3，
+  旧自定义已占 3 时保留原组合、扩写为未设置。显式禁用回读不自动恢复，
+  三项碰撞、完整旧默认迁移及读取不写盘均有覆盖。
+- 独立静态审查发现旧单槽 `TF_DEFAULT_SELECTION` 查询不能证明选区唯一。
+  已改为从索引 0 查询两槽，严格要求仅一项，捕获和写回复核共用；
+  错误/部分返回也释放所有 COM 引用，复审批准。
+- Release libtest 实际编译通过；完整索引及后台种子的大小、条数和 SHA-256
+  与 0.5.8/0.5.9 一致。定向检查最终 118 项通过：
+  写作请求/协议/传输/worker 71、设置 17、窗口状态 15、
+  快捷键及修饰手势 6、单选区结果拒绝 1、隐私捕获/观察者 1、
+  输出预算及既有写回/默认入口 4、自有扩写控件及设置窗口 3。
+  扩写窗口验证常用/自定义字数、原文只读、未自动生成、一次应用、
+  96/144/192 DPI 小窗控件可达；已查看其实际截图及第三快捷键设置截图。
+- `cargo clippy --locked --offline --release --lib --bins --tests -- -D warnings`、
+  `cargo fmt --all -- --check` 和 `git diff --check` 通过。Clippy 发现的数组
+  `each_mut` 超出 Rust 1.75 最低版本要求和无效同类型转换已修正；
+  最后仅重验受影响的单选区、隐私捕获、写回预算及扩写控件等 8 项，
+  其余 110 项源码及执行条件未受影响，继续复用有效结果，未重跑整个仓库。
+- 新 TSF 预算测试首次读回只获 512 字，原因是测试辅助读取缓冲区仍为 512；
+  将测试缓冲区扩充为覆盖完整输出后，800/801、2400/2401 及不增长拒绝全部通过，
+  未修改生产输出或放宽断言。
+- 另 1 项显式运行的端到端夹具
+  `native_expansion_shortcut_selection_preview_and_safe_replace` 未通过：
+  Windows 在自有宿主创建阶段拒绝 `SetForegroundWindow`，
+  尚未进入快捷键及替换动作。不绕过前台门禁，不能据此声称端到端通过。
+  历史 0.5.9 Ctrl-only 夹具失败未在本轮重跑或改断言。
+
+验证使用隔离 Store、自有 HWND/TSF 文档及固定假结果，未读用户正文、真实设置或凭据，
+未请求用户模型 API。协议与安全接线不等于真实供应商扩写质量或实际应用宿主验收。
+
+## 0.5.9 默认 AI 快捷键与编辑式润色
+
+用户要求默认帮写 Ctrl+Shift+1、润色 Ctrl+Shift+2，并改善润色只重复原句或换词。
+基线为已发布 v0.5.8 的 `ead8408`。合同见
+`design/editorial-polish-and-default-shortcuts.md`，本节记录源码阶段验证，
+本地构包记录见下节。未覆盖已发布文件、标签或安装目录。
+
+- 默认使用主键盘 1/2 与精确 Ctrl+Shift。`writing_shortcuts` 序列化增加 version 1，
+  无版本/版本 0 的完整旧 Ctrl+Alt / Ctrl+Space 默认对在读取时迁移，
+  partial 与其它自定义保留，不自动写盘；新版主动保存旧组合可稳定回读。
+  默认、恢复默认、CLI、内嵌帮助及当前开发说明已同步。
+- 润色通过 `src/writing/prompts/polish.md` 内嵌编辑规范，结构重组、衔接和
+  有依据的适度展开仅作用于 Polish。通顺、正式、简洁仍为原枚举，
+  两种 API 协议共用规范；帮写、500/800 字边界和 2048 token 预算保持。
+  不增加第二次模型调用或外部技能下载，材料仍仅在用户 JSON 数据区。
+- 静态独立审查发现示例将明确“有问题”弱化为“待确认”，已修正为保留
+  “仍存在问题”的判断；另一示例也收窄到首次点击困惑与提示。
+  修正后复审批准，未将静态审查当作真实供应商的输出质量证明。
+- `cargo test --locked --offline --release --lib --no-run` 原生编译成功。
+  完整索引构建对照通过，索引、种子和 TSV 摘要仍与 v0.5.8 相同。
+  `cargo clippy --locked --offline --release --lib --bins --tests -- -D warnings`、
+  `cargo fmt --all -- --check` 和适配 CRLF 的 `git diff --check` 通过。
+
+定向 libtest 使用本 Thread 隔离 Store、临时目录及自有 HWND/TSF 文档，
+串行显式运行匹配的 ignored 项，共 41 项：**40 通过、1 项失败**。
+通过范围包括全部设置测试、两协议/三风格/简繁的请求与材料隔离、
+帮写规则保持、内嵌帮助、新默认生产预测/真实按键/重复不重发/关闭零捕获、
+旧纯修饰与 Ctrl+Space 自定义、两个在线设置原生夹具及主设置预览。
+
+失败项为
+`native_writing_key_prediction_repeat_and_composition_preserved`：
+Ctrl-only 负例的预测返回 TRUE。保留的 v0.5.8 测试程序在同机同样失败，
+其 SHA-256 为 `957fc9878a0894ae49eba67bd4f6999755fb6737e34b12f5ce5a407c3eccacd3`。
+临时诊断显示回调之前 GetKeyState 已读到 Ctrl+Shift，而非夹具期望的仅 Ctrl，
+精确匹配因此返回 Draft；没有 pending Shift/纯修饰手势。
+探针和修饰别名试验未解决该夹具差异，均已移除；生产按键读取和原断言未放宽。
+不将该项标为通过或宣称所有原生预编辑交叉路径已验收。
+
+最终代码恢复到 40 项通过时及独立审查对应的相同内容身份，
+复用这些未受影响结果，不因临时诊断尝试清零有效证据。
+源码及检查摘要见本 Thread artifacts 的 `writing-0.5.9-verification.json`。
+自有窗口截图位于 `p9/settings-preview-32220/`，根已查看
+`settings-category-2.png`，新默认组合、恢复默认和提示均清楚可见。
+
+固定公开评价材料见 `polish-evaluation.md`，属于人工验收判据，不是已实测模型产出。
+本轮未读取用户密钥、发送用户正文或调用其付费模型 API；
+真实润色质量与实际桌面宿主尚未验收；本地安装包的独立核验见下节。
+
+### 0.5.9 本地构包
+
+用户明确要求构建安装器与 ZIP，不发布 GitHub。标准 `scripts/package.py`
+以离线 Cargo、锁定依赖执行 Windows x64 Release 的 DLL/register/settings 构建，
+再由标准 `scripts/installer.py` 和现有 Inno Setup 编译器包装。
+沿用 0.5.8 的完整固定 AI 资产及 LZMA2/32 MiB 字典/solid 压缩设置。
+
+| 交付目标 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `dist/flower-0.5.9-windows-x64-setup.exe` | 144,445,831 | `4ca4d34c4735b2c386981acfd30a614c6a567d0ad69f587284b39a3cc6a153ff` |
+| `dist/flower-0.5.9-windows-x64.zip` | 168,952,941 | `5abe50edaf8a878243fa5a09701eac2828e67f1a9a36a6403d87e201a9e8deb7` |
+
+ZIP 与安装器分别较 0.5.8 增加 4,152 / 6,123 字节。171 个文件的展开载荷
+为 437,289,342 字节，164 个固定资产与 0.5.8 逐字节一致。
+随包 README 与冻结的 `docs/distribution.md`、Cargo.lock 精确匹配；
+源文件摘要与上一节审查及测试版本相同，三个 PE 摘要对应本次 x64 Release。
+
+完整片段检查确认新编辑规范同时进入 DLL 和 settings，设置帮助包含新默认
+Ctrl+Shift+1/2；完整输入索引仍仅在 DLL、后台 seed 仍仅在 settings。
+两个 EXE 的 `--help` 均退出 0。27 个图标图像与源 ICO 相同，
+应用清单仍仅在 settings，三个 PE 及安装器均为 `NotSigned`。
+安装器数值版本为 0.5.9.0，其图标、外部摘要、构建清单与来源 ZIP 关联通过。
+
+两制品、各自 `.sha256` 及安装器 `.manifest.json` 共五文件交付到 `dist`，
+复制后重新核摘要一致。保留已有 0.5.7/0.5.8 制品。
+本轮复用未变源码的 40 通过/1 个旧基线同样失败、Clippy 和静态审查记录，
+新增核验仅覆盖发布链接、完整制品和资源，没有把组包成功当作真实模型质量证据。
+
+详细证据位于本 Thread artifacts 的 `package-0.5.9-inputs.json`、
+`package-0.5.9-verification.json`、`package-0.5.9-resources.json`、
+`installer-0.5.9-verification.json` 及 `delivery-0.5.9.json`。
+未发布 GitHub，未运行安装器、注册或改变用户输入法状态；
+真实安装/卸载与桌面宿主仍属独立验收。
+
 ## 0.5.8 完整离线包体积优化
 
 本轮继续基于 `4525227` 及已保留的首键修复，不恢复此前撤销的实验代码。

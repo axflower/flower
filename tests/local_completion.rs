@@ -23,7 +23,7 @@ fn select_completion(r: &mut EngineRouter) -> String {
         .iter()
         .position(|c| c.is_completion())
         .expect("completion on first page");
-    assert!(candidates[index].display_text().contains("联想"));
+    assert_eq!(candidates[index].display_text(), candidates[index].text);
     assert!(!candidates[index].is_ai() && !candidates[index].is_spelling());
     let result = r.select_candidate(index).unwrap().commit.unwrap();
     assert!(r.pending_learning().is_empty());

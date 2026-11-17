@@ -7,6 +7,62 @@ struct UiObservations {
     element: RefCell<Option<ITfCandidateListUIElement>>,
 }
 
+#[test]
+fn ui_element_clean_candidate_strings_preserve_original_identity() {
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+        .ok()
+        .unwrap();
+    let _apartment = Apartment;
+    let (host, _store) = writable_document();
+    let candidates = vec![
+        crate::engine::Candidate::new("普通", "pu'tong"),
+        crate::engine::Candidate::new("纠正", crate::ai::AI_COMMENT),
+        crate::engine::Candidate::new(
+            "拼写结果",
+            format!("{}pin'xie", crate::engine::Candidate::SPELLING_PREFIX),
+        ),
+        crate::engine::Candidate::new(
+            "完整后续",
+            format!("{}wan'zheng", crate::engine::Candidate::COMPLETION_PREFIX),
+        ),
+    ];
+    let data = Rc::new(UiData {
+        snapshot: RefCell::new(crate::platform::CandidatePopupSnapshot {
+            revision: 1,
+            preedit: "fixture".into(),
+            candidates: candidates.clone(),
+            highlighted: Some(0),
+            page: 0,
+            page_count: 1,
+        }),
+        context: host.context.clone(),
+        allowed: Cell::new(false),
+        shown: Cell::new(false),
+        alive: Cell::new(true),
+        negotiated: Cell::new(false),
+        closed: Rc::new(Cell::new(false)),
+        requested: Cell::new(None),
+        token: next_activation_token(),
+        owner: std::thread::current().id(),
+        caret: Cell::new(None),
+        _registration: ObjectRegistration::new(),
+    });
+    let element: ITfCandidateListUIElement = CandidateUi { data: data.clone() }.into();
+    for (index, expected) in ["普通", "纠正 √", "拼写结果 √", "完整后续"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            unsafe { element.GetString(index as u32) }
+                .unwrap()
+                .to_string(),
+            *expected
+        );
+    }
+    assert!(unsafe { element.GetString(4) }.is_err());
+    assert_eq!(data.snapshot.borrow().candidates, candidates);
+}
+
 #[implement(ITfUIElementSink)]
 struct ObservingUiSink {
     manager: ITfUIElementMgr,
@@ -162,7 +218,7 @@ fn ui_element_real_activate_ex_host_negotiation_and_keyboard() {
     for (i, candidate) in snapshot.candidates.iter().enumerate() {
         assert_eq!(
             unsafe { element.GetString(i as u32) }.unwrap().to_string(),
-            candidate.text
+            candidate.display_text()
         );
     }
     assert!(unsafe { element.GetString(snapshot.candidates.len() as u32) }.is_err());
@@ -260,17 +316,30 @@ fn ui_element_begin_update_failures_and_current_page_snapshot() {
     unsafe { service.ActivateEx(&manager, host.client, 0) }.unwrap();
     // Deterministic fixture data; no user dictionary is read.
     let long = "这是完整候选文字不能截断".repeat(20);
-    let mut tsv = format!("ni\t{long}\t10000\n");
+    // Long-body policy deliberately keeps just one complete candidate. The
+    // remaining fixture choices must be partial prefixes to exercise paging.
+    let mut tsv = format!("ni'hao\t{long}\t10000\n");
     for i in 0..25 {
         tsv.push_str(&format!("ni\t候选{i}\t{}\n", 1000 - i));
     }
-    shared.borrow_mut().as_mut().unwrap().lexicon = Lexicon::from_tsv(&tsv).unwrap();
+    {
+        let mut state = shared.borrow_mut();
+        let active = state.as_mut().unwrap();
+        // Installing fixture data also replaces the deferred builtin load.
+        active.pending_lexicon = None;
+        // Exercise a genuine second page independently of default quotas.
+        active.settings.candidate_page_size = 2;
+        active.lexicon = Lexicon::from_tsv(&tsv).unwrap();
+    }
     let sink: ITfKeyEventSink = service.cast().unwrap();
     send_key(&sink, &host.context, b'N');
     assert_popup_visibility(&shared, false);
     assert_eq!(observations.begins.get(), 0);
     fail_begin.set(false);
     send_key(&sink, &host.context, b'I');
+    for key in b"HAO" {
+        send_key(&sink, &host.context, *key);
+    }
     assert_eq!(observations.begins.get(), 1);
     let element = observations.element.borrow().as_ref().unwrap().clone();
     assert_eq!(unsafe { element.GetString(0) }.unwrap().to_string(), long);
@@ -369,6 +438,7 @@ fn ui_element_uiless_async_ai_does_not_show_popup_or_status() {
         let mut state = shared.borrow_mut();
         let active = state.as_mut().unwrap();
         active.settings.ai_correction_enabled = true;
+        active.pending_lexicon = None;
         active.lexicon = Lexicon::from_tsv("jin'tian'xin'qing\t今天新情\t100").unwrap();
         active.ai = Some(AiScheduler::new(Box::new(CapturingTransport {
             capture: capture.clone(),
@@ -410,7 +480,10 @@ fn ui_element_uiless_async_ai_does_not_show_popup_or_status() {
     let strings: Vec<String> = (0..unsafe { element.GetCount() }.unwrap())
         .map(|i| unsafe { element.GetString(i) }.unwrap().to_string())
         .collect();
-    assert!(strings.iter().any(|text| text == "今天心情"), "{strings:?}");
+    assert!(
+        strings.iter().any(|text| text == "今天心情 √"),
+        "{strings:?}"
+    );
     unsafe { element.Show(TRUE) }.unwrap();
     assert_popup_visibility(&shared, true);
     unsafe { element.Show(FALSE) }.unwrap();

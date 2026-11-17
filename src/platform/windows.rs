@@ -353,6 +353,7 @@ mod windows_exports {
         pending_lexicon: Option<String>,
         context_generation: Rc<Cell<u64>>,
         _thread_events: Option<ThreadEvents>,
+        _key_trace: Option<KeyTraceEvents>,
         /// Activation snapshot; script override is never written to disk.
         settings: Settings,
         lexicon: Lexicon,
@@ -369,6 +370,7 @@ mod windows_exports {
 
     fn starts_pinyin(event: KeyEvent) -> bool {
         !event.is_passthrough()
+            && !event.modifiers.shift
             && matches!(event.key, crate::engine::Key::Char(c) if c.is_ascii_alphabetic())
     }
 
@@ -498,6 +500,14 @@ mod windows_exports {
             {
                 Some(crate::writing::Task::polish())
             }
+            key if u16::try_from(key).ok().is_some_and(|key| {
+                shortcuts
+                    .expand
+                    .is_some_and(|shortcut| shortcut.matches(key, modifiers))
+            }) =>
+            {
+                Some(crate::writing::Task::expand())
+            }
             _ => None,
         }
     }
@@ -604,6 +614,7 @@ mod windows_exports {
         range: ITfRange,
         style: TF_SELECTIONSTYLE,
         original: String,
+        task: crate::writing::Task,
         key: ContextKey,
         token: ActivationToken,
         owner: ThreadId,
@@ -630,19 +641,30 @@ mod windows_exports {
         context: &ITfContext,
         cookie: u32,
     ) -> Result<(ITfRange, TF_SELECTIONSTYLE)> {
-        let mut selections = [TF_SELECTION::default()];
+        // Start at zero, not TF_DEFAULT_SELECTION: the latter returns only the
+        // default even when additional selections exist. Two slots detect them
+        // without reading any selected or surrounding text.
+        let mut selections = [TF_SELECTION::default(), TF_SELECTION::default()];
         let mut fetched = 0;
-        let result =
-            unsafe { context.GetSelection(cookie, u32::MAX, &mut selections, &mut fetched) };
-        let range = unsafe { std::mem::ManuallyDrop::take(&mut selections[0].range) };
+        let result = unsafe { context.GetSelection(cookie, 0, &mut selections, &mut fetched) };
+        single_writing_selection(selections, fetched, result)
+    }
+
+    fn single_writing_selection(
+        selections: [TF_SELECTION; 2],
+        fetched: u32,
+        result: Result<()>,
+    ) -> Result<(ITfRange, TF_SELECTIONSTYLE)> {
+        // Release both returned COM references, including partial/error replies.
+        let style = selections[0].style;
+        let ranges = selections
+            .map(|mut selection| unsafe { std::mem::ManuallyDrop::take(&mut selection.range) });
         result?;
         if fetched != 1 {
             return Err(E_UNEXPECTED.into());
         }
-        Ok((
-            range.ok_or_else(|| Error::from(E_UNEXPECTED))?,
-            selections[0].style,
-        ))
+        let [range, _extra] = ranges;
+        Ok((range.ok_or_else(|| Error::from(E_UNEXPECTED))?, style))
     }
 
     // 500 Unicode scalars occupy at most 1000 UTF-16 units. One extra unit
@@ -702,7 +724,9 @@ mod windows_exports {
             let empty = unsafe { range.IsEmpty(cookie)? }.as_bool();
             let original = match self.task {
                 crate::writing::Task::Draft { .. } if empty => String::new(),
-                crate::writing::Task::Polish { .. } if !empty => {
+                crate::writing::Task::Polish { .. } | crate::writing::Task::Expand { .. }
+                    if !empty =>
+                {
                     #[cfg(test)]
                     WRITING_BODY_READS.with(|calls| calls.set(calls.get() + 1));
                     match writing_range_text(&range, cookie) {
@@ -758,6 +782,10 @@ mod windows_exports {
             let (manager, _) = writing_activation_valid(&shared, binding.token)
                 .ok_or_else(|| Error::from(E_UNEXPECTED))?;
             if binding.invalid.get()
+                || binding
+                    .task
+                    .validate_output(&binding.original, &self.output)
+                    .is_err()
                 || !polish_activation_matches(binding, &shared)
                 || (binding.polish_guard.is_some() && !polish_host_matches(binding))
                 || focused_context_key(&manager) != Some(binding.key)
@@ -826,8 +854,10 @@ mod windows_exports {
         if binding.used.replace(true)
             || binding.invalid.get()
             || binding.owner != std::thread::current().id()
-            || output.is_empty()
-            || output.chars().count() > 800
+            || binding
+                .task
+                .validate_output(&binding.original, output)
+                .is_err()
         {
             return Err(denied());
         }
@@ -1159,6 +1189,7 @@ mod windows_exports {
             range,
             style,
             original,
+            task,
             key,
             token,
             owner,
@@ -1287,7 +1318,7 @@ mod windows_exports {
             return;
         }
         if polish_popup_open(token) {
-            writing_notice("请先关闭当前润色候选，再打开帮写。");
+            writing_notice("请先关闭当前润色候选，再打开新的 AI 任务。");
             return;
         }
         let existing = WRITING_PANELS.with(|p| p.borrow_mut().remove(&token));
@@ -1302,8 +1333,8 @@ mod windows_exports {
                     let displaced = WRITING_PANELS.with(|p| p.borrow_mut().insert(token, panel));
                     drop(displaced);
                 }
-                if result.is_err() {
-                    writing_notice("当前任务尚未结束，请先停止生成。");
+                if let Err(error) = result {
+                    writing_notice(&error);
                 }
                 return;
             }
@@ -1358,12 +1389,15 @@ mod windows_exports {
                         {
                             if original.is_empty() {
                                 source = PanelSource::Insertion;
+                            } else if matches!(task, crate::writing::Task::Expand { .. }) {
+                                source = PanelSource::Selection(original.clone());
                             }
                             let binding = Rc::new(WritingBinding {
                                 context: context.clone(),
                                 range,
                                 style,
                                 original,
+                                task,
                                 key,
                                 token,
                                 owner,
@@ -1390,7 +1424,14 @@ mod windows_exports {
             }
         }
         if too_long.get() {
-            writing_notice("所选文字超过 500 字或无法安全读取，请缩短选区或手动输入。");
+            writing_notice("所选文字超过 500 字或无法安全读取，请缩短选区。");
+        }
+        if matches!(task, crate::writing::Task::Expand { .. })
+            && (apply.is_none()
+                || !matches!(&source, PanelSource::Selection(text) if !text.trim().is_empty()))
+        {
+            writing_notice("请在可编辑的安全输入框中选择 1–500 字；当前选区无法扩写。");
+            return;
         }
         if writing_activation_valid(shared, token).is_none() {
             return;
@@ -2355,6 +2396,11 @@ mod windows_exports {
                     self.task = Some(crate::writing::Task::draft());
                 } else if shortcuts.polish.key == 0 && shortcuts.polish.modifiers == self.held {
                     self.task = Some(crate::writing::Task::polish());
+                } else if shortcuts
+                    .expand
+                    .is_some_and(|shortcut| shortcut.key == 0 && shortcut.modifiers == self.held)
+                {
+                    self.task = Some(crate::writing::Task::expand());
                 }
             }
         }
@@ -2656,6 +2702,167 @@ mod windows_exports {
         // SAFETY: GetKeyState has no pointer arguments and reports the current
         // thread's keyboard state.
         unsafe { GetKeyState(virtual_key.0 as i32) < 0 }
+    }
+
+    fn caps_lock_on() -> bool {
+        unsafe { GetKeyState(0x14) & 1 != 0 }
+    }
+
+    fn observe_key_down(
+        shared: &SharedActivation,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<()> {
+        let mode = context.and_then(|context| shared_key_mode(shared, context));
+        let Some((epoch, _)) = mode else {
+            if let Ok(mut state) = shared.try_borrow_mut() {
+                if let Some(active) = state.as_mut() {
+                    active.shift.pressed = None;
+                    active.writing_gesture = WritingGesture::default();
+                }
+            }
+            return Ok(());
+        };
+        let context = context.unwrap();
+        let key = context_key(context)?;
+        let bit = writing_modifier(wparam.0);
+        let repeat = lparam.0 as usize & (1 << 30) != 0;
+        {
+            let Ok(mut state) = shared.try_borrow_mut() else {
+                return Ok(());
+            };
+            let Some(active) = state
+                .as_mut()
+                .filter(|a| a.foreground && !a.processing && a.focus_epoch == epoch)
+            else {
+                return Ok(());
+            };
+            let binding = (key, epoch, active.context_generation.get(), active.token);
+            if active
+                .writing_gesture
+                .binding
+                .is_some_and(|old| old != binding)
+            {
+                active.writing_gesture = WritingGesture::default();
+            }
+            let unsafe_snapshot =
+                writing_snapshot_unsafe(active.writing_gesture.held, bit, wparam.0, lparam);
+            active.writing_gesture.down(
+                bit,
+                repeat,
+                unsafe_snapshot,
+                binding,
+                active.settings.writing_shortcuts,
+            );
+            let was_pressed = active.shift.pressed.is_some();
+            active.shift.down(
+                shift_identity(wparam.0, lparam),
+                repeat,
+                command_modifiers_down() || other_keys_down(),
+                key,
+                epoch,
+            );
+            if !was_pressed && active.shift.pressed.is_some() {
+                active.shift.context_generation = active.context_generation.get();
+            }
+            if active.writing_gesture.held.count_ones() >= 2 || caps_lock_on() {
+                active.shift.pressed = None;
+            }
+            if let Some(ai) = active.ai.as_mut() {
+                ai.invalidate();
+            }
+        }
+        if wparam.0 == 0x14 {
+            let composing = shared.try_borrow().ok().is_some_and(|state| {
+                state.as_ref().is_some_and(|a| {
+                    a.contexts
+                        .get(&key)
+                        .is_some_and(|e| e.router.is_composing())
+                })
+            });
+            if composing {
+                let _ = apply_engine_key(shared, context, None, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[implement(windows::Win32::UI::TextServices::ITfKeyTraceEventSink)]
+    struct PhysicalKeyObserver {
+        shared: std::rc::Weak<RefCell<Option<Activation>>>,
+        token: ActivationToken,
+        owner: ThreadId,
+        _registration: ObjectRegistration,
+    }
+
+    impl PhysicalKeyObserver {
+        fn target(&self) -> Option<(SharedActivation, Option<ITfContext>)> {
+            if self.owner != std::thread::current().id() {
+                return None;
+            }
+            let shared = self.shared.upgrade()?;
+            let manager = {
+                let state = shared.try_borrow().ok()?;
+                let active = state.as_ref().filter(|a| {
+                    a.token == self.token && a.owner_thread == self.owner && !a.processing
+                })?;
+                active.thread_manager.clone()
+            };
+            let context = unsafe { manager.GetFocus().and_then(|doc| doc.GetTop()) }.ok();
+            Some((shared, context))
+        }
+    }
+
+    impl windows::Win32::UI::TextServices::ITfKeyTraceEventSink_Impl for PhysicalKeyObserver_Impl {
+        fn OnKeyTraceDown(&self, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
+            if let Some((shared, context)) = self.get_impl().target() {
+                observe_key_down(&shared, context.as_ref(), wparam, lparam)?;
+            }
+            Ok(())
+        }
+        fn OnKeyTraceUp(&self, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
+            if let Some((shared, context)) = self.get_impl().target() {
+                let _ = observe_key_up(&shared, context.as_ref(), wparam, lparam)?;
+            }
+            Ok(())
+        }
+    }
+
+    struct KeyTraceEvents {
+        source: windows::Win32::UI::TextServices::ITfSource,
+        cookie: u32,
+        #[cfg(test)]
+        sink: windows::Win32::UI::TextServices::ITfKeyTraceEventSink,
+    }
+    impl KeyTraceEvents {
+        fn subscribe(
+            manager: &ITfThreadMgr,
+            shared: &SharedActivation,
+            token: ActivationToken,
+        ) -> Result<Self> {
+            use windows::Win32::UI::TextServices::ITfKeyTraceEventSink;
+            let source: windows::Win32::UI::TextServices::ITfSource = manager.cast()?;
+            let sink: ITfKeyTraceEventSink = PhysicalKeyObserver {
+                shared: Rc::downgrade(shared),
+                token,
+                owner: std::thread::current().id(),
+                _registration: ObjectRegistration::new(),
+            }
+            .into();
+            let cookie = unsafe { source.AdviseSink(&ITfKeyTraceEventSink::IID, &sink) }?;
+            Ok(Self {
+                source,
+                cookie,
+                #[cfg(test)]
+                sink,
+            })
+        }
+    }
+    impl Drop for KeyTraceEvents {
+        fn drop(&mut self) {
+            let _ = unsafe { self.source.UnadviseSink(self.cookie) };
+        }
     }
 
     fn map_key_event(wparam: WPARAM) -> Option<KeyEvent> {
@@ -3911,13 +4118,6 @@ mod windows_exports {
         fn owns_current_thread(&self) -> bool {
             std::thread::current().id() == self.owner_thread
         }
-
-        /// Restores a context entry only when the activation that started the
-        /// key is still active. The entry and any displaced entry are dropped
-        /// after the activation borrow is released.
-        fn restore_context(&self, token: ActivationToken, key: ContextKey, entry: ContextEntry) {
-            restore_activation_context(&self.activation, token, key, entry);
-        }
     }
 
     fn restore_activation_context(
@@ -4548,6 +4748,8 @@ mod windows_exports {
             if let Err(error) = popup.set_settings_action_sink(Some(settings_sink)) {
                 return Err(popup_activation_hresult(&error).into());
             }
+            let key_trace =
+                KeyTraceEvents::subscribe(thread_manager, &self.get_impl().activation, token)?;
             if !register_thread_popup(token, popup) {
                 return Err(E_UNEXPECTED.into());
             }
@@ -4581,6 +4783,7 @@ mod windows_exports {
                         pending_lexicon: Some(pending_lexicon),
                         context_generation: Rc::clone(&context_generation),
                         _thread_events: Some(thread_events),
+                        _key_trace: Some(key_trace),
                         settings,
                         lexicon,
                         rankings,
@@ -4719,25 +4922,60 @@ mod windows_exports {
         }
     }
 
-    impl TextService_Impl {
-        fn key_mode(&self, context: &ITfContext) -> Option<(u64, bool)> {
-            let (manager, epoch, english) = {
-                let state = self.get_impl().activation.try_borrow().ok()?;
-                let active = state.as_ref().filter(|a| a.foreground && !a.processing)?;
-                (
-                    active.thread_manager.clone(),
-                    active.focus_epoch,
-                    active.english,
-                )
+    fn shared_key_mode(shared: &SharedActivation, context: &ITfContext) -> Option<(u64, bool)> {
+        let (manager, epoch, english) = {
+            let state = shared.try_borrow().ok()?;
+            let active = state.as_ref().filter(|a| a.foreground && !a.processing)?;
+            (
+                active.thread_manager.clone(),
+                active.focus_epoch,
+                active.english,
+            )
+        };
+        (focused_context_key(&manager) == Some(context_key(context).ok()?))
+            .then_some((epoch, english))
+    }
+
+    fn apply_engine_key(
+        shared: &SharedActivation,
+        context: &ITfContext,
+        event: Option<KeyEvent>,
+        switch_to_english: bool,
+    ) -> Result<BOOL> {
+        let key = context_key(context)?;
+
+        let (
+            entry,
+            client_id,
+            token,
+            owner_thread,
+            focus_epoch,
+            thread_manager,
+            settings,
+            lexicon,
+            context_generation,
+        ) = {
+            let Ok(mut activation) = shared.try_borrow_mut() else {
+                return Ok(FALSE);
             };
-            (focused_context_key(&manager) == Some(context_key(context).ok()?))
-                .then_some((epoch, english))
-        }
-
-        fn apply_engine_key(&self, context: &ITfContext, event: Option<KeyEvent>) -> Result<BOOL> {
-            let key = context_key(context)?;
-
-            let (
+            let Some(active) = activation.as_mut() else {
+                return Ok(FALSE);
+            };
+            if active.processing {
+                return Ok(FALSE);
+            }
+            if event.is_some_and(starts_pinyin) {
+                ensure_input_lexicon(active)?;
+            }
+            let entry = active.contexts.remove(&key);
+            let client_id = active.client_id;
+            let token = active.token;
+            let owner_thread = active.owner_thread;
+            let focus_epoch = active.focus_epoch;
+            let thread_manager = active.thread_manager.clone();
+            let settings = active.settings.clone();
+            active.processing = true;
+            (
                 entry,
                 client_id,
                 token,
@@ -4745,134 +4983,201 @@ mod windows_exports {
                 focus_epoch,
                 thread_manager,
                 settings,
-                lexicon,
-                context_generation,
-            ) = {
-                let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
-                    return Ok(FALSE);
-                };
-                let Some(active) = activation.as_mut() else {
-                    return Ok(FALSE);
-                };
-                if active.processing {
-                    return Ok(FALSE);
-                }
-                if event.is_some_and(starts_pinyin) {
-                    ensure_input_lexicon(active)?;
-                }
-                let entry = active.contexts.remove(&key);
-                let client_id = active.client_id;
-                let token = active.token;
-                let owner_thread = active.owner_thread;
-                let focus_epoch = active.focus_epoch;
-                let thread_manager = active.thread_manager.clone();
-                let settings = active.settings.clone();
-                active.processing = true;
-                (
-                    entry,
-                    client_id,
-                    token,
-                    owner_thread,
-                    focus_epoch,
-                    thread_manager,
-                    settings,
-                    active.lexicon.clone(),
-                    active.context_generation.get(),
-                )
-            };
-            let _guard = ProcessingGuard {
-                activation: Rc::clone(&self.get_impl().activation),
-                token,
-                owner_thread,
-            };
+                active.lexicon.clone(),
+                active.context_generation.get(),
+            )
+        };
+        let _guard = ProcessingGuard {
+            activation: Rc::clone(shared),
+            token,
+            owner_thread,
+        };
 
-            let was_existing = entry.is_some();
-            let mut old_entry = entry.clone();
-            let mut entry = match entry {
+        let was_existing = entry.is_some();
+        let mut old_entry = entry.clone();
+        let mut entry = match entry {
+            Some(entry) => entry,
+            None => match ContextEntry::new(context, &settings, &lexicon) {
                 Some(entry) => entry,
-                None => match ContextEntry::new(context, &settings, &lexicon) {
-                    Some(entry) => entry,
-                    None => return Ok(FALSE),
-                },
+                None => return Ok(FALSE),
+            },
+        };
+        if entry.composition_terminated() {
+            clear_invalid_popup_action(shared, token, owner_thread, key);
+            let Ok(router) =
+                EngineRouter::from_lexicon(lexicon.clone(), settings.candidate_page_size)
+            else {
+                return Ok(FALSE);
             };
-            if entry.composition_terminated() {
-                clear_invalid_popup_action(&self.get_impl().activation, token, owner_thread, key);
-                let Ok(router) =
-                    EngineRouter::from_lexicon(lexicon.clone(), settings.candidate_page_size)
-                else {
+            entry.router = router;
+            entry.router.set_chinese_script(settings.chinese_script);
+            entry
+                .router
+                .set_candidate_width(Some(crate::engine::paging::DEFAULT_CANDIDATE_WIDTH));
+            entry.composition = None;
+            entry.controller = CompositionController::new();
+            entry.popup_model.hide();
+            old_entry = Some(entry.clone());
+        }
+
+        sync_idle_rankings(shared, token, &mut entry.router);
+        let update = match match event {
+            Some(event) if event.is_script_toggle() => {
+                Ok(entry.router.project_chinese_script(settings.chinese_script))
+            }
+            Some(event) => entry.router.process_key(event),
+            None => Ok(entry.router.commit_raw()),
+        } {
+            Ok(update) => update,
+            Err(_) => {
+                if let Some(old_entry) = old_entry {
+                    restore_activation_context(shared, token, key, old_entry);
+                }
+                return Ok(FALSE);
+            }
+        };
+
+        if !update.handled {
+            if was_existing {
+                restore_activation_context(shared, token, key, entry);
+            }
+            return Ok(FALSE);
+        }
+
+        let target = EditTarget {
+            context_generation: event.is_none().then_some(context_generation),
+            switch_to_english,
+            promotion_claim: Rc::new(Cell::new(false)),
+            activation: Rc::clone(shared),
+            thread_manager,
+            token,
+            owner_thread,
+            key,
+            focus_epoch,
+        };
+        let update_for_popup = update.clone();
+        let outcome = request_checked_key_edit_session(
+            &entry.context,
+            client_id,
+            update,
+            entry.composition.take(),
+            entry.controller,
+            Some(target.clone()),
+        );
+
+        let Some(outcome) = outcome else {
+            // The edit session did not report success. Restore the engine
+            // and popup snapshots, but do not claim the TSF document is
+            // unchanged: SetText may already have partially applied before
+            // a later EndComposition failure.
+            if let Some(old_entry) = old_entry {
+                restore_activation_context(shared, token, key, old_entry);
+            }
+            return Ok(FALSE);
+        };
+
+        publish_successful_edit(&target, entry, &update_for_popup, outcome);
+
+        Ok(TRUE)
+    }
+
+    impl TextService_Impl {
+        fn key_mode(&self, context: &ITfContext) -> Option<(u64, bool)> {
+            shared_key_mode(&self.get_impl().activation, context)
+        }
+        fn apply_engine_key(&self, context: &ITfContext, event: Option<KeyEvent>) -> Result<BOOL> {
+            apply_engine_key(&self.get_impl().activation, context, event, event.is_none())
+        }
+    }
+
+    fn observe_key_up(
+        shared: &SharedActivation,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<BOOL> {
+        let bit = writing_modifier(wparam.0);
+        if bit != 0 {
+            let binding = context.and_then(|context| {
+                let (epoch, _) = shared_key_mode(shared, context)?;
+                Some((context_key(context).ok()?, epoch))
+            });
+            let task = {
+                let Ok(mut state) = shared.try_borrow_mut() else {
                     return Ok(FALSE);
                 };
-                entry.router = router;
-                entry.router.set_chinese_script(settings.chinese_script);
-                entry
-                    .router
-                    .set_candidate_width(Some(crate::engine::paging::DEFAULT_CANDIDATE_WIDTH));
-                entry.composition = None;
-                entry.controller = CompositionController::new();
-                entry.popup_model.hide();
-                old_entry = Some(entry.clone());
-            }
-
-            sync_idle_rankings(&self.get_impl().activation, token, &mut entry.router);
-            let update = match match event {
-                Some(event) if event.is_script_toggle() => {
-                    Ok(entry.router.project_chinese_script(settings.chinese_script))
+                let Some(active) = state.as_mut() else {
+                    return Ok(FALSE);
+                };
+                if writing_snapshot_unsafe(active.writing_gesture.held, bit, wparam.0, lparam) {
+                    active.writing_gesture.invalid = true;
+                    active.writing_gesture.task = None;
                 }
-                Some(event) => entry.router.process_key(event),
-                None => Ok(entry.router.commit_raw()),
-            } {
-                Ok(update) => update,
-                Err(_) => {
-                    if let Some(old_entry) = old_entry {
-                        self.get_impl().restore_context(token, key, old_entry);
-                    }
+                let had_gesture = active.writing_gesture.held.count_ones() >= 2
+                    || active.writing_gesture.task.is_some();
+                let binding = binding.map(|(key, epoch)| {
+                    (key, epoch, active.context_generation.get(), active.token)
+                });
+                if binding.is_none() || active.writing_gesture.binding != binding {
+                    active.writing_gesture = WritingGesture::default();
+                    active.shift.pressed = None;
                     return Ok(FALSE);
                 }
-            };
-
-            if !update.handled {
-                if was_existing {
-                    self.get_impl().restore_context(token, key, entry);
+                let task = active.writing_gesture.up(bit, binding);
+                if had_gesture || task.is_some() {
+                    active.shift.pressed = None;
                 }
+                task
+            };
+            if let (Some(task), Some(context)) = (task, context) {
+                open_writing_panel(shared, context, task);
+            }
+            // Never eat modifier releases: the host must see balanced key state.
+            if shift_identity(wparam.0, lparam).is_none() {
                 return Ok(FALSE);
             }
-
-            let target = EditTarget {
-                context_generation: event.is_none().then_some(context_generation),
-                switch_to_english: event.is_none(),
-                promotion_claim: Rc::new(Cell::new(false)),
-                activation: Rc::clone(&self.get_impl().activation),
-                thread_manager,
-                token,
-                owner_thread,
-                key,
-                focus_epoch,
-            };
-            let update_for_popup = update.clone();
-            let outcome = request_checked_key_edit_session(
-                &entry.context,
-                client_id,
-                update,
-                entry.composition.take(),
-                entry.controller,
-                Some(target.clone()),
-            );
-
-            let Some(outcome) = outcome else {
-                // The edit session did not report success. Restore the engine
-                // and popup snapshots, but do not claim the TSF document is
-                // unchanged: SetText may already have partially applied before
-                // a later EndComposition failure.
-                if let Some(old_entry) = old_entry {
-                    self.get_impl().restore_context(token, key, old_entry);
-                }
-                return Ok(FALSE);
-            };
-
-            publish_successful_edit(&target, entry, &update_for_popup, outcome);
-
-            Ok(TRUE)
         }
+        let Some(shift) = shift_identity(wparam.0, lparam) else {
+            return Ok(FALSE);
+        };
+        let mode = context.and_then(|context| shared_key_mode(shared, context));
+        // Query COM before borrowing activation state. Identity failure
+        // invalidates the gesture, but its pending release must still clear.
+        let key = context.and_then(|context| context_key(context).ok());
+        let Ok(mut state) = shared.try_borrow_mut() else {
+            return Ok(FALSE);
+        };
+        let Some(active) = state.as_mut() else {
+            return Ok(FALSE);
+        };
+        let valid = key.zip(mode).is_some_and(|(key, (epoch, _))| {
+            active.foreground
+                && !caps_lock_on()
+                && !active.processing
+                && active.focus_epoch == epoch
+                && active.shift.context_generation == active.context_generation.get()
+                && active.shift.matches(
+                    shift,
+                    key,
+                    epoch,
+                    command_modifiers_down() || other_keys_down(),
+                )
+        });
+        active.shift.pressed = None;
+        if !valid {
+            return Ok(FALSE);
+        }
+        let context = context.unwrap();
+        let composing = active
+            .contexts
+            .get(&key.ok_or(Error::from(E_UNEXPECTED))?)
+            .is_some_and(|entry| entry.router.is_composing());
+        if active.english || !composing {
+            active.english = !active.english;
+            return Ok(TRUE);
+        }
+        drop(state);
+        apply_engine_key(shared, context, None, true)
     }
 
     impl ITfKeyEventSink_Impl for TextService_Impl {
@@ -4960,22 +5265,7 @@ mod windows_exports {
             if map_key_event(wparam).is_some_and(KeyEvent::is_script_toggle) {
                 return Ok(TRUE);
             }
-            // Route real chord keys through OnKeyDown so they can disarm Shift
-            // even when they ultimately pass through in English mode.
-            let pending = self
-                .get_impl()
-                .activation
-                .try_borrow()
-                .ok()
-                .is_some_and(|state| {
-                    state.as_ref().is_some_and(|active| {
-                        active.shift.pressed.is_some() || active.writing_gesture.held != 0
-                    })
-                });
-            if writing_modifier(wparam.0) != 0 || pending {
-                return Ok(TRUE);
-            }
-            if english {
+            if english || caps_lock_on() {
                 return Ok(FALSE);
             }
             let Some(event) = map_key_event(wparam) else {
@@ -5034,32 +5324,11 @@ mod windows_exports {
             }
         }
 
-        fn OnTestKeyUp(
-            &self,
-            context: Option<&ITfContext>,
-            wparam: WPARAM,
-            _lparam: LPARAM,
-        ) -> Result<BOOL> {
+        fn OnTestKeyUp(&self, _: Option<&ITfContext>, _: WPARAM, _: LPARAM) -> Result<BOOL> {
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
-            let Some(context) = context else {
-                return Ok(FALSE);
-            };
-            if writing_modifier(wparam.0) == 0 {
-                return Ok(FALSE);
-            }
-            if self.key_mode(context).is_none() {
-                return Ok(FALSE);
-            }
-            let Ok(state) = self.get_impl().activation.try_borrow() else {
-                return Ok(FALSE);
-            };
-            Ok(BOOL::from(state.as_ref().is_some_and(|active| {
-                // Even a cancelled chord release must reach the real callback
-                // to clear its pending gesture; only OnKeyUp decides to eat it.
-                active.shift.pressed.is_some() || active.writing_gesture.held != 0
-            })))
+            Ok(FALSE)
         }
 
         fn OnKeyDown(
@@ -5091,36 +5360,6 @@ mod windows_exports {
                 }
                 return Ok(FALSE);
             };
-            {
-                let key = context_key(context)?;
-                let bit = writing_modifier(wparam.0);
-                let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
-                    return Ok(FALSE);
-                };
-                let Some(active) = state.as_mut() else {
-                    return Ok(FALSE);
-                };
-                let binding = (key, epoch, active.context_generation.get(), active.token);
-                if active
-                    .writing_gesture
-                    .binding
-                    .is_some_and(|old| old != binding)
-                {
-                    active.writing_gesture = WritingGesture::default();
-                }
-                let unsafe_snapshot =
-                    writing_snapshot_unsafe(active.writing_gesture.held, bit, wparam.0, lparam);
-                active.writing_gesture.down(
-                    bit,
-                    lparam.0 as usize & (1 << 30) != 0,
-                    unsafe_snapshot,
-                    binding,
-                    active.settings.writing_shortcuts,
-                );
-                if active.writing_gesture.held.count_ones() >= 2 {
-                    active.shift.pressed = None;
-                }
-            }
             if let Some(token) =
                 polish_escape_target(&self.get_impl().activation, context, wparam.0)
             {
@@ -5161,17 +5400,6 @@ mod windows_exports {
                 if let Some(ai) = active.ai.as_mut() {
                     ai.invalidate();
                 }
-                let was_pressed = active.shift.pressed.is_some();
-                active.shift.down(
-                    shift,
-                    lparam.0 as usize & (1 << 30) != 0,
-                    command_modifiers_down() || other_keys_down(),
-                    key,
-                    epoch,
-                );
-                if !was_pressed && active.shift.pressed.is_some() {
-                    active.shift.context_generation = active.context_generation.get();
-                }
                 if script_toggle {
                     active.shift.pressed = None;
                     if !repeat {
@@ -5198,7 +5426,7 @@ mod windows_exports {
                 return self.apply_engine_key(context, map_key_event(wparam));
             }
             // Let native Shift reach the host so normal Shift shortcuts keep working.
-            if shift.is_some() || english {
+            if shift.is_some() || english || caps_lock_on() {
                 return Ok(FALSE);
             }
             let Some(event) = map_key_event(wparam) else {
@@ -5207,96 +5435,11 @@ mod windows_exports {
             self.apply_engine_key(context, Some(event))
         }
 
-        fn OnKeyUp(
-            &self,
-            context: Option<&ITfContext>,
-            wparam: WPARAM,
-            lparam: LPARAM,
-        ) -> Result<BOOL> {
+        fn OnKeyUp(&self, _: Option<&ITfContext>, _: WPARAM, _: LPARAM) -> Result<BOOL> {
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
-            let bit = writing_modifier(wparam.0);
-            if bit != 0 {
-                let binding = context.and_then(|context| {
-                    let (epoch, _) = self.key_mode(context)?;
-                    Some((context_key(context).ok()?, epoch))
-                });
-                let task = {
-                    let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
-                        return Ok(FALSE);
-                    };
-                    let Some(active) = state.as_mut() else {
-                        return Ok(FALSE);
-                    };
-                    if writing_snapshot_unsafe(active.writing_gesture.held, bit, wparam.0, lparam) {
-                        active.writing_gesture.invalid = true;
-                        active.writing_gesture.task = None;
-                    }
-                    let had_gesture = active.writing_gesture.held.count_ones() >= 2
-                        || active.writing_gesture.task.is_some();
-                    let binding = binding.map(|(key, epoch)| {
-                        (key, epoch, active.context_generation.get(), active.token)
-                    });
-                    if binding.is_none() || active.writing_gesture.binding != binding {
-                        active.writing_gesture = WritingGesture::default();
-                        active.shift.pressed = None;
-                        return Ok(FALSE);
-                    }
-                    let task = active.writing_gesture.up(bit, binding);
-                    if had_gesture || task.is_some() {
-                        active.shift.pressed = None;
-                    }
-                    task
-                };
-                if let (Some(task), Some(context)) = (task, context) {
-                    open_writing_panel(&self.get_impl().activation, context, task);
-                }
-                // Never eat modifier releases: the host must see balanced key state.
-                if shift_identity(wparam.0, lparam).is_none() {
-                    return Ok(FALSE);
-                }
-            }
-            let Some(shift) = shift_identity(wparam.0, lparam) else {
-                return Ok(FALSE);
-            };
-            let mode = context.and_then(|context| self.key_mode(context));
-            // Query COM before borrowing activation state. Identity failure
-            // invalidates the gesture, but its pending release must still clear.
-            let key = context.and_then(|context| context_key(context).ok());
-            let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
-                return Ok(FALSE);
-            };
-            let Some(active) = state.as_mut() else {
-                return Ok(FALSE);
-            };
-            let valid = key.zip(mode).is_some_and(|(key, (epoch, _))| {
-                active.foreground
-                    && !active.processing
-                    && active.focus_epoch == epoch
-                    && active.shift.context_generation == active.context_generation.get()
-                    && active.shift.matches(
-                        shift,
-                        key,
-                        epoch,
-                        command_modifiers_down() || other_keys_down(),
-                    )
-            });
-            active.shift.pressed = None;
-            if !valid {
-                return Ok(FALSE);
-            }
-            let context = context.unwrap();
-            let composing = active
-                .contexts
-                .get(&key.ok_or(Error::from(E_UNEXPECTED))?)
-                .is_some_and(|entry| entry.router.is_composing());
-            if active.english || !composing {
-                active.english = !active.english;
-                return Ok(TRUE);
-            }
-            drop(state);
-            self.apply_engine_key(context, None)
+            Ok(FALSE)
         }
 
         fn OnPreservedKey(
@@ -5773,7 +5916,7 @@ mod windows_exports {
         #[test]
         fn writing_shortcut_exact_main_keyboard_only() {
             let shortcuts = crate::settings::WritingShortcuts::default();
-            for key in [0, 0x20, 0x31, 0x32] {
+            for key in [0, 0x20, 0x31, 0x32, 0x33, 0x61, 0x62, 0x63] {
                 for mask in 0..16 {
                     let modifiers = Modifiers {
                         control: mask & 1 != 0,
@@ -5783,18 +5926,31 @@ mod windows_exports {
                     };
                     assert_eq!(
                         writing_shortcut(key, modifiers, shortcuts).is_some(),
-                        key == 0x20 && mask == 1
+                        matches!(key, 0x31..=0x33) && mask == 3
                     );
                 }
             }
             for key in [0x30, 0x33, 0x61, 0x62, 0x70] {
                 assert!(writing_shortcut(key, Modifiers::CONTROL, shortcuts).is_none());
             }
+            assert_eq!(
+                writing_shortcut(0x33, Modifiers::CONTROL.with_shift(), shortcuts),
+                Some(crate::writing::Task::expand())
+            );
+            assert!(writing_shortcut(
+                0x33,
+                Modifiers::CONTROL.with_shift(),
+                crate::settings::WritingShortcuts {
+                    expand: None,
+                    ..shortcuts
+                },
+            )
+            .is_none());
         }
 
         #[test]
         fn writing_modifier_gesture_orders_cancellation_and_binding() {
-            let shortcuts = crate::settings::WritingShortcuts::default();
+            let shortcuts = legacy_writing_shortcuts();
             let binding = (1, 2, 3, 4);
             for down in [[1, 2], [2, 1]] {
                 for up in [[1, 2], [2, 1]] {
@@ -5846,6 +6002,14 @@ mod windows_exports {
             assert!(gesture.up(2, Some(binding)).is_none());
         }
 
+        fn legacy_writing_shortcuts() -> crate::settings::WritingShortcuts {
+            crate::settings::WritingShortcuts {
+                draft: crate::settings::WritingShortcut::new(0, 3),
+                polish: crate::settings::WritingShortcut::new(0x20, 1),
+                expand: None,
+            }
+        }
+
         #[test]
         fn writing_modifier_snapshot_rejects_preheld_altgr_and_aliases() {
             let mut keys = [0u8; 256];
@@ -5872,6 +6036,7 @@ mod windows_exports {
                 let shortcuts = WritingShortcuts {
                     draft: WritingShortcut::new(0x41, mask),
                     polish: WritingShortcut::new(0x7b, mask),
+                    expand: None,
                 };
                 for actual in 0..16 {
                     let modifiers = Modifiers {
@@ -5916,6 +6081,7 @@ mod windows_exports {
             let token = shared.borrow().as_ref().unwrap().token;
             let mut settings = Settings {
                 online_ai_enabled: true,
+                writing_shortcuts: legacy_writing_shortcuts(),
                 ..Settings::default()
             };
             // Draft needs no model: this fixture cannot accidentally send.
@@ -5934,11 +6100,11 @@ mod windows_exports {
                         .unwrap();
                 }
                 assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, held);
-                assert!(
-                    !unsafe { sink.OnKeyDown(&host.context, WPARAM(vk), LPARAM(1)) }
-                        .unwrap()
-                        .as_bool()
-                );
+                assert!(!unsafe {
+                    legacy_trace_key_down(&shared, &sink, &host.context, WPARAM(vk), LPARAM(1))
+                }
+                .unwrap()
+                .as_bool());
             };
             let up = |vk, mods| {
                 let _keys = LocalKeyboard::set(mods);
@@ -5948,9 +6114,11 @@ mod windows_exports {
                     let _ = unsafe { sink.OnTestKeyUp(&host.context, WPARAM(vk), lp) }.unwrap();
                 }
                 assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, held);
-                assert!(!unsafe { sink.OnKeyUp(&host.context, WPARAM(vk), lp) }
-                    .unwrap()
-                    .as_bool());
+                assert!(!unsafe {
+                    legacy_trace_key_up(&shared, &sink, &host.context, WPARAM(vk), lp)
+                }
+                .unwrap()
+                .as_bool());
             };
             let both = Modifiers {
                 control: true,
@@ -6039,6 +6207,12 @@ mod windows_exports {
             let _apartment = Apartment;
             let host = NativeDocument::new().unwrap();
             let (service, shared) = basic_service(&host);
+            shared
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .settings
+                .writing_shortcuts = legacy_writing_shortcuts();
             let sink: ITfKeyEventSink = service.cast().unwrap();
             let _keys = LocalKeyboard::set(Modifiers::NONE);
             send_key(&sink, &host.context, b'N');
@@ -6068,18 +6242,18 @@ mod windows_exports {
                     let _keys = LocalKeyboard::set(mods);
                     let held = shared.borrow().as_ref().unwrap().writing_gesture.held;
                     for _ in 0..3 {
-                        assert!(unsafe {
+                        assert!(!unsafe {
                             sink.OnTestKeyDown(&host.context, WPARAM(vk), LPARAM(0))
                         }
                         .unwrap()
                         .as_bool());
                     }
                     assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, held);
-                    assert!(
-                        !unsafe { sink.OnKeyDown(&host.context, WPARAM(vk), LPARAM(0)) }
-                            .unwrap()
-                            .as_bool()
-                    );
+                    assert!(!unsafe {
+                        legacy_trace_key_down(&shared, &sink, &host.context, WPARAM(vk), LPARAM(0))
+                    }
+                    .unwrap()
+                    .as_bool());
                 }
                 let both = Modifiers {
                     control: true,
@@ -6090,11 +6264,17 @@ mod windows_exports {
                 {
                     let _keys = LocalKeyboard::set(both);
                     if cancel == 1 {
-                        assert!(
-                            !unsafe { sink.OnKeyDown(&host.context, WPARAM(0x58), LPARAM(0)) }
-                                .unwrap()
-                                .as_bool()
-                        );
+                        assert!(!unsafe {
+                            legacy_trace_key_down(
+                                &shared,
+                                &sink,
+                                &host.context,
+                                WPARAM(0x58),
+                                LPARAM(0),
+                            )
+                        }
+                        .unwrap()
+                        .as_bool());
                     } else if cancel == 2 {
                         let active = shared.borrow_mut();
                         let active = active.as_ref().unwrap();
@@ -6104,7 +6284,13 @@ mod windows_exports {
                             .set(active.context_generation.get().wrapping_add(2));
                     } else if cancel == 3 {
                         assert!(!unsafe {
-                            sink.OnKeyDown(&host.context, WPARAM(0x12), LPARAM(1 << 30))
+                            legacy_trace_key_down(
+                                &shared,
+                                &sink,
+                                &host.context,
+                                WPARAM(0x12),
+                                LPARAM(1 << 30),
+                            )
                         }
                         .unwrap()
                         .as_bool());
@@ -6131,20 +6317,19 @@ mod windows_exports {
                     if cancel != 4 {
                         let held = shared.borrow().as_ref().unwrap().writing_gesture.held;
                         for _ in 0..3 {
-                            assert_eq!(
-                                unsafe { sink.OnTestKeyUp(&host.context, WPARAM(vk), LPARAM(0)) }
-                                    .unwrap()
-                                    .as_bool(),
-                                held != 0
-                            );
+                            assert!(!unsafe {
+                                sink.OnTestKeyUp(&host.context, WPARAM(vk), LPARAM(0))
+                            }
+                            .unwrap()
+                            .as_bool());
                         }
                         assert_eq!(shared.borrow().as_ref().unwrap().writing_gesture.held, held);
                     }
-                    assert!(
-                        !unsafe { sink.OnKeyUp(&host.context, WPARAM(vk), LPARAM(0)) }
-                            .unwrap()
-                            .as_bool()
-                    );
+                    assert!(!unsafe {
+                        legacy_trace_key_up(&shared, &sink, &host.context, WPARAM(vk), LPARAM(0))
+                    }
+                    .unwrap()
+                    .as_bool());
                 }
                 WRITING_NOTICES.with(|n| assert_eq!(n.borrow().len(), usize::from(cancel == 0)));
                 WRITING_CAPTURE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
@@ -6158,6 +6343,95 @@ mod windows_exports {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn native_writing_default_draft_prediction_launch_repeat_and_disabled() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let (service, shared) = basic_service(&host);
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let token = shared.borrow().as_ref().unwrap().token;
+            shared
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .settings
+                .model_api
+                .active_id = None;
+            let store = writing_settings_store().unwrap();
+            store
+                .save(&shared.borrow().as_ref().unwrap().settings)
+                .unwrap();
+            WRITING_CAPTURE_CALLS.with(|c| c.set(0));
+            for modifiers in [
+                Modifiers::CONTROL,
+                Modifiers::CONTROL.with_shift().with_alt(),
+            ] {
+                let _keys = LocalKeyboard::set(modifiers);
+                assert!(
+                    !unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x31), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+                assert!(
+                    !unsafe { sink.OnKeyDown(&host.context, WPARAM(0x31), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+            }
+            let _keys = LocalKeyboard::set(Modifiers::CONTROL.with_shift());
+            for _ in 0..3 {
+                assert!(
+                    unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x31), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+            }
+            WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 0));
+            assert!(!WRITING_PANELS.with(|p| p.borrow().contains_key(&token)));
+            assert!(
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x31), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 1));
+            assert!(WRITING_PANELS.with(|p| p.borrow()[&token].window.is_open()));
+            assert!(
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x31), LPARAM(1 << 30)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 1));
+            close_writing_panel(token);
+            shared
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .settings
+                .online_ai_enabled = false;
+            store
+                .save(&shared.borrow().as_ref().unwrap().settings)
+                .unwrap();
+            WRITING_CAPTURE_CALLS.with(|c| c.set(0));
+            for digit in [0x31, 0x32] {
+                assert!(
+                    unsafe { sink.OnTestKeyDown(&host.context, WPARAM(digit), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+                assert!(
+                    unsafe { sink.OnKeyDown(&host.context, WPARAM(digit), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+            }
+            WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 0));
+            assert!(!WRITING_PANELS.with(|p| p.borrow().contains_key(&token)));
+            assert!(POLISH_POPUPS.with(|p| p.borrow().is_empty()));
         }
 
         #[test]
@@ -6190,24 +6464,24 @@ mod windows_exports {
                     .online_polish
                     .enabled
             );
-            let _keys = LocalKeyboard::set(Modifiers::CONTROL);
+            let _keys = LocalKeyboard::set(Modifiers::CONTROL.with_shift());
             WRITING_CAPTURE_CALLS.with(|calls| calls.set(0));
             WRITING_NOTICES.with(|n| n.borrow_mut().clear());
             for _ in 0..3 {
                 assert!(
-                    unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x20), LPARAM(0)) }
+                    unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x32), LPARAM(0)) }
                         .unwrap()
                         .as_bool()
                 );
             }
             WRITING_NOTICES.with(|n| assert!(n.borrow().is_empty()));
             assert!(
-                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x20), LPARAM(0)) }
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x32), LPARAM(0)) }
                     .unwrap()
                     .as_bool()
             );
             assert!(
-                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x20), LPARAM(1 << 30)) }
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(0x32), LPARAM(1 << 30)) }
                     .unwrap()
                     .as_bool()
             );
@@ -6229,6 +6503,7 @@ mod windows_exports {
             let shortcuts = WritingShortcuts {
                 draft: WritingShortcut::new(0x41, 5),
                 polish: WritingShortcut::new(0x7b, 5),
+                expand: None,
             };
             assert_eq!(
                 writing_shortcut(0x41, modifiers, shortcuts),
@@ -6353,10 +6628,15 @@ mod windows_exports {
                 writing_fixture_edit(&host, Some("选中文字🙂"), true);
                 // Draft never treats the selected text as an implicit prompt.
                 assert!(writing_fixture_capture(&host, crate::writing::Task::draft()).is_none());
-                let captured = writing_fixture_capture(&host, crate::writing::Task::polish());
-                assert_eq!(captured.is_some(), scope == Some(0));
-                if let Some((_, _, text)) = captured {
-                    assert_eq!(text, "选中文字🙂");
+                for task in [
+                    crate::writing::Task::polish(),
+                    crate::writing::Task::expand(),
+                ] {
+                    let captured = writing_fixture_capture(&host, task);
+                    assert_eq!(captured.is_some(), scope == Some(0), "{task:?}");
+                    if let Some((_, _, text)) = captured {
+                        assert_eq!(text, "选中文字🙂");
+                    }
                 }
                 if scope != Some(0) {
                     continue;
@@ -6372,7 +6652,9 @@ mod windows_exports {
                 );
                 writing_fixture_edit(&host, Some(&"字".repeat(501)), true);
                 assert!(writing_fixture_capture(&host, crate::writing::Task::polish()).is_none());
+                assert!(writing_fixture_capture(&host, crate::writing::Task::expand()).is_none());
                 writing_fixture_edit(&host, None, false);
+                assert!(writing_fixture_capture(&host, crate::writing::Task::expand()).is_none());
                 assert_eq!(
                     writing_fixture_capture(&host, crate::writing::Task::draft())
                         .unwrap()
@@ -6402,6 +6684,49 @@ mod windows_exports {
                 assert!(invalid.get(), "text editing invalidates");
                 writing_fixture_edit(&host, Some(&original), false);
                 assert!(invalid.get(), "restoring text cannot restore authority");
+            }
+        }
+
+        #[test]
+        fn writing_selection_rejects_multiple_missing_and_failed_results() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let scope: IUnknown = TestScope(vec![0]).into();
+            let owner: IUnknown = ScopeOwner {
+                value: RefCell::new(VARIANT::from(scope)),
+                calls: Rc::new(Cell::new(0)),
+                fail: false,
+            }
+            .into();
+            let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+            let range = writing_fixture_capture(&host, crate::writing::Task::draft())
+                .unwrap()
+                .0;
+            for (fetched, failed, has_range, allowed) in [
+                (0, false, false, false),
+                (1, false, true, true),
+                (2, false, true, false),
+                (3, false, true, false),
+                (1, true, true, false),
+                (1, false, false, false),
+            ] {
+                let mut selections = [TF_SELECTION::default(), TF_SELECTION::default()];
+                if has_range {
+                    selections[0].range = std::mem::ManuallyDrop::new(Some(range.clone()));
+                    selections[1].range = std::mem::ManuallyDrop::new(Some(range.clone()));
+                }
+                let result = single_writing_selection(
+                    selections,
+                    fetched,
+                    if failed {
+                        Err(E_UNEXPECTED.into())
+                    } else {
+                        Ok(())
+                    },
+                );
+                assert_eq!(result.is_ok(), allowed);
             }
         }
 
@@ -6456,6 +6781,7 @@ mod windows_exports {
                 .writing_shortcuts = crate::settings::WritingShortcuts {
                 draft: crate::settings::WritingShortcut::new(0x31, 5),
                 polish: crate::settings::WritingShortcut::new(0x32, 5),
+                expand: None,
             };
             shared
                 .borrow_mut()
@@ -6613,6 +6939,12 @@ mod windows_exports {
                 .into();
                 let host = NativeDocument::with_owner(Some(&owner)).unwrap();
                 let (service, shared) = basic_service(&host);
+                shared
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .settings
+                    .writing_shortcuts = legacy_writing_shortcuts();
                 let sink: ITfKeyEventSink = service.cast().unwrap();
                 writing_fixture_edit(&host, Some("合成选区"), !empty);
                 let store = writing_settings_store().unwrap();
@@ -6726,10 +7058,12 @@ mod windows_exports {
                 crate::settings::WritingShortcuts {
                     draft: crate::settings::WritingShortcut::new(0x31, 5),
                     polish: crate::settings::WritingShortcut::new(0x32, 5),
+                    expand: None,
                 },
                 crate::settings::WritingShortcuts {
                     draft: crate::settings::WritingShortcut::new(0x41, 5),
                     polish: crate::settings::WritingShortcut::new(0x7b, 5),
+                    expand: None,
                 },
             ] {
                 shared
@@ -6835,6 +7169,187 @@ mod windows_exports {
         }
 
         #[test]
+        #[ignore = "owned HWND/TSF and isolated Store; FLOWER_CONSENT_TEST_DIR required"]
+        fn native_expansion_shortcut_selection_preview_and_safe_replace() {
+            use crate::writing::Task;
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for (scope, selected, online) in [
+                (Some(0), true, true),
+                (None, true, true),
+                (Some(31), true, true),
+                (Some(0), false, true),
+                (Some(0), true, false),
+            ] {
+                let value = scope
+                    .map(|value| {
+                        let object: IUnknown = TestScope(vec![value]).into();
+                        VARIANT::from(object)
+                    })
+                    .unwrap_or_default();
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(value),
+                    calls: Rc::new(Cell::new(0)),
+                    fail: false,
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let (service, shared) = basic_service(&host);
+                let window = WritingHostWindow::new(&host);
+                writing_fixture_edit(&host, Some("原文🙂"), selected);
+                let token = shared.borrow().as_ref().unwrap().token;
+                let _cleanup = WritingPanelCleanup(token);
+                {
+                    let mut state = shared.borrow_mut();
+                    let active = state.as_mut().unwrap();
+                    active.settings.online_ai_enabled = online;
+                    // Expansion is independently confirmed, not Polish opt-in.
+                    active.settings.online_polish.enabled = false;
+                    active.settings.model_api.active_id = None;
+                }
+                writing_settings_store()
+                    .unwrap()
+                    .save(&shared.borrow().as_ref().unwrap().settings)
+                    .unwrap();
+                let sink: ITfKeyEventSink = service.cast().unwrap();
+                let _keys = LocalKeyboard::set(Modifiers::CONTROL.with_shift());
+                WRITING_CAPTURE_CALLS.with(|c| c.set(0));
+                WRITING_BODY_READS.with(|c| c.set(0));
+                for _ in 0..3 {
+                    assert!(
+                        unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0x33), LPARAM(0)) }
+                            .unwrap()
+                            .as_bool()
+                    );
+                }
+                WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 0));
+                assert!(
+                    unsafe { sink.OnKeyDown(&host.context, WPARAM(0x33), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+                writing_pump_owned_messages();
+                let allowed = scope == Some(0) && selected && online;
+                let panel = WRITING_PANELS
+                    .with(|panels| panels.borrow().get(&token).map(|p| p.window.hwnd()));
+                assert_eq!(panel.is_some(), allowed);
+                if !allowed {
+                    WRITING_BODY_READS.with(|c| assert_eq!(c.get(), 0));
+                    assert_eq!(read_document(&host, None), "原文🙂");
+                    continue;
+                }
+                let binding = LAST_WRITING_BINDING
+                    .with(|b| b.borrow().as_ref().unwrap().upgrade())
+                    .unwrap();
+                assert_eq!(binding.original, "原文🙂");
+                assert!(matches!(binding.task, Task::Expand { .. }));
+                WRITING_BODY_READS.with(|c| assert_eq!(c.get(), 1));
+                let _ = unsafe { sink.OnKeyDown(&host.context, WPARAM(0x33), LPARAM(1 << 30)) }
+                    .unwrap();
+                WRITING_CAPTURE_CALLS.with(|c| assert_eq!(c.get(), 1));
+                assert_eq!(read_document(&host, None), "原文🙂");
+                let output = "文".repeat(801);
+                apply_writing_binding(
+                    Rc::clone(&binding),
+                    &Rc::downgrade(&shared),
+                    panel.unwrap(),
+                    &output,
+                )
+                .unwrap();
+                assert!(binding.used.get());
+                assert_eq!(read_document(&host, None), output);
+                assert_eq!(
+                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+                    window.control
+                );
+                assert!(apply_writing_binding(
+                    binding,
+                    &Rc::downgrade(&shared),
+                    panel.unwrap(),
+                    "不应再写",
+                )
+                .is_err());
+            }
+        }
+
+        #[test]
+        fn native_expansion_write_budget_is_checked_before_changing_the_document() {
+            use crate::writing::Task;
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for (task, length, allowed) in [
+                (Task::draft(), 800, true),
+                (Task::draft(), 801, false),
+                (Task::polish(), 800, true),
+                (Task::polish(), 801, false),
+                (Task::expand(), 801, true),
+                (Task::expand(), 2400, true),
+                (Task::expand(), 2401, false),
+                (Task::expand(), 2, false),
+            ] {
+                let scope: IUnknown = TestScope(vec![0]).into();
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(scope)),
+                    calls: Rc::new(Cell::new(0)),
+                    fail: false,
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let (_service, shared) = basic_service(&host);
+                let selected = !matches!(task, Task::Draft { .. });
+                let source = if selected { "原文🙂" } else { "" };
+                writing_fixture_edit(&host, Some(source), selected);
+                let (range, style, original) = writing_fixture_capture(&host, task).unwrap();
+                let invalid = Rc::new(Cell::new(false));
+                let observation =
+                    WritingObservation::connect(&host.context, Rc::clone(&invalid)).unwrap();
+                let binding = Rc::new(WritingBinding {
+                    context: host.context.clone(),
+                    range,
+                    style,
+                    original,
+                    task,
+                    key: context_key(&host.context),
+                    token: shared.borrow().as_ref().unwrap().token,
+                    owner: std::thread::current().id(),
+                    focus: unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+                    root: Default::default(),
+                    process: 0,
+                    invalid,
+                    used: Cell::new(false),
+                    polish_guard: None,
+                    _observation: observation,
+                });
+                let output = "文".repeat(length);
+                let success = Rc::new(Cell::new(false));
+                let session: ITfEditSession = WritingApply {
+                    binding,
+                    shared: Rc::downgrade(&shared),
+                    output: output.clone(),
+                    success: Rc::clone(&success),
+                }
+                .into();
+                let _ = unsafe {
+                    host.context.RequestEditSession(
+                        host.client,
+                        &session,
+                        TF_ES_SYNC | TF_ES_READWRITE,
+                    )
+                };
+                assert_eq!(success.get(), allowed, "{task:?}: {length}");
+                assert_eq!(
+                    read_document(&host, None),
+                    if allowed { output.as_str() } else { source },
+                    "{task:?}: {length}"
+                );
+            }
+        }
+
+        #[test]
         fn native_writing_sync_write_revalidation_and_once() {
             unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
                 .ok()
@@ -6861,6 +7376,7 @@ mod windows_exports {
                     range,
                     style,
                     original,
+                    task: crate::writing::Task::polish(),
                     key: context_key(&host.context),
                     token: shared.borrow().as_ref().unwrap().token,
                     owner: std::thread::current().id(),
@@ -6990,6 +7506,7 @@ mod windows_exports {
                 pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
+                _key_trace: None,
                 settings: fixture_settings,
                 lexicon: Lexicon::from_tsv("ni\t你\t100\nhao\t好\t100\nni'hao\t你好\t200").unwrap(),
                 rankings: Arc::new(Vec::new()),
@@ -8746,6 +9263,7 @@ mod windows_exports {
                     pending_lexicon: None,
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
+                    _key_trace: None,
                     settings: Settings {
                         ai_correction_enabled: index < 19,
                         ai_undeclared_scope_compatibility: !matches!(index, 21 | 22),
@@ -9133,6 +9651,7 @@ mod windows_exports {
                     pending_lexicon: None,
                     context_generation: Rc::new(Cell::new(0)),
                     _thread_events: None,
+                    _key_trace: None,
                     settings: Settings {
                         ai_correction_enabled: false,
                         ai_undeclared_scope_compatibility: compat,
@@ -9283,7 +9802,9 @@ mod windows_exports {
                 let range = unsafe { self.context.GetStart(cookie) }?;
                 let end = unsafe { self.context.GetEnd(cookie) }?;
                 unsafe { range.ShiftEndToRange(cookie, &end, TF_ANCHOR_END) }?;
-                let mut buffer = [0u16; 512];
+                // Owned test documents now include expansion results above
+                // 800 characters; read the entire bounded fixture for assertions.
+                let mut buffer = [0u16; 8192];
                 let mut fetched = 0;
                 unsafe { range.GetText(cookie, 0, &mut buffer, &mut fetched) }?;
                 *self.text.borrow_mut() = String::from_utf16(&buffer[..fetched as usize])
@@ -9315,6 +9836,8 @@ mod windows_exports {
             let result = text.borrow().clone();
             result
         }
+
+        include!("keyboard_trace_tests.rs");
 
         fn send_key(sink: &ITfKeyEventSink, context: &ITfContext, key: u8) {
             assert!(
@@ -9604,6 +10127,7 @@ mod windows_exports {
                 pending_lexicon: None,
                 context_generation: generation,
                 _thread_events: Some(events),
+                _key_trace: None,
                 settings: Settings::default(),
                 lexicon: Lexicon::from_tsv("jin'tian'xin'qing\t今天新情\t100").unwrap(),
                 rankings: Arc::new(Vec::new()),
@@ -11478,6 +12002,7 @@ mod windows_exports {
                 pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
+                _key_trace: None,
                 settings: Settings::default(),
                 lexicon: Lexicon::from_tsv("ni\t你\t100\nhao\t好\t100\nni'hao\t你好\t200").unwrap(),
                 rankings: Arc::new(Vec::new()),
@@ -11492,9 +12017,17 @@ mod windows_exports {
             });
             let sink: ITfKeyEventSink = service.cast().unwrap();
             let down = |key| {
-                unsafe { sink.OnKeyDown(&host.context, WPARAM(key), LPARAM(0)) }
-                    .unwrap()
-                    .as_bool()
+                unsafe {
+                    legacy_trace_key_down(
+                        &implementation.activation,
+                        &sink,
+                        &host.context,
+                        WPARAM(key),
+                        LPARAM(0),
+                    )
+                }
+                .unwrap()
+                .as_bool()
             };
             let test_down = |key| {
                 unsafe { sink.OnTestKeyDown(&host.context, WPARAM(key), LPARAM(0)) }
@@ -11507,9 +12040,17 @@ mod windows_exports {
                     .as_bool()
             };
             let up = || {
-                unsafe { sink.OnKeyUp(&host.context, WPARAM(0xA0), LPARAM(0)) }
-                    .unwrap()
-                    .as_bool()
+                unsafe {
+                    legacy_trace_key_up(
+                        &implementation.activation,
+                        &sink,
+                        &host.context,
+                        WPARAM(0xA0),
+                        LPARAM(0),
+                    )
+                }
+                .unwrap()
+                .as_bool()
             };
             let generation = Rc::clone(
                 &implementation
@@ -11545,12 +12086,12 @@ mod windows_exports {
                 .unwrap();
             send_key(&sink, &host.context, b'1' + partial as u8);
             assert_eq!(read_document(&host, None), "你hao");
-            assert!(test_down(0xA0));
-            assert!(test_down(0xA0)); // Prediction does not arm or toggle.
+            assert!(!test_down(0xA0));
+            assert!(!test_down(0xA0)); // Prediction does not arm or toggle.
             assert!(!test_up());
             assert!(!down(0xA0));
-            assert!(test_up());
-            assert!(test_up()); // Prediction does not commit.
+            assert!(!test_up());
+            assert!(!test_up()); // Prediction does not commit.
             assert_eq!(read_document(&host, None), "你hao");
             assert!(!implementation.activation.borrow().as_ref().unwrap().english);
             assert!(up());
@@ -11572,7 +12113,7 @@ mod windows_exports {
             assert!(!down(b'N' as usize)); // Host handles English; test never injects keys.
             assert_eq!(read_document(&host, None), "nihao");
             assert!(!down(0xA0));
-            assert!(test_down(b'A' as usize)); // Route chord solely to disarm.
+            assert!(!test_down(b'A' as usize)); // Route chord solely to disarm.
             assert!(!down(b'A' as usize));
             assert!(!up());
             assert!(implementation.activation.borrow().as_ref().unwrap().english);
@@ -11598,11 +12139,17 @@ mod windows_exports {
                 focused_context_key(&host.manager),
                 Some(context_key(&host.context))
             );
-            assert!(
-                !unsafe { sink.OnKeyDown(&host.context, WPARAM(0xA0), LPARAM(1 << 30)) }
-                    .unwrap()
-                    .as_bool()
-            );
+            assert!(!unsafe {
+                legacy_trace_key_down(
+                    &implementation.activation,
+                    &sink,
+                    &host.context,
+                    WPARAM(0xA0),
+                    LPARAM(1 << 30),
+                )
+            }
+            .unwrap()
+            .as_bool());
             assert!(!up());
             assert!(!implementation.activation.borrow().as_ref().unwrap().english);
 
@@ -11724,6 +12271,7 @@ mod windows_exports {
                 pending_lexicon: None,
                 context_generation: Rc::new(Cell::new(0)),
                 _thread_events: None,
+                _key_trace: None,
                 settings: Settings::default(),
                 lexicon: Lexicon::builtin().unwrap(),
                 rankings: Arc::new(Vec::new()),

@@ -25,7 +25,9 @@ pub fn map_windows_virtual_key(virtual_key: u32, modifiers: Modifiers) -> Option
             Key::Char(b")!@#$%^&*("[(virtual_key - 0x30) as usize] as char)
         }
         0x30..=0x39 => Key::Char((b'0' + (virtual_key - 0x30) as u8) as char),
-        0x41..=0x5A => Key::Char((b'a' + (virtual_key - 0x41) as u8) as char),
+        0x41..=0x5A => Key::Char(
+            ((if modifiers.shift { b'A' } else { b'a' }) + (virtual_key - 0x41) as u8) as char,
+        ),
         0xDE => Key::Char(if modifiers.shift { '"' } else { '\'' }),
         0xBA => Key::Char(if modifiers.shift { ':' } else { ';' }),
         0xBC => Key::Char(if modifiers.shift { '<' } else { ',' }),

@@ -1,6 +1,6 @@
 //! One owned background generation job, with a bounded latest-snapshot mailbox.
 
-use super::{WritingError, WritingRequest, MAX_OUTPUT_CHARS};
+use super::{WritingError, WritingRequest};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -178,14 +178,20 @@ impl WritingJob {
             .spawn(move || {
                 let _lease = lease;
                 let mut partial = String::new();
+                let output_limit = request.task.output_limit();
+                let mut overflow = false;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     generate(
                         &request,
                         &token,
                         &mut |chunk| {
-                            if !token.load(Ordering::Acquire)
-                                && partial.chars().count() + chunk.chars().count()
-                                    <= MAX_OUTPUT_CHARS
+                            if token.load(Ordering::Acquire) || overflow {
+                                return;
+                            }
+                            if partial.chars().count() + chunk.chars().count() > output_limit {
+                                overflow = true;
+                                return;
+                            }
                             {
                                 partial.push_str(&chunk);
                                 publish(
@@ -215,15 +221,14 @@ impl WritingJob {
                 .unwrap_or(Err(WritingError::Service));
                 let (text, phase) = if token.load(Ordering::Acquire) {
                     (partial, Phase::Failed(WritingError::Cancelled))
+                } else if overflow {
+                    (partial, Phase::Failed(WritingError::TooLarge))
                 } else {
                     match result {
-                        Ok(text)
-                            if !text.trim().is_empty()
-                                && text.chars().count() <= MAX_OUTPUT_CHARS =>
-                        {
-                            (text, Phase::Complete)
-                        }
-                        Ok(_) => (partial, Phase::Failed(WritingError::Incomplete)),
+                        Ok(text) => match request.task.validate_output(&request.input, &text) {
+                            Ok(()) => (text, Phase::Complete),
+                            Err(error) => (partial, Phase::Failed(error)),
+                        },
                         Err(error) => (partial, Phase::Failed(error)),
                     }
                 };
@@ -384,6 +389,88 @@ mod tests {
         assert_eq!(update.id, 7);
         assert_eq!(update.text.chars().count(), 800);
         assert_eq!(update.phase, Phase::Complete);
+    }
+
+    #[test]
+    fn expansion_worker_accepts_long_complete_output_and_validates_final_independently() {
+        for (count, expected) in [
+            (801, Phase::Complete),
+            (2400, Phase::Complete),
+            (4, Phase::Failed(WritingError::ExpansionUnchanged)),
+            (2401, Phase::Failed(WritingError::TooLarge)),
+            (0, Phase::Failed(WritingError::Incomplete)),
+        ] {
+            let mut request = request(11);
+            request.task = super::super::Task::expand();
+            let job = WritingJob::spawn(request, move |_, _, emit| {
+                let text = "花".repeat(count);
+                if matches!(count, 801 | 2400) {
+                    for chunk in text.chars().collect::<Vec<_>>().chunks(127) {
+                        emit(chunk.iter().collect());
+                    }
+                }
+                Ok(text)
+            })
+            .unwrap();
+            let update = wait(&job);
+            assert_eq!(update.phase, expected);
+            assert!(update.text.chars().count() <= 2400);
+        }
+    }
+
+    #[test]
+    fn worker_emit_overflow_cannot_be_washed_by_short_final_for_any_task() {
+        for task in [
+            super::super::Task::expand(),
+            super::super::Task::draft(),
+            super::super::Task::polish(),
+        ] {
+            let mut request = request(12);
+            request.task = task;
+            let limit = task.output_limit();
+            let job = WritingJob::spawn(request, move |_, _, emit| {
+                emit("花".repeat(limit));
+                emit("多".into());
+                emit("晚".into());
+                Ok("合法但较短的正文".into())
+            })
+            .unwrap();
+            let update = wait(&job);
+            assert_eq!(update.phase, Phase::Failed(WritingError::TooLarge));
+            assert_eq!(update.text.chars().count(), limit);
+        }
+    }
+
+    #[test]
+    fn old_tasks_reject_801_final_without_streamed_chunks() {
+        for task in [super::super::Task::draft(), super::super::Task::polish()] {
+            let mut request = request(13);
+            request.task = task;
+            let job = WritingJob::spawn(request, |_, _, _| Ok("花".repeat(801))).unwrap();
+            assert_eq!(wait(&job).phase, Phase::Failed(WritingError::TooLarge));
+        }
+    }
+
+    #[test]
+    fn expansion_cancellation_wins_over_overflow_and_late_final() {
+        let mut request = request(14);
+        request.task = super::super::Task::expand();
+        let (ready, emitted) = std::sync::mpsc::channel();
+        let job = WritingJob::spawn(request, move |_, cancel, emit| {
+            emit("花".repeat(2401));
+            ready.send(()).unwrap();
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            emit("晚结果".into());
+            Ok("较长的合法正文".into())
+        })
+        .unwrap();
+        emitted.recv_timeout(Duration::from_secs(3)).unwrap();
+        job.cancel();
+        let update = wait(&job);
+        assert_eq!(update.phase, Phase::Failed(WritingError::Cancelled));
+        assert!(update.text.is_empty());
     }
 
     #[test]

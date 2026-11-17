@@ -738,7 +738,8 @@ pub fn generate_until_for(
             ));
         }
         validate_content_type(owned.handle.0)?;
-        let mut decoder = SseDecoder::with_protocol(profile.protocol, profile.is_bigmodel_api());
+        let mut decoder =
+            SseDecoder::for_task(profile.protocol, profile.is_bigmodel_api(), request.task);
         let mut total = 0usize;
         loop {
             let length = owned.read(READ_SIZE, cancel, deadline)?;

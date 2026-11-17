@@ -35,8 +35,8 @@ impl Key {
 
 /// Modifier state attached to a key event.
 ///
-/// Shift is allowed during composition because Pinyin letters are normalized
-/// to lowercase. Command-style modifiers are passed through to the host.
+/// Shift plus an ASCII letter is an explicit uppercase literal, not Pinyin.
+/// Command-style modifiers are passed through to the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Modifiers {
     pub shift: bool,

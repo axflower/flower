@@ -24,6 +24,9 @@
 
 ## 快捷键故障与验证
 
-- 保留Ctrl+Alt纯组合释放帮写、Ctrl+Space选区润色及自定义精确组合；排查真实OnTest/OnKeyDown/OnKeyUp链，不把系统拦截或用户旧DLL当成已证原因。
+默认 AI 快捷键及旧设置迁移现以 `editorial-polish-and-default-shortcuts.md`
+为准：帮写 Ctrl+Shift+1、润色 Ctrl+Shift+2。下文纯修饰释放等仍适用于自定义组合。
+
+- 保留纯修饰释放和自定义精确组合的兼容能力；排查真实OnTest/OnKeyDown/OnKeyUp链，不把系统拦截或用户旧DLL当成已证原因。
 - 修复须有生产回调链隔离证据，而不只手势状态机直调。OnTest纯预测、AltGr/串键/repeat/焦点代际取消、开启时可启动及关闭时0捕获/0面板/0请求都要验证。
 - 自有HWND/TSF文档和注入Store测试，不使用真实配置/密钥/正文/API/剪贴板/全局注键；不安装注册或覆盖在用DLL，不提交Git。新测试制品用0.5.2，保留旧0.5.1。

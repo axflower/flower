@@ -542,7 +542,7 @@ fn keys_without_an_active_composition_pass_through() {
 #[test]
 fn windows_virtual_keys_map_to_the_core_api() {
     let letter = map_windows_virtual_key(b'A' as u32, Modifiers::SHIFT).expect("letter key");
-    assert_eq!(letter.key, Key::Char('a'));
+    assert_eq!(letter.key, Key::Char('A'));
     assert_eq!(letter.modifiers, Modifiers::SHIFT);
 
     assert_eq!(

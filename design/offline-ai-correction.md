@@ -1,5 +1,8 @@
 # Flower 离线 AI 纠错实验版
 
+0.5.11 候选展示以 [新显示合同](input-commands-case-and-clean-candidates.md) 为准：
+纠正尾部统一 `√`，不再显示“AI”；模型、授权与学习边界不变。
+
 0.4.15用户明确选择默认兼容未声明范围的应用，适用安全边界与设置以
 `default-ai-scope-compatibility.md` 为准；本页与之冲突的未知范围拒绝条款为历史。
 

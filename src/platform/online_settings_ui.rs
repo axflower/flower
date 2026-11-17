@@ -298,7 +298,7 @@ fn initialize(
 ) -> Result<(), String> {
     let specs = [
         (200, "STATIC", "在线润色 · 当前模型 API", 0, [24, 16, 550, 62]),
-        (201, "STATIC", "润色快捷键（默认 Ctrl+Space）会将主动选中的文本发送给当前模型 API 处理，适用供应商隐私与服务条款，可能计入 API 额度或产生费用。不会自动监听或上传选区。", 0, [24, 84, 550, 60]),
+        (201, "STATIC", "按润色快捷键（默认 Ctrl+Shift+2）会将主动选中的文本发送给当前模型 API，适用供应商隐私与服务条款，可能产生费用。不会自动监听或上传选区。", 0, [24, 84, 550, 60]),
         (ENABLE, "BUTTON", "允许按润色快捷键将所选文本发送至上方显示的当前连接", (BS_AUTOCHECKBOX | BS_MULTILINE) as u32, [24, 152, 550, 52]),
         (202, "STATIC", "润色风格", 0, [24, 220, 160, 24]),
         (STYLE, "COMBOBOX", "", CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0, [24, 248, 240, 120]),
@@ -349,7 +349,7 @@ fn initialize(
         for (id, labels, selected) in [
             (
                 STYLE,
-                ["通顺", "正式", "简洁"],
+                ["通顺（充分表达）", "正式", "简洁"],
                 match initial.style {
                     PolishStyle::Fluent => 0,
                     PolishStyle::Formal => 1,
@@ -869,6 +869,7 @@ mod tests {
             writing_shortcuts: crate::settings::WritingShortcuts {
                 draft: crate::settings::WritingShortcut::new(0x41, 5),
                 polish: crate::settings::WritingShortcut::new(0x7b, 5),
+                expand: None,
             },
             ..Default::default()
         };

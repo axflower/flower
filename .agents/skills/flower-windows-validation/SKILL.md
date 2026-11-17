@@ -7,6 +7,11 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 ## 在线 BYOK 写作的隔离验证
 
+- 多选区拒绝须从索引0以至少两槽调用ITfContext::GetSelection，严格要求fetched==1；TF_DEFAULT_SELECTION即使提供多槽也只返回默认项，不能证明唯一。捕获与写回复核共用检查，并在失败/部分返回时释放所有ManuallyDrop COM引用。新增长输出任务时同时核SSE增量/Responses快照、worker partial/final失败锁存、窗口应用和TSF同步写回预算，旧任务上限保持；测试文档读取缓冲区也须覆盖完整输出，不能把测试读回截短误认为生产裁切。
+
+- 默认快捷键升级时，为序列化设置记录迁移版本；仅识别完整旧默认对，保留 partial 和自定义组合，读取不写用户文件。新版主动保存的旧组合必须可稳定回读，不能每次加载再改回新默认。原生测试将旧默认手势改为显式自定义 fixture，另验证新默认的生产预测/真实按键、repeat、关闭零捕获及预编辑保护。
+- 润色质量改动须同时审编辑规则和固定示例：明确事实不能被弱化成待确认事项，局部意见不能无据扩成完整流程建议，扩写保留条件、否定和承诺程度。两协议/风格的请求构造、材料 JSON 边界和预算测试只证明接入，不证明真实模型质量；使用固定公开样例区分重复、有效展开、过度扩写和虚构，不自动读取用户密钥或调用其付费 API。
+
 - 配置保存、活动模型选择、模型目录同步和真实推理成功分别取证，不把任何一项冒充其它。自定义目录并非都可发现：显式GET base/models只在用户点击时发生，不发正文/不自动生成，模型ID从有效目录选择，无法发现时保留高级手填而不猜默认收费模型。连接校验须独立于modelID校验，空模型可以获取目录但不能生成/应用；有界JSON/ID数、超时取消、编辑目标变更和关闭拒晚结果、旧密钥不跨target是必要回归。
 - 主配置“保存并使用”需验证凭据操作结果，再持久化当前选择并回读；密钥成功而配置失败明确部分成功，不能说已应用或回滚未知并发设置。用户说“已切换但生成失败”时优先收集服务商基址和固定安全报错，HTTP404/400不能统称Protocol，5xx保留状态数字；不索取密钥或正文。Coding Plan和标准API的入口/密钥/适用工具分开说明，不伪装受支持工具，不把改地址当套餐授权迁移。
 
@@ -45,6 +50,8 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 先读 `docs/distribution.md`、`docs/windows-validation.md` 和当前 `design/mixed-input-and-installation.md`，分页与调序见 `design/adaptive-candidates.md`，旧版补充见 `design/input-and-installation.md`。历史设计文件若已不存在，不按旧摘要恢复；以当前源码和实际宿主事实为准，不将历史通过记录当成本次版本通过。
 
 ## 环境与构建
+
+本项目本地交付遵循 `design/local-build-and-publication.md`：完成授权修改和适用验证后，默认直接构建并核验当前版本完整 ZIP 与 EXE，交付 `dist/`，无需再单独询问打包。不得把本地打包视为发布、推送、创建发布标签或安装注册的授权；发布需用户另行明确指令，旧包保留。
 
 - Release 的 `panic=abort` 与集成测试的 unwind 构建可能为同一 cdylib/rlib 写出同名产物，出现 Cargo filename collision 及 LNK2019/LNK1120；先核对实际双构建证据。可仅在测试命令使用 `--config 'profile.release.panic="unwind"'` 统一策略，不修改产品 profile、不把未链接的测试当通过，也不为此盲目清空整个 target。
 
@@ -96,6 +103,9 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 独立 TSF 探针必须区分 host client、service client 和已存在接收器。客户端标识无效或重复 advise 的错误不等于真实宿主故障，不能据此改成异步或强行吞键。
 
 ## 隔离原生回归与目录安全
+
+- 组合键/英文符号吞键先核OnTest与实际消费是否一致：不能为观察Shift或纯修饰手势而对原生键预测TRUE、实际又FALSE。可用线程mgr ITfKeyTraceEventSink分离物理历史，弱Activation/token/owner+RAII订阅，无COM环；测试按Trace→Test→仅TRUE调用OnKey路由，区分真实订阅、直调Trace夹具与真实系统键盘投递。修饰释放交宿主，不读写真实剪贴板；Caps用系统toggle覆盖base模式，关闭后恢复，未提交raw转换不学习。
+- COM测试优先传入已持有的SharedActivation，不把任意经QI取得的继承base接口强行AsImpl推回实现。替换词典fixture时同步清pending_lexicon，防首键延迟加载覆盖；分页fixture须满足当前长候选只保留一个完整项规则，用真实部分前缀制造后页，不能仅堆同reading完整长项或放宽分页断言。
 
 - 纯修饰快捷键须验证生产回调链最终创建真实HWND，不以手势状态机或composition拒绝提示计数代替成功唤窗。漏收release后失焦/再进入必须清完整held/releasing且旧任务不能复活；新完整组合可恢复，OnTest仍只预测。私密/空选区可能需要一次只读编辑会话检查scope/selection，正文读取0与会话数0是不同事实，分别计数。
 - 候选配额改变时同时验证合法AI显示同文升级：普通完整项被去重移除后仍保留待选正文的长短分类，不能依赖该项仍存在而跳过单字配额，也不能按confirmed显示长度误删短正文歧义。调整页大小后按候选身份恢复高亮；前缀选择测试用Space，Enter对未耗尽raw有原拼提交语义。旧默认页大小迁移应带一次性标记，新保存的显式自定义值不反复强改。

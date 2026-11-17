@@ -111,7 +111,7 @@ fn ai_marks_existing_correction_without_duplicate_or_learning() {
         .any(|c| c.text == "今天心情很好"));
     let update = r.apply_ai_candidate(&input, "今天心情很好").unwrap();
     assert_eq!(update.candidates[0].text, "今天新情很好");
-    assert_eq!(update.candidates[1].display_text(), "今天心情很好 ✓ AI");
+    assert_eq!(update.candidates[1].display_text(), "今天心情很好 √");
     assert_eq!(
         update
             .candidates
@@ -147,7 +147,7 @@ fn ai_candidate_uses_real_selection_and_never_learns() {
         let update = r.apply_ai_candidate(&input, "今天心情很好").unwrap();
         assert_eq!(r.preedit(), original);
         assert!(update.candidates[1].is_ai());
-        assert_eq!(update.candidates[1].display_text(), "今天心情很好 ✓ AI");
+        assert_eq!(update.candidates[1].display_text(), "今天心情很好 √");
         let update = match method {
             0 => r.process_key(KeyEvent::plain(Key::Char('2'))).unwrap(),
             1 | 2 => {
