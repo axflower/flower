@@ -411,14 +411,14 @@ pub struct InstallationSnapshot {
     pub language_profile: ResourceState,
     pub keyboard_category: ResourceState,
     pub ui_element_category: ResourceState,
+    pub immersive_category: ResourceState,
 }
 
 impl InstallationSnapshot {
     pub fn is_complete(self) -> bool {
-        self.com.is_present()
-            && self.language_profile.is_present()
-            && self.keyboard_category.is_present()
-            && self.ui_element_category.is_present()
+        RegistrationResource::INSTALL_ORDER
+            .into_iter()
+            .all(|resource| resource.state(self).is_present())
     }
 }
 
@@ -428,15 +428,25 @@ pub enum RegistrationResource {
     LanguageProfile,
     KeyboardCategory,
     UiElementCategory,
+    ImmersiveCategory,
 }
 
 impl RegistrationResource {
+    const INSTALL_ORDER: [Self; 5] = [
+        Self::Com,
+        Self::LanguageProfile,
+        Self::KeyboardCategory,
+        Self::UiElementCategory,
+        Self::ImmersiveCategory,
+    ];
+
     fn state(self, snapshot: InstallationSnapshot) -> ResourceState {
         match self {
             Self::Com => snapshot.com,
             Self::LanguageProfile => snapshot.language_profile,
             Self::KeyboardCategory => snapshot.keyboard_category,
             Self::UiElementCategory => snapshot.ui_element_category,
+            Self::ImmersiveCategory => snapshot.immersive_category,
         }
     }
 
@@ -446,6 +456,7 @@ impl RegistrationResource {
             Self::LanguageProfile => "TSF 语言配置",
             Self::KeyboardCategory => "TSF 键盘分类",
             Self::UiElementCategory => "TSF UIElement 能力分类",
+            Self::ImmersiveCategory => "TSF 现代界面兼容分类",
         }
     }
 }
@@ -475,12 +486,7 @@ impl std::error::Error for RegistrationConflict {}
 pub fn plan_registration(
     snapshot: InstallationSnapshot,
 ) -> Result<RegistrationPlan, RegistrationConflict> {
-    let all = [
-        RegistrationResource::Com,
-        RegistrationResource::LanguageProfile,
-        RegistrationResource::KeyboardCategory,
-        RegistrationResource::UiElementCategory,
-    ];
+    let all = RegistrationResource::INSTALL_ORDER;
     if let Some(resource) = all
         .into_iter()
         .find(|resource| resource.state(snapshot) == ResourceState::Conflict)
@@ -652,12 +658,7 @@ fn rollback_failed_installation<B: RegistrationBackend>(
     }
 
     let mut cleanup_blocked = false;
-    for resource in [
-        RegistrationResource::UiElementCategory,
-        RegistrationResource::KeyboardCategory,
-        RegistrationResource::LanguageProfile,
-        RegistrationResource::Com,
-    ] {
+    for resource in RegistrationResource::INSTALL_ORDER.into_iter().rev() {
         if !cleanup.contains(&resource) {
             continue;
         }
@@ -699,12 +700,7 @@ pub fn execute_unregistration<B: RegistrationBackend>(
     let snapshot = backend
         .inspect_registration(None)
         .map_err(OperationError::new)?;
-    let all = [
-        RegistrationResource::Com,
-        RegistrationResource::LanguageProfile,
-        RegistrationResource::KeyboardCategory,
-        RegistrationResource::UiElementCategory,
-    ];
+    let all = RegistrationResource::INSTALL_ORDER;
     if let Some(resource) = all
         .into_iter()
         .find(|resource| resource.state(snapshot) == ResourceState::Conflict)
@@ -715,12 +711,7 @@ pub fn execute_unregistration<B: RegistrationBackend>(
     }
 
     let mut changed = false;
-    for resource in [
-        RegistrationResource::UiElementCategory,
-        RegistrationResource::KeyboardCategory,
-        RegistrationResource::LanguageProfile,
-        RegistrationResource::Com,
-    ] {
+    for resource in all.into_iter().rev() {
         if resource.state(snapshot).is_present() {
             backend.remove_resource(resource).map_err(|error| {
                 OperationError::new(format!("{}移除失败：{error}", resource.label()))

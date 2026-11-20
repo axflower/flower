@@ -16,14 +16,20 @@ from scripts.test_package import PackageFixture, ai_fixture, flower_package, mak
 
 
 class InstallerSourceTests(unittest.TestCase):
-    def test_ui_element_capability_is_required_and_orphans_are_detected(self):
+    def test_modern_shell_capabilities_are_required_and_orphans_are_detected(self):
         source = (installer.REPO / "installer" / "flower.iss").read_text(encoding="utf-8-sig")
-        self.assertIn("UIElementCategory = '{49D2F9CF-1F5E-11D7-A6D3-00065B84435C}'", source)
-        # Both initial conflicts and post-registration ownership cover the capability.
-        self.assertGreaterEqual(source.count("UIElementCategory + '\\' + FlowerClass"), 2)
+        preflight = source.split("function HasFlowerRegistration", 1)[1].split("end;\n\n", 1)[0]
         owned = source.split("function OwnedRegistrationComplete", 1)[1].split("function CanStartFlower", 1)[0]
         self.assertIn("KeyboardCategory", owned)
-        self.assertIn("UIElementCategory", owned)
+        for category, guid in (
+            ("UIElementCategory", "49D2F9CF-1F5E-11D7-A6D3-00065B84435C"),
+            ("ImmersiveCategory", "13A016DF-560B-46CD-947A-4C3AF1E0E35D"),
+        ):
+            with self.subTest(category=category):
+                self.assertIn(f"{category} = '{{{guid}}}'", source)
+                key = f"{category} + '\\' + FlowerClass"
+                self.assertIn(f"{key}) then Exit", preflight)
+                self.assertIn(f"{key})", owned)
 
     """Static integration guards, not a substitute for executing the wizard."""
 

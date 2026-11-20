@@ -1,8 +1,16 @@
 # Flower Windows x64 分发与使用
 
-Flower 支持 Windows 10/11 x64。当前版本为 0.5.14，提供完整离线 EXE
+Flower 支持 Windows 10/11 x64。当前版本为 0.5.15，提供完整离线 EXE
 测试安装器与 ZIP 包；下文安装示例使用本版本文件名。
 测试包尚未签名，校验哈希不等于验证发布者身份。不支持 x86 或 ARM64 宿主。
+
+## 0.5.15 Windows 系统搜索兼容
+
+- 增加现代 Windows 界面所需的输入法注册分类，并为应用容器提供读取、执行
+  安装文件的权限，解决开始菜单和设置搜索框切换列表可能不显示 Flower 的问题。
+- 此更改需要重新安装，单独复制新版 DLL 或重新启用旧版不足以更新注册与目录权限。
+  更新后分别在开始菜单和设置的搜索框中按 `Win + Space`，选择 Flower，
+  输入 `nihao` 并选词，确认汉字进入搜索框。此项不包含 Windows 内联搜索建议集成。
 
 ## 0.5.14 本地候选质量
 
@@ -149,7 +157,7 @@ Flower 支持 Windows 10/11 x64。当前版本为 0.5.14，提供完整离线 EX
 
 1. 校验下载文件旁的 `.sha256`。例如：
    ```powershell
-    Get-FileHash .\flower-0.5.14-windows-x64-setup.exe -Algorithm SHA256
+    Get-FileHash .\flower-0.5.15-windows-x64-setup.exe -Algorithm SHA256
    ```
 2. EXE 安装器请求管理员权限，仅进行机器级安装与注册，不更改默认输入法。
 3. 在普通用户桌面从开始菜单运行“启动 Flower”，再按 `Win + Space`
@@ -198,14 +206,19 @@ flower-register prepare-install-path --path "C:\Program Files\Flower"
 ```
 
 前者只读；后者会新建缺失目录，供管理员安装流程调用，不修复已有目录。
+目录须给普通及受限 Windows 应用容器可继承的读取和执行权限，不授予写权限。
+若旧版已卸载且安装器提示准备目录失败，确认 `Program Files\Flower` **完全为空**后，
+可删除该空目录再运行安装器。若还有文件或旧注册，请保留并按旧版本卸载流程处理。
 检查失败没有复制载荷或注册的授权；准备失败可能留下本次创建的空安全目录。
 辅助命令保留旧路径检查能力，不代表本版 EXE 允许自选目录。
 0.4.1 用户副本辅助命令仅保留兼容，新安装器不调用。
 
 ### ZIP 手工安装
 
-ZIP 本身不提权。校验外部哈希和包内 `SHA256SUMS` 后，将文件放入受保护的稳定安装
-目录，不从 Downloads、开发 `target` 或会话临时目录注册。
+ZIP 本身不提权。校验外部哈希和包内 `SHA256SUMS` 后，先以管理员身份用已校验的
+`flower-register.exe prepare-install-path --path "C:\Program Files\Flower\manual"`
+创建受保护的稳定目录，再复制解压内容，让载荷继承目录权限（不要移动保留旧权限的文件）。
+不要从 Downloads、开发 `target` 或会话临时目录执行机器注册。
 在管理员终端使用该稳定目录中的注册工具：
 
 ```powershell

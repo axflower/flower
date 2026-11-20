@@ -140,6 +140,7 @@ impl FakeRegistrationBackend {
             RegistrationResource::LanguageProfile => &mut self.snapshot.language_profile,
             RegistrationResource::KeyboardCategory => &mut self.snapshot.keyboard_category,
             RegistrationResource::UiElementCategory => &mut self.snapshot.ui_element_category,
+            RegistrationResource::ImmersiveCategory => &mut self.snapshot.immersive_category,
         }
     }
 
@@ -203,6 +204,7 @@ fn missing() -> InstallationSnapshot {
         language_profile: ResourceState::Missing,
         keyboard_category: ResourceState::Missing,
         ui_element_category: ResourceState::Missing,
+        immersive_category: ResourceState::Missing,
     }
 }
 
@@ -212,6 +214,7 @@ fn complete() -> InstallationSnapshot {
         language_profile: ResourceState::PresentOwned,
         keyboard_category: ResourceState::PresentOwned,
         ui_element_category: ResourceState::PresentOwned,
+        immersive_category: ResourceState::PresentOwned,
     }
 }
 
@@ -231,6 +234,7 @@ fn register_is_idempotent_and_installs_identity_components_in_order() {
             RegistrationResource::LanguageProfile,
             RegistrationResource::KeyboardCategory,
             RegistrationResource::UiElementCategory,
+            RegistrationResource::ImmersiveCategory,
         ]
     );
     assert!(backend.snapshot.is_complete());
@@ -239,7 +243,7 @@ fn register_is_idempotent_and_installs_identity_components_in_order() {
         execute_registration(&mut backend, dll),
         Ok(OperationOutcome::Unchanged)
     );
-    assert_eq!(backend.writes.len(), 4);
+    assert_eq!(backend.writes.len(), 5);
     assert!(backend.removals.is_empty());
 }
 
@@ -265,10 +269,8 @@ fn conflicting_registration_is_rejected_before_any_write() {
 #[test]
 fn failed_register_rolls_back_only_items_created_by_this_run() {
     let existing_category = InstallationSnapshot {
-        com: ResourceState::Missing,
-        language_profile: ResourceState::Missing,
         keyboard_category: ResourceState::PresentOwned,
-        ui_element_category: ResourceState::Missing,
+        ..missing()
     };
     let mut backend = FakeRegistrationBackend::new(existing_category);
     backend.fail_install = Some(RegistrationResource::LanguageProfile);
@@ -284,31 +286,39 @@ fn failed_register_rolls_back_only_items_created_by_this_run() {
 }
 
 #[test]
-fn ui_element_is_independent_and_rollback_preserves_existing_resources() {
-    let old_keyboard_install = InstallationSnapshot {
-        ui_element_category: ResourceState::Missing,
-        ..complete()
-    };
-    assert!(!old_keyboard_install.is_complete());
-    assert_eq!(
-        plan_registration(old_keyboard_install).unwrap().actions,
-        vec![RegistrationResource::UiElementCategory]
-    );
-    let mut backend = FakeRegistrationBackend::new(old_keyboard_install);
-    backend.fail_install = Some(RegistrationResource::UiElementCategory);
-    backend.write_failed_install = true;
-    assert!(execute_registration(&mut backend, Path::new(r"C:\Flower\flower.dll")).is_err());
-    assert_eq!(
-        backend.removals,
-        vec![RegistrationResource::UiElementCategory]
-    );
-    assert_eq!(backend.snapshot, old_keyboard_install);
-    let mut conflict = old_keyboard_install;
-    conflict.ui_element_category = ResourceState::Conflict;
-    assert_eq!(
-        plan_registration(conflict).unwrap_err().resource,
-        RegistrationResource::UiElementCategory
-    );
+fn missing_capability_can_be_added_without_disturbing_an_existing_install() {
+    let dll = Path::new(r"C:\Flower\flower.dll");
+    for resource in [
+        RegistrationResource::UiElementCategory,
+        RegistrationResource::ImmersiveCategory,
+    ] {
+        let mut backend = FakeRegistrationBackend::new(complete());
+        *backend.state_mut(resource) = ResourceState::Conflict;
+        assert_eq!(
+            plan_registration(backend.snapshot).unwrap_err().resource,
+            resource
+        );
+        assert!(execute_unregistration(&mut backend).is_err());
+        assert!(backend.removals.is_empty());
+
+        *backend.state_mut(resource) = ResourceState::Missing;
+        let before = backend.snapshot;
+        assert!(!before.is_complete());
+        assert_eq!(plan_registration(before).unwrap().actions, vec![resource]);
+        backend.fail_install = Some(resource);
+        backend.write_failed_install = true;
+        assert!(execute_registration(&mut backend, dll).is_err());
+        assert_eq!(backend.removals, vec![resource]);
+        assert_eq!(backend.snapshot, before);
+
+        backend.clear_faults();
+        assert_eq!(
+            execute_registration(&mut backend, dll),
+            Ok(OperationOutcome::Changed)
+        );
+        assert_eq!(backend.snapshot, complete());
+        assert_eq!(backend.writes, vec![resource, resource]);
+    }
 }
 
 #[test]
@@ -412,6 +422,7 @@ fn unregister_removes_tsf_before_com_and_repeats_safely() {
     assert_eq!(
         backend.removals,
         vec![
+            RegistrationResource::ImmersiveCategory,
             RegistrationResource::UiElementCategory,
             RegistrationResource::KeyboardCategory,
             RegistrationResource::LanguageProfile,
@@ -423,7 +434,7 @@ fn unregister_removes_tsf_before_com_and_repeats_safely() {
         execute_unregistration(&mut backend),
         Ok(OperationOutcome::Unchanged)
     );
-    assert_eq!(backend.removals.len(), 4);
+    assert_eq!(backend.removals.len(), 5);
 }
 
 #[test]
@@ -436,6 +447,7 @@ fn unregister_failure_preserves_com_for_retry() {
     assert_eq!(
         backend.removals,
         vec![
+            RegistrationResource::ImmersiveCategory,
             RegistrationResource::UiElementCategory,
             RegistrationResource::KeyboardCategory,
             RegistrationResource::LanguageProfile,

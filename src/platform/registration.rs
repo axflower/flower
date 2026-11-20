@@ -43,8 +43,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr,
-    ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
-    GUID_TFCAT_TIP_KEYBOARD, TF_INPUTPROCESSORPROFILE, TF_PROFILETYPE_INPUTPROCESSOR,
+    ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+    GUID_TFCAT_TIPCAP_UIELEMENTENABLED, GUID_TFCAT_TIP_KEYBOARD, TF_INPUTPROCESSORPROFILE,
+    TF_PROFILETYPE_INPUTPROCESSOR,
 };
 
 const MAX_DLL_SIZE: u64 = 512 * 1024 * 1024;
@@ -842,18 +843,17 @@ fn inspect_language_profile() -> Result<ResourceState, String> {
     })
 }
 
-fn inspect_keyboard_category() -> Result<ResourceState, String> {
-    inspect_category(GUID_TFCAT_TIP_KEYBOARD)
-}
-
-fn inspect_ui_element_category() -> Result<ResourceState, String> {
-    inspect_category(GUID_TFCAT_TIPCAP_UIELEMENTENABLED)
-}
+const FLOWER_CATEGORIES: [GUID; 3] = [
+    GUID_TFCAT_TIP_KEYBOARD,
+    GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+    GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+];
 
 fn category_state(categories: &[GUID], requested: GUID) -> ResourceState {
-    if categories.iter().any(|category| {
-        *category != GUID_TFCAT_TIP_KEYBOARD && *category != GUID_TFCAT_TIPCAP_UIELEMENTENABLED
-    }) {
+    if categories
+        .iter()
+        .any(|category| !FLOWER_CATEGORIES.contains(category))
+    {
         ResourceState::Conflict
     } else if categories.contains(&requested) {
         ResourceState::PresentOwned
@@ -863,6 +863,10 @@ fn category_state(categories: &[GUID], requested: GUID) -> ResourceState {
 }
 
 fn inspect_category(requested: GUID) -> Result<ResourceState, String> {
+    Ok(category_state(&read_categories()?, requested))
+}
+
+fn read_categories() -> Result<Vec<GUID>, String> {
     let manager = category_manager()?;
     // SAFETY: The manager and fixed class identifier are live for the call.
     let categories = unsafe { manager.EnumCategoriesInItem(&FLOWER_CLSID) }
@@ -882,7 +886,7 @@ fn inspect_category(requested: GUID) -> Result<ResourceState, String> {
         }
         found.push(category[0]);
     }
-    Ok(category_state(&found, requested))
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -890,9 +894,10 @@ mod category_pure_tests {
     use super::*;
 
     #[test]
-    fn registrationpure_ui_element_categories_are_exact_and_independent() {
+    fn registrationpure_categories_are_exact_and_independent() {
         let keyboard = GUID_TFCAT_TIP_KEYBOARD;
         let ui = GUID_TFCAT_TIPCAP_UIELEMENTENABLED;
+        let immersive = GUID::from_u128(0x13a016df_560b_46cd_947a_4c3af1e0e35d);
         assert_eq!(category_state(&[], keyboard), ResourceState::Missing);
         assert_eq!(category_state(&[], ui), ResourceState::Missing);
         assert_eq!(
@@ -902,13 +907,17 @@ mod category_pure_tests {
         assert_eq!(category_state(&[keyboard], ui), ResourceState::Missing);
         assert_eq!(category_state(&[ui], ui), ResourceState::PresentOwned);
         assert_eq!(category_state(&[ui], keyboard), ResourceState::Missing);
-        for category in [keyboard, ui] {
+        assert_eq!(
+            category_state(&[keyboard, ui], immersive),
+            ResourceState::Missing
+        );
+        for category in [keyboard, ui, immersive] {
             assert_eq!(
-                category_state(&[keyboard, ui], category),
+                category_state(&[keyboard, ui, immersive], category),
                 ResourceState::PresentOwned
             );
             assert_eq!(
-                category_state(&[keyboard, ui, GUID::from_u128(1)], category),
+                category_state(&[keyboard, ui, immersive, GUID::from_u128(1)], category),
                 ResourceState::Conflict
             );
         }
@@ -982,44 +991,27 @@ fn remove_language_profile() -> Result<(), String> {
     Ok(())
 }
 
-fn install_keyboard_category() -> Result<ResourceInstallation, String> {
-    install_category(GUID_TFCAT_TIP_KEYBOARD)
-}
-
-fn install_ui_element_category() -> Result<ResourceInstallation, String> {
-    install_category(GUID_TFCAT_TIPCAP_UIELEMENTENABLED)
-}
-
 fn install_category(category: GUID) -> Result<ResourceInstallation, String> {
     match inspect_category(category)? {
         ResourceState::PresentOwned => return Ok(ResourceInstallation::AlreadyPresent),
         ResourceState::Conflict => {
-            return Err("Flower TSF 键盘分类状态冲突；未覆盖。".to_owned());
+            return Err("Flower TSF 分类状态冲突；未覆盖。".to_owned());
         }
         ResourceState::Missing => {}
     }
 
     let manager = category_manager()?;
-    // SAFETY: The manager and all fixed GUIDs remain live for the call. Flower
-    // implements only the keyboard and UIElement capabilities.
+    // SAFETY: The manager and all fixed GUIDs remain live for the call.
     unsafe { manager.RegisterCategory(&FLOWER_CLSID, &category, &FLOWER_CLSID) }
-        .map_err(|error| com_error("注册 TSF 键盘分类", error))?;
+        .map_err(|error| com_error("注册 TSF 分类", error))?;
     Ok(ResourceInstallation::Created)
-}
-
-fn remove_keyboard_category() -> Result<(), String> {
-    remove_category(GUID_TFCAT_TIP_KEYBOARD)
-}
-
-fn remove_ui_element_category() -> Result<(), String> {
-    remove_category(GUID_TFCAT_TIPCAP_UIELEMENTENABLED)
 }
 
 fn remove_category(category: GUID) -> Result<(), String> {
     match inspect_category(category)? {
         ResourceState::Missing => return Ok(()),
         ResourceState::Conflict => {
-            return Err("Flower TSF 键盘分类状态冲突；未删除。".to_owned());
+            return Err("Flower TSF 分类状态冲突；未删除。".to_owned());
         }
         ResourceState::PresentOwned => {}
     }
@@ -1030,11 +1022,11 @@ fn remove_category(category: GUID) -> Result<(), String> {
     if let Err(error) = result {
         match inspect_category(category) {
             Ok(ResourceState::Missing) => return Ok(()),
-            Ok(_) => return Err(com_error("注销 TSF 键盘分类", error)),
+            Ok(_) => return Err(com_error("注销 TSF 分类", error)),
             Err(check_error) => {
                 return Err(format!(
-                    "{}；复核 TSF 键盘分类状态失败：{check_error}",
-                    com_error("注销 TSF 键盘分类", error)
+                    "{}；复核 TSF 分类状态失败：{check_error}",
+                    com_error("注销 TSF 分类", error)
                 ));
             }
         }
@@ -1049,11 +1041,13 @@ impl RegistrationBackend for WindowsRegistrationBackend {
         &mut self,
         expected_dll: Option<&Path>,
     ) -> Result<InstallationSnapshot, String> {
+        let categories = read_categories()?;
         Ok(InstallationSnapshot {
             com: inspect_com(expected_dll)?.state,
             language_profile: inspect_language_profile()?,
-            keyboard_category: inspect_keyboard_category()?,
-            ui_element_category: inspect_ui_element_category()?,
+            keyboard_category: category_state(&categories, GUID_TFCAT_TIP_KEYBOARD),
+            ui_element_category: category_state(&categories, GUID_TFCAT_TIPCAP_UIELEMENTENABLED),
+            immersive_category: category_state(&categories, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT),
         })
     }
 
@@ -1068,8 +1062,13 @@ impl RegistrationBackend for WindowsRegistrationBackend {
                 create_com_registration(&validated)
             }
             RegistrationResource::LanguageProfile => install_language_profile(dll),
-            RegistrationResource::KeyboardCategory => install_keyboard_category(),
-            RegistrationResource::UiElementCategory => install_ui_element_category(),
+            RegistrationResource::KeyboardCategory => install_category(GUID_TFCAT_TIP_KEYBOARD),
+            RegistrationResource::UiElementCategory => {
+                install_category(GUID_TFCAT_TIPCAP_UIELEMENTENABLED)
+            }
+            RegistrationResource::ImmersiveCategory => {
+                install_category(GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT)
+            }
         }
     }
 
@@ -1077,8 +1076,13 @@ impl RegistrationBackend for WindowsRegistrationBackend {
         match resource {
             RegistrationResource::Com => remove_com_registration(),
             RegistrationResource::LanguageProfile => remove_language_profile(),
-            RegistrationResource::KeyboardCategory => remove_keyboard_category(),
-            RegistrationResource::UiElementCategory => remove_ui_element_category(),
+            RegistrationResource::KeyboardCategory => remove_category(GUID_TFCAT_TIP_KEYBOARD),
+            RegistrationResource::UiElementCategory => {
+                remove_category(GUID_TFCAT_TIPCAP_UIELEMENTENABLED)
+            }
+            RegistrationResource::ImmersiveCategory => {
+                remove_category(GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT)
+            }
         }
     }
 }
@@ -1152,6 +1156,12 @@ pub fn register(dll_path: &Path) -> Result<OperationOutcome, OperationError> {
     let validated = validate_dll(dll_path).map_err(|error| OperationError {
         message: error.to_string(),
         rollback_errors: Vec::new(),
+    })?;
+    super::install_path::check_input_method_image_access(&validated.path).map_err(|error| {
+        OperationError {
+            message: format!("输入法 DLL 无法满足现代 Windows 宿主的访问要求：{error}。未注册。"),
+            rollback_errors: Vec::new(),
+        }
     })?;
     let _apartment = ComApartment::initialize().map_err(|message| OperationError {
         message,

@@ -16,6 +16,8 @@
   对根本身的 DELETE 位，仍拒绝 FILE_DELETE_CHILD、WRITE_DAC、WRITE_OWNER 等权限。
   不把这一例外应用于任意子目录，不允许卷根作为安装目标。
 - 新增显式 `prepare-install-path --path`，仅供提升后的安装流程准备目录。
+  现代 Windows 应用容器所需的只读/执行授权见
+  [Windows 系统搜索中的普通输入](startup-uiless-and-mixed-composition.md#windows-系统搜索中的普通输入)。
   不修改任何已有目录的权限、owner 或内容；存在的不安全目录拒绝使用。
   缺失组件逐级使用创建时的受保护安全描述符：
   owner Administrators，SYSTEM/Administrators 完全控制，Users 读和执行，

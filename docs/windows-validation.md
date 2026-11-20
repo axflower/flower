@@ -1630,7 +1630,8 @@ Cargo.lock、内外摘要及源ZIP关联、帮助/Unicode/非法启动参数、�
 - Activate与ActivateEx共用初始化并保存flags，完整候选UIElement Begin/Update/End。
   仅公开当前引擎页为一个页面；宿主拒显时所有自绘候选/AI状态行及旧鼠标帧均不可见，
   隐藏HWND仍供原AI定时器。COM重入、旧元素、失焦、提交/取消及停用清理有隔离回归。
-  仅登记实际实现的UIELEMENTENABLED能力，不额外挂IMMERSIVE等标记。
+  0.4.14 当时仅登记 UIELEMENTENABLED；0.5.15 的现代界面注册条件见
+  [Windows 系统搜索中的普通输入](../design/startup-uiless-and-mixed-composition.md#windows-系统搜索中的普通输入)。
   新能力作为独立第四资源纳入完整性、冲突、安装/逆序回滚和孤立安装器检测，
   补能力失败不删除已有keyboard-only安装的资源。
 - 混拼保留原legacy beam8/edge4，另用独立有界supplemental lane，

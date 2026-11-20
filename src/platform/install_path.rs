@@ -18,7 +18,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, GetDriveTypeW, GetFileInformationByHandle, QueryDosDeviceW,
-    BY_HANDLE_FILE_INFORMATION,
+    BY_HANDLE_FILE_INFORMATION, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
 };
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 
@@ -26,13 +26,16 @@ const SYSTEM: &str = "S-1-5-18";
 const ADMINS: &str = "S-1-5-32-544";
 const INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 const CREATOR_OWNER: &str = "S-1-3-0";
+const APP_PACKAGES: &str = "S-1-15-2-1";
+const RESTRICTED_APP_PACKAGES: &str = "S-1-15-2-2";
+const OBJECT_AND_CONTAINER_INHERIT: u8 = 0x03;
 const INHERIT_ONLY: u8 = 0x08;
 const REPARSE_POINT: u32 = 0x400;
 // DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_ALL, MAXIMUM_ALLOWED, FILE_DELETE_CHILD.
 const ANCESTOR_MUTATION: u32 = 0x120d_0040;
 const TREE_MUTATION: u32 = ANCESTOR_MUTATION | 0x4000_0116;
 const INSTALL_DIRECTORY_SDDL: &str =
-    "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
+    "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)(A;OICI;GRGX;;;AC)(A;OICI;GRGX;;;S-1-15-2-2)";
 
 fn trusted(sid: &str) -> bool {
     matches!(sid, SYSTEM | ADMINS | INSTALLER)
@@ -145,6 +148,14 @@ unsafe fn sid_string(sid: PSID) -> Result<String, String> {
 }
 
 fn inspect(path: &Path, strict: bool) -> Result<(bool, File), String> {
+    inspect_with_package_access(path, strict, None)
+}
+
+fn inspect_with_package_access(
+    path: &Path,
+    strict: bool,
+    required_package_flags: Option<u8>,
+) -> Result<(bool, File), String> {
     // Do not follow the final component; every ancestor is independently inspected.
     // Keep a no-delete-share handle open throughout the descriptor inspection.
     let file = OpenOptions::new()
@@ -183,7 +194,7 @@ fn inspect(path: &Path, strict: bool) -> Result<(bool, File), String> {
         let _memory = LocalAllocation(descriptor.0);
         status.ok().map_err(|e| e.to_string())?;
         let volume_root = path.parent().is_none() && path.has_root();
-        inspect_acl(owner, acl, strict, volume_root)?;
+        inspect_acl(owner, acl, strict, volume_root, required_package_flags)?;
     }
     Ok((metadata.is_dir(), file))
 }
@@ -194,6 +205,7 @@ unsafe fn inspect_acl(
     acl: *const ACL,
     strict: bool,
     volume_root: bool,
+    required_package_flags: Option<u8>,
 ) -> Result<(), String> {
     if !trusted(&sid_string(owner)?) {
         return Err("owner 必须为 SYSTEM、Administrators 或 TrustedInstaller".into());
@@ -201,6 +213,7 @@ unsafe fn inspect_acl(
     if acl.is_null() {
         return Err("不允许 null DACL".into());
     }
+    let mut packages = [false; 2];
     for index in 0..(*acl).AceCount {
         let mut ace = std::ptr::null_mut();
         GetAce(acl, u32::from(index), &mut ace).map_err(|e| e.to_string())?;
@@ -220,6 +233,44 @@ unsafe fn inspect_acl(
         if !path_allow_is_safe(&sid, mask, header[1], strict, volume_root) {
             return Err(format!("非可信 SID {sid} 具有写入或替换权限"));
         }
+        if let Some(flags) = required_package_flags {
+            // Require an allow ACE that applies to this object. For the install
+            // root it must also propagate to files and subdirectories.
+            if matches_package_read_execute(mask, header[1], flags) {
+                match sid.as_str() {
+                    APP_PACKAGES => packages[0] = true,
+                    RESTRICTED_APP_PACKAGES => packages[1] = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    if required_package_flags.is_some() && !packages.into_iter().all(|allowed| allowed) {
+        return Err("缺少 Windows 应用容器的读取和执行权限".into());
+    }
+    Ok(())
+}
+
+fn matches_package_read_execute(mask: u32, flags: u8, required_flags: u8) -> bool {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const NO_PROPAGATE_INHERIT: u8 = 0x04;
+    let read = mask & GENERIC_READ != 0 || mask & FILE_GENERIC_READ.0 == FILE_GENERIC_READ.0;
+    let execute =
+        mask & GENERIC_EXECUTE != 0 || mask & FILE_GENERIC_EXECUTE.0 == FILE_GENERIC_EXECUTE.0;
+    flags & INHERIT_ONLY == 0
+        && flags & required_flags == required_flags
+        && (required_flags == 0 || flags & NO_PROPAGATE_INHERIT == 0)
+        && read
+        && execute
+}
+
+/// Require sandbox read/execute grants on the actual image before advertising
+/// immersive support. This does not modify the DLL or its descriptor.
+pub(super) fn check_input_method_image_access(path: &Path) -> Result<(), String> {
+    let (is_directory, _) = inspect_with_package_access(path, true, Some(0))?;
+    if is_directory {
+        return Err("输入法 DLL 路径不能是目录".into());
     }
     Ok(())
 }
@@ -243,6 +294,8 @@ pub fn prepare_install_path(path: &Path) -> Result<(), String> {
     }
     // Keep every earlier no-delete handle alive until the strict recheck ends.
     let final_guards = check_path(path, true)?;
+    inspect_with_package_access(path, true, Some(OBJECT_AND_CONTAINER_INHERIT))
+        .map_err(|error| format!("安装目标 {}：{error}", path.display()))?;
     drop(final_guards);
     drop(guards);
     Ok(())
@@ -738,6 +791,14 @@ mod tests {
     }
 
     fn check_sddl(sddl: &str, strict: bool) -> Result<(), String> {
+        check_sddl_with_package_access(sddl, strict, None)
+    }
+
+    fn check_sddl_with_package_access(
+        sddl: &str,
+        strict: bool,
+        required_package_flags: Option<u8>,
+    ) -> Result<(), String> {
         use windows::Win32::Foundation::BOOL;
         use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
         use windows::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
@@ -766,8 +827,8 @@ mod tests {
                 assert_ne!(control & SE_DACL_PROTECTED.0, 0);
                 assert_eq!(sid_string(owner).unwrap(), ADMINS);
                 assert!(present.as_bool());
-                assert_eq!((*acl).AceCount, 3);
-                for index in 0..3 {
+                assert_eq!((*acl).AceCount, 5);
+                for index in 0..5 {
                     let mut ace = std::ptr::null_mut();
                     GetAce(acl, index, &mut ace).unwrap();
                     let header = std::slice::from_raw_parts(ace.cast::<u8>(), 4);
@@ -775,7 +836,7 @@ mod tests {
                     assert_eq!(header[1], 3); // object + container inheritance
                 }
             }
-            inspect_acl(owner, acl, strict, false)
+            inspect_acl(owner, acl, strict, false, required_package_flags)
         }
     }
 
@@ -801,6 +862,38 @@ mod tests {
             true
         )
         .is_err());
+    }
+
+    #[test]
+    fn app_container_access_requires_both_groups_and_never_allows_mutation() {
+        let directory = Some(OBJECT_AND_CONTAINER_INHERIT);
+        let image = Some(0);
+        assert!(check_sddl_with_package_access(INSTALL_DIRECTORY_SDDL, true, directory).is_ok());
+
+        let old_install = "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
+        assert!(
+            check_sddl(old_install, true).is_ok(),
+            "still safe to uninstall"
+        );
+        assert!(check_sddl_with_package_access(old_install, true, directory).is_err());
+        let one_level_only = "O:BAD:(A;OICINP;FRFX;;;AC)(A;OICI;FRFX;;;S-1-15-2-2)";
+        assert!(check_sddl_with_package_access(one_level_only, true, directory).is_err());
+
+        // The inherited DLL ACEs usually carry mapped file rights rather than GR/GX.
+        let inherited_image = "O:BAD:(A;ID;FRFX;;;AC)(A;ID;FRFX;;;S-1-15-2-2)";
+        assert!(check_sddl_with_package_access(inherited_image, true, image).is_ok());
+        assert!(check_sddl_with_package_access(inherited_image, true, directory).is_err());
+        for invalid in [
+            "O:BAD:(A;;FRFX;;;AC)",
+            "O:BAD:(A;;FRFX;;;AC)(A;;FR;;;S-1-15-2-2)",
+            "O:BAD:(A;OICIIO;FRFX;;;AC)(A;;FRFX;;;S-1-15-2-2)",
+            "O:BAD:(A;;FRFWFX;;;AC)(A;;FRFX;;;S-1-15-2-2)",
+        ] {
+            assert!(
+                check_sddl_with_package_access(invalid, true, image).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

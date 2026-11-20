@@ -93,6 +93,7 @@ const
   TipKey = 'Software\Microsoft\CTF\TIP\{3D5B7CB1-96CB-4F44-A792-64304F6E7426}';
   KeyboardCategory = '{34745C63-B2F0-4784-8B67-5E12C8701A31}';
   UIElementCategory = '{49D2F9CF-1F5E-11D7-A6D3-00065B84435C}';
+  ImmersiveCategory = '{13A016DF-560B-46CD-947A-4C3AF1E0E35D}';
   InstallerKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{1B8DAF2E-D5F7-49AC-A9BF-4713A0D57224}_is1';
 var
   RegistrationFailed: Boolean;
@@ -179,6 +180,8 @@ begin
     KeyboardCategory + '\' + FlowerClass) then Exit;
   if RegKeyExists(HKLM64, TipKey + '\Category\Category\' +
     UIElementCategory + '\' + FlowerClass) then Exit;
+  if RegKeyExists(HKLM64, TipKey + '\Category\Category\' +
+    ImmersiveCategory + '\' + FlowerClass) then Exit;
   if RegKeyExists(HKLM64, TipKey + '\LanguageProfile') then begin
     if not RegGetSubkeyNames(HKLM64, TipKey + '\LanguageProfile', Languages) then Exit;
     for I := 0 to GetArrayLength(Languages) - 1 do
@@ -245,7 +248,8 @@ begin
     'Description', Description) then Exit;
   Result := (Description = 'Flower') and RegKeyExists(HKLM64,
     TipKey + '\Category\Category\' + KeyboardCategory + '\' + FlowerClass) and
-    RegKeyExists(HKLM64, TipKey + '\Category\Category\' + UIElementCategory + '\' + FlowerClass);
+    RegKeyExists(HKLM64, TipKey + '\Category\Category\' + UIElementCategory + '\' + FlowerClass) and
+    RegKeyExists(HKLM64, TipKey + '\Category\Category\' + ImmersiveCategory + '\' + FlowerClass);
 end;
 
 function CanStartFlower: Boolean;
@@ -299,7 +303,7 @@ begin
   else if not HasNativeRuntime then
     Result := '请先安装 Microsoft Visual C++ v14 x64 运行库。本离线安装器不会下载它。'
   else if not PrepareInstallPath(WizardDirValue) then
-    Result := '安全准备目录失败：祖先或已有目标不安全，或创建时发生竞争。已有权限未更改；本次创建的空安全目录可能保留。'
+    Result := '安全准备目录失败：路径不安全、已有目标缺少 Windows 应用容器读取权限，或创建时发生竞争。已有权限未更改。若旧版已卸载且 Flower 目录确认完全为空，可删除该空目录后重试。'
   else if not SafeInstallPath(ExpandConstant('{app}')) then
     Result := '固定安装目录安全检查失败。已有父目录权限和所有者不会更改。';
 end;
