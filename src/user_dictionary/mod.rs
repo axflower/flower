@@ -11,9 +11,14 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::engine::{promote_order, LearningEvent, PromotionEvent, RankingOrder};
+use crate::engine::{
+    promote_order, short_suffix, LearningEvent, PromotionEvent, RankingOrder, RankingSnapshot,
+    RecentWord, WordLink,
+};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
+const MAX_RECENT_WORDS: usize = 4096;
+const MAX_WORD_LINKS: usize = 8192;
 const MAX_AUTO_PHRASES: usize = 4096;
 const AUTO_PHRASE_WEIGHT: u32 = 16384;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -98,6 +103,12 @@ pub struct UserDictionary {
     pub learned: Vec<LearnedEntry>,
     #[serde(default)]
     pub auto_phrases: Vec<AutoPhrase>,
+    #[serde(default)]
+    pub selection_sequence: u64,
+    #[serde(default)]
+    pub recent_words: Vec<RecentWord>,
+    #[serde(default)]
+    pub word_links: Vec<WordLink>,
 }
 
 impl Default for UserDictionary {
@@ -112,11 +123,142 @@ impl Default for UserDictionary {
             domains: Vec::new(),
             learned: Vec::new(),
             auto_phrases: Vec::new(),
+            selection_sequence: 0,
+            recent_words: Vec::new(),
+            word_links: Vec::new(),
         }
     }
 }
 
 impl UserDictionary {
+    pub fn ranking_snapshot(&self) -> RankingSnapshot {
+        let mut snapshot = RankingSnapshot {
+            sequence: self.selection_sequence,
+            ..RankingSnapshot::default()
+        };
+        let recent: std::collections::HashMap<_, _> = self
+            .recent_words
+            .iter()
+            .map(|r| ((r.pinyin.as_str(), r.text.as_str()), r.sequence))
+            .collect();
+        for word in &self.learned {
+            let last = recent
+                .get(&(word.pinyin.as_str(), word.text.as_str()))
+                .copied()
+                .unwrap_or(0);
+            snapshot
+                .words
+                .insert((word.pinyin.clone(), word.text.clone()), (word.count, last));
+        }
+        for link in &self.word_links {
+            snapshot.links.insert(
+                (link.prefix.clone(), link.pinyin.clone(), link.text.clone()),
+                (link.count, link.sequence),
+            );
+        }
+        snapshot
+    }
+
+    pub fn remember_commit(
+        &mut self,
+        promotions: &[PromotionEvent],
+        phrases: &[LearningEvent],
+        words: &[LearningEvent],
+        prefix: &str,
+    ) -> Result<(), DictionaryError> {
+        validate_selection_commit(promotions, phrases, words, prefix)?;
+        for event in promotions {
+            promote_order(&mut self.rankings, event);
+            self.validate()?;
+        }
+        remember_auto_phrases(&mut self.auto_phrases, phrases)?;
+        self.remember_selection(words, prefix)?;
+        self.validate()?;
+        if serde_json::to_vec_pretty(self)
+            .map_err(|_| DictionaryError::InvalidData)?
+            .len()
+            > MAX_FILE_BYTES
+        {
+            return Err(DictionaryError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Called on a private transaction snapshot, after the successful-edit gate.
+    /// The store invokes this only while holding its interprocess update lock.
+    pub fn remember_selection(
+        &mut self,
+        events: &[LearningEvent],
+        prefix: &str,
+    ) -> Result<(), DictionaryError> {
+        validate_selection(events, prefix)?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        // Rebase all ages deterministically before overflow; no clock involved.
+        if self.selection_sequence == u64::MAX {
+            let old = self.selection_sequence;
+            for word in &mut self.recent_words {
+                word.sequence = 1024u64.saturating_sub(old.saturating_sub(word.sequence).min(1024));
+            }
+            for link in &mut self.word_links {
+                link.sequence = 1024u64.saturating_sub(old.saturating_sub(link.sequence).min(1024));
+            }
+            self.selection_sequence = 1024;
+        }
+        self.selection_sequence += 1;
+        let sequence = self.selection_sequence;
+        let mut previous = short_suffix(prefix);
+        for event in events {
+            if let Some(word) = self
+                .learned
+                .iter_mut()
+                .find(|w| w.pinyin == event.pinyin && w.text == event.text)
+            {
+                word.count = word.count.saturating_add(1).min(MAX_LEARNING_COUNT);
+            } else {
+                self.learned.push(LearnedEntry {
+                    pinyin: event.pinyin.clone(),
+                    text: event.text.clone(),
+                    count: 1,
+                });
+            }
+            self.recent_words
+                .retain(|w| w.pinyin != event.pinyin || w.text != event.text);
+            self.recent_words.push(RecentWord {
+                pinyin: event.pinyin.clone(),
+                text: event.text.clone(),
+                sequence,
+            });
+            if self.recent_words.len() > MAX_RECENT_WORDS {
+                self.recent_words.remove(0);
+            }
+            if !previous.is_empty() {
+                let count = self
+                    .word_links
+                    .iter()
+                    .find(|w| {
+                        w.prefix == previous && w.pinyin == event.pinyin && w.text == event.text
+                    })
+                    .map_or(1, |w| w.count.saturating_add(1).min(MAX_LEARNING_COUNT));
+                self.word_links.retain(|w| {
+                    w.prefix != previous || w.pinyin != event.pinyin || w.text != event.text
+                });
+                self.word_links.push(WordLink {
+                    prefix: previous,
+                    pinyin: event.pinyin.clone(),
+                    text: event.text.clone(),
+                    count,
+                    sequence,
+                });
+                if self.word_links.len() > MAX_WORD_LINKS {
+                    self.word_links.remove(0);
+                }
+            }
+            previous = short_suffix(&event.text);
+        }
+        self.validate()
+    }
     /// A canonical TSV snapshot; learned counts are not static frequencies.
     pub fn lexicon_tsv(&self) -> Result<String, DictionaryError> {
         self.snapshot_tsv(true)
@@ -171,12 +313,38 @@ impl UserDictionary {
         }
         validate_rankings(&self.rankings)?;
         validate_auto_phrases(&self.auto_phrases)?;
+        if self.recent_words.len() > MAX_RECENT_WORDS || self.word_links.len() > MAX_WORD_LINKS {
+            return Err(DictionaryError::LimitExceeded);
+        }
+        let mut recent = HashSet::new();
+        for word in &self.recent_words {
+            validate_pair(&word.pinyin, &word.text)?;
+            if word.sequence > self.selection_sequence || !recent.insert((&word.pinyin, &word.text))
+            {
+                return Err(DictionaryError::InvalidData);
+            }
+        }
+        let mut links = HashSet::new();
+        for link in &self.word_links {
+            validate_pair(&link.pinyin, &link.text)?;
+            if link.prefix.is_empty()
+                || short_suffix(&link.prefix) != link.prefix
+                || link.count == 0
+                || link.count > MAX_LEARNING_COUNT
+                || link.sequence > self.selection_sequence
+                || !links.insert((&link.prefix, &link.pinyin, &link.text))
+            {
+                return Err(DictionaryError::InvalidData);
+            }
+        }
         if self.domains.len() > MAX_RECORDS
             || self
                 .entries
                 .len()
                 .saturating_add(self.learned.len())
                 .saturating_add(self.auto_phrases.len())
+                .saturating_add(self.recent_words.len())
+                .saturating_add(self.word_links.len())
                 .saturating_add(self.domains.iter().map(|d| d.entries.len()).sum::<usize>())
                 .saturating_add(
                     self.rankings
@@ -296,6 +464,63 @@ fn validate_commit(
     // Include both halves in the queue's serialized payload budget.
     let pairs: Vec<_> = phrases.iter().map(|p| (&p.pinyin, &p.text)).collect();
     if serde_json::to_vec(&(promotions, pairs))
+        .map_err(|_| DictionaryError::InvalidData)?
+        .len()
+        > MAX_FILE_BYTES
+    {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    Ok(())
+}
+
+fn validate_selection(events: &[LearningEvent], prefix: &str) -> Result<(), DictionaryError> {
+    if events.len() > MAX_BATCH {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    if short_suffix(prefix) != prefix {
+        return Err(DictionaryError::InvalidData);
+    }
+    for event in events {
+        validate_pair(&event.pinyin, &event.text)?;
+    }
+    if serde_json::to_vec(&(
+        events
+            .iter()
+            .map(|e| (&e.pinyin, &e.text))
+            .collect::<Vec<_>>(),
+        prefix,
+    ))
+    .map_err(|_| DictionaryError::InvalidData)?
+    .len()
+        > MAX_FILE_BYTES
+    {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    Ok(())
+}
+
+fn validate_selection_commit(
+    promotions: &[PromotionEvent],
+    phrases: &[LearningEvent],
+    words: &[LearningEvent],
+    prefix: &str,
+) -> Result<(), DictionaryError> {
+    validate_commit(promotions, phrases)?;
+    validate_selection(words, prefix)?;
+    if promotions
+        .len()
+        .saturating_add(phrases.len())
+        .saturating_add(words.len())
+        > MAX_BATCH
+    {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    let pairs: Vec<_> = phrases
+        .iter()
+        .chain(words)
+        .map(|e| (&e.pinyin, &e.text))
+        .collect();
+    if serde_json::to_vec(&(promotions, pairs, prefix))
         .map_err(|_| DictionaryError::InvalidData)?
         .len()
         > MAX_FILE_BYTES
@@ -680,6 +905,9 @@ impl DictionaryStore {
             dictionary.learned.clear();
             dictionary.rankings.clear();
             dictionary.auto_phrases.clear();
+            dictionary.recent_words.clear();
+            dictionary.word_links.clear();
+            dictionary.selection_sequence = 0;
             Ok(true)
         })
     }
@@ -713,20 +941,26 @@ impl DictionaryStore {
         promotions: &[PromotionEvent],
         phrases: &[LearningEvent],
     ) -> Result<(), DictionaryError> {
-        validate_commit(promotions, phrases)?;
+        self.commit_selection_if_generation(generation, promotions, phrases, &[], "")
+    }
+
+    pub fn commit_selection_if_generation(
+        &self,
+        generation: u64,
+        promotions: &[PromotionEvent],
+        phrases: &[LearningEvent],
+        words: &[LearningEvent],
+        prefix: &str,
+    ) -> Result<(), DictionaryError> {
+        validate_selection_commit(promotions, phrases, words, prefix)?;
         self.update(false, |dictionary| {
             if !dictionary.adaptive_ranking_enabled
                 || dictionary.generation != generation
-                || (promotions.is_empty() && phrases.is_empty())
+                || (promotions.is_empty() && phrases.is_empty() && words.is_empty())
             {
                 return Ok(false);
             }
-            for event in promotions {
-                promote_order(&mut dictionary.rankings, event);
-                dictionary.validate()?;
-            }
-            remember_auto_phrases(&mut dictionary.auto_phrases, phrases)?;
-            dictionary.validate()?;
+            dictionary.remember_commit(promotions, phrases, words, prefix)?;
             Ok(true)
         })
     }
@@ -785,7 +1019,7 @@ fn load_path(path: &Path) -> Result<UserDictionary, DictionaryError> {
     let mut dictionary: UserDictionary =
         serde_json::from_slice(&bytes).map_err(|_| DictionaryError::InvalidData)?;
     match dictionary.schema_version {
-        1 | 2 => {
+        1..=3 => {
             dictionary.schema_version = SCHEMA_VERSION;
         }
         SCHEMA_VERSION => {}
@@ -1305,7 +1539,12 @@ fn current_user_path() -> Result<PathBuf, DictionaryError> {
 enum WorkerMessage {
     Learn(Vec<LearningEvent>),
     Promote(Vec<PromotionEvent>),
-    Commit(Vec<PromotionEvent>, Vec<LearningEvent>),
+    Commit(
+        Vec<PromotionEvent>,
+        Vec<LearningEvent>,
+        Vec<LearningEvent>,
+        String,
+    ),
     Stop,
 }
 
@@ -1324,10 +1563,16 @@ impl LearningWorker {
                 let mut failed = false;
                 while let Ok(message) = receiver.recv() {
                     match message {
-                        WorkerMessage::Commit(promotions, phrases) => {
+                        WorkerMessage::Commit(promotions, phrases, words, prefix) => {
                             if !failed
                                 && store
-                                    .commit_if_generation(generation, &promotions, &phrases)
+                                    .commit_selection_if_generation(
+                                        generation,
+                                        &promotions,
+                                        &phrases,
+                                        &words,
+                                        &prefix,
+                                    )
                                     .is_err()
                             {
                                 failed = true;
@@ -1388,11 +1633,26 @@ impl LearningWorker {
         promotions: &[PromotionEvent],
         phrases: &[LearningEvent],
     ) -> Result<(), DictionaryError> {
-        validate_commit(promotions, phrases)?;
+        self.submit_selection_commit(promotions, phrases, &[], "")
+    }
+
+    pub fn submit_selection_commit(
+        &self,
+        promotions: &[PromotionEvent],
+        phrases: &[LearningEvent],
+        words: &[LearningEvent],
+        prefix: &str,
+    ) -> Result<(), DictionaryError> {
+        validate_selection_commit(promotions, phrases, words, prefix)?;
         self.sender
             .as_ref()
             .ok_or(DictionaryError::WorkerStopped)?
-            .try_send(WorkerMessage::Commit(promotions.to_vec(), phrases.to_vec()))
+            .try_send(WorkerMessage::Commit(
+                promotions.to_vec(),
+                phrases.to_vec(),
+                words.to_vec(),
+                prefix.to_owned(),
+            ))
             .map_err(|error| match error {
                 TrySendError::Full(_) => DictionaryError::QueueFull,
                 TrySendError::Disconnected(_) => DictionaryError::WorkerStopped,

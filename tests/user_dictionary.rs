@@ -88,7 +88,7 @@ fn auto_phrase_validation_bounds_and_snapshot_max_weights() {
 fn old_schemas_preserve_all_fields_without_rewriting() {
     let fixture = Fixture::new();
     let store = fixture.store();
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
         let mut dictionary = flower::user_dictionary::UserDictionary {
             schema_version: version,
             generation: 29,
@@ -104,9 +104,12 @@ fn old_schemas_preserve_all_fields_without_rewriting() {
         };
         let mut value = serde_json::to_value(&dictionary).unwrap();
         value.as_object_mut().unwrap().remove("auto_phrases");
+        for field in ["selection_sequence", "recent_words", "word_links"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
         let bytes = serde_json::to_vec(&value).unwrap();
         fs::write(store.path(), &bytes).unwrap();
-        dictionary.schema_version = 3;
+        dictionary.schema_version = 4;
         assert_eq!(store.load().unwrap(), dictionary);
         assert_eq!(fs::read(store.path()).unwrap(), bytes);
         assert!(dictionary.auto_phrase_tsv().unwrap().is_empty());
@@ -248,7 +251,7 @@ fn schema_one_migrates_only_on_update() {
     let bytes = br#"{"schema_version":1,"generation":7,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#;
     fs::write(store.path(), bytes).unwrap();
     let snapshot = store.load().unwrap();
-    assert_eq!(snapshot.schema_version, 3);
+    assert_eq!(snapshot.schema_version, 4);
     assert!(snapshot.adaptive_ranking_enabled);
     assert!(!snapshot.learning_enabled);
     assert_eq!(fs::read(store.path()).unwrap(), bytes);
@@ -257,7 +260,7 @@ fn schema_one_migrates_only_on_update() {
     assert_eq!(snapshot.rankings[0].candidates[3].text, "五");
     assert_eq!(snapshot.generation, 7);
     let json: serde_json::Value = serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
-    assert_eq!(json["schema_version"], 3);
+    assert_eq!(json["schema_version"], 4);
     assert_eq!(snapshot, store.load().unwrap());
 }
 
@@ -425,7 +428,7 @@ fn missing_load_has_no_side_effect_and_learning_defaults_off() {
     let fixture = Fixture::new();
     let store = DictionaryStore::new(fixture.path("missing").join("dictionary.json"));
     let dictionary = store.load().unwrap();
-    assert_eq!(dictionary.schema_version, 3);
+    assert_eq!(dictionary.schema_version, 4);
     assert!(dictionary.adaptive_ranking_enabled);
     assert!(!dictionary.learning_enabled);
     assert_eq!(dictionary.generation, 0);
@@ -524,7 +527,7 @@ fn corrupt_unknown_and_oversized_data_are_not_replaced() {
     let store = fixture.store();
     for bytes in [
         b"{not json".to_vec(),
-        br#"{"schema_version":4,"generation":0,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#.to_vec(),
+        br#"{"schema_version":5,"generation":0,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#.to_vec(),
         vec![b' '; MAX_FILE_BYTES + 1],
     ] {
         fs::write(store.path(), &bytes).unwrap();
@@ -637,7 +640,7 @@ fn cooperative_public_loads_and_updates_preserve_complete_monotonic_snapshots() 
                     let mut previous_count = 0;
                     for _ in 0..32 {
                         let snapshot = store.load()?;
-                        assert_eq!(snapshot.schema_version, 3);
+                        assert_eq!(snapshot.schema_version, 4);
                         assert_eq!(snapshot.generation, generation);
                         assert!(snapshot.learning_enabled);
                         assert!(snapshot.learned.len() <= 1);

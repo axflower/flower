@@ -94,7 +94,7 @@ fn core_mixed_ranks_are_measured_not_assumed_first() {
     let mut measurements = Vec::new();
     for (raw, text, reading, rank) in [
         // Measured with the full 0.2.0 dictionary and simplified projection;
-        // keep exact ordinary-lane ranks rather than assuming every gold first.
+        // These are the pre-quota ranks, not an assumption every gold is first.
         ("zheshism", "这是什么", "zhe'shi'shen'me", 1),
         ("zhesm", "这什么", "zhe'shen'me", 4),
         ("shenmeys", "什么意思", "shen'me'yi'si", 2),
@@ -126,7 +126,12 @@ fn core_mixed_ranks_are_measured_not_assumed_first() {
                 session.next_page().unwrap();
             }
         }
-        measurements.push((raw, actual - suggestions, rank));
+        let max_displacement = if rank == 1 {
+            0
+        } else {
+            session.page_size() - 1
+        };
+        measurements.push((raw, actual - suggestions, rank, max_displacement));
         assert_eq!(
             session.select_candidate(index).unwrap().commit.as_deref(),
             Some(text)
@@ -134,10 +139,14 @@ fn core_mixed_ranks_are_measured_not_assumed_first() {
         assert!(session.pending_input().is_empty());
     }
     assert!(
-        measurements
-            .iter()
-            .all(|(_, actual, expected)| actual == expected),
-        "ordinary mixed ranks (input, actual, expected): {measurements:?}"
+        measurements.iter().all(|(_, actual, expected, promoted)| {
+            (*expected..=expected + promoted).contains(actual)
+        }),
+        // The first-page contract promotes at most page_size - 1 prefixes or
+        // suggestions ahead of a non-leading whole sentence. Keep the old
+        // lexical quality bound plus only that finite display displacement;
+        // missing gold still fails in locate, and canonical commits above.
+        "ordinary mixed ranks (input, actual, pre-quota rank, max displacement): {measurements:?}"
     );
 }
 

@@ -23,6 +23,7 @@ pub use error::EngineError;
 pub use key::{Key, KeyEvent, Modifiers};
 pub use keymap::map_windows_virtual_key;
 pub use lexicon::Lexicon;
+pub use ranking::{is_han, short_suffix, RankingSnapshot, RecentWord, WordLink};
 pub use ranking::{promote_order, ranking_indices};
 pub use router::EngineRouter;
 pub use session::{EngineSession, PinyinSession, DEFAULT_PAGE_SIZE};

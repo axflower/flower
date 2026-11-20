@@ -71,7 +71,12 @@ fn session_for(raw: &str) -> PinyinSession {
 }
 
 fn select_phrase(mut session: PinyinSession, word: &str, reading: &str) {
+    let raw = session.pending_input().to_owned();
+    let mut observed = Vec::new();
     for _ in 0..session.page_count() {
+        if observed.is_empty() {
+            observed.extend(session.candidates_on_current_page().iter().cloned());
+        }
         if let Some(index) = session
             .candidates_on_current_page()
             .iter()
@@ -87,7 +92,7 @@ fn select_phrase(mut session: PinyinSession, word: &str, reading: &str) {
         }
         session.next_page().unwrap();
     }
-    panic!("missing phrase {word} ({reading})");
+    panic!("missing phrase {word} ({reading}), raw={raw}, first_page={observed:?}");
 }
 
 #[test]
@@ -207,7 +212,7 @@ fn custom_fixture_and_overlay_do_not_pollute_builtin_project_phrases() {
 }
 
 #[test]
-fn builtin_and_composed_fixture_mixed_sentence_are_on_the_first_page() {
+fn builtin_and_composed_fixture_mixed_sentence_survive_first_page_quotas() {
     let builtin = Lexicon::builtin().unwrap();
     // The expanded dictionary now contains the whole phrase. Keep a separate
     // two-word fixture to prove composition without deleting real source data.
@@ -220,15 +225,34 @@ fn builtin_and_composed_fixture_mixed_sentence_are_on_the_first_page() {
         .lookup("shenmeyisi")
         .iter()
         .any(|c| c.text == "什么意思"));
-    for lexicon in [builtin, composed] {
+    for (lexicon, max_page) in [(builtin, 1), (composed, 0)] {
         let mut session = PinyinSession::from_lexicon(lexicon, 9).unwrap();
         for c in "shenmeys".chars() {
             session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
         }
-        assert!(session
-            .candidates_on_current_page()
-            .iter()
-            .any(|c| c.text == "什么意思" && c.comment == "shen'me'yi'si"));
+        // Only one ordinary whole sentence is displayed on the first page.
+        // The builtin runner-up must remain reachable, not be deleted; the
+        // unambiguous composed fixture still belongs on the first page.
+        let mut found = false;
+        let mut observed = Vec::new();
+        for page in 0..=max_page.min(session.page_count() - 1) {
+            observed.extend(session.candidates_on_current_page().iter().cloned());
+            if session
+                .candidates_on_current_page()
+                .iter()
+                .any(|c| c.text == "什么意思" && c.comment == "shen'me'yi'si")
+            {
+                found = true;
+                break;
+            }
+            if page < max_page {
+                session.next_page().unwrap();
+            }
+        }
+        assert!(
+            found,
+            "raw=shenmeys gold=什么意思 max_page={max_page}: {observed:?}"
+        );
     }
 }
 

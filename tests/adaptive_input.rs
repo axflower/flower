@@ -22,15 +22,35 @@ fn builtin_session(raw: &str, orders: Vec<flower::engine::RankingOrder>) -> Piny
     session
 }
 
+fn ordinary_page(session: &PinyinSession) -> Vec<flower::engine::Candidate> {
+    session
+        .candidates_on_current_page()
+        .iter()
+        .filter(|candidate| {
+            !candidate.is_ai() && !candidate.is_spelling() && !candidate.is_completion()
+        })
+        .cloned()
+        .collect()
+}
+
+fn choose_text(session: &mut PinyinSession, text: &str) {
+    let index = session
+        .candidates_on_current_page()
+        .iter()
+        .position(|candidate| candidate.text == text && !candidate.is_completion())
+        .unwrap();
+    session.select_candidate(index).unwrap();
+}
+
 #[test]
 fn builtin_ambiguities_promote_only_one_step_and_keep_raw_domains_separate() {
     use flower::engine::promote_order;
     for raw in ["wenti", "shijie", "shijian"] {
         let mut session = builtin_session(raw, Vec::new());
-        let before = session.candidates_on_current_page().to_vec();
+        let before = ordinary_page(&session);
         assert!(before.len() >= 3, "{raw} must exercise a later candidate");
         let selected = before[2].text.clone();
-        session.select_candidate(2).unwrap();
+        choose_text(&mut session, &selected);
         let event = session.pending_promotions().last().unwrap().clone();
         // Persistence keeps the original dictionary identity; the input
         // surface is projected to the selected script without rewriting it.
@@ -42,16 +62,17 @@ fn builtin_ambiguities_promote_only_one_step_and_keep_raw_domains_separate() {
         let mut orders = Vec::new();
         assert!(promote_order(&mut orders, &event));
         let mut next = builtin_session(raw, orders.clone());
-        assert_eq!(next.candidates_on_current_page()[0], before[0]);
-        assert_eq!(next.candidates_on_current_page()[1].text, selected);
-        assert_eq!(next.candidates_on_current_page()[2], before[1]);
-        next.select_candidate(1).unwrap();
+        let after = ordinary_page(&next);
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[1].text, selected);
+        assert_eq!(after[2], before[1]);
+        choose_text(&mut next, &selected);
         assert!(promote_order(
             &mut orders,
             next.pending_promotions().last().unwrap()
         ));
         assert_eq!(
-            builtin_session(raw, orders.clone()).candidates_on_current_page()[0].text,
+            ordinary_page(&builtin_session(raw, orders.clone()))[0].text,
             selected
         );
         // A saved full-spelling order must not leak into initials or mixed input.
@@ -105,7 +126,7 @@ fn selected_mapping_moves_one_position_and_survives_a_new_store_and_session() {
 
     let reopened = DictionaryStore::new(fixture.0.join("dictionary.json"));
     let persisted = reopened.load().unwrap();
-    assert_eq!(persisted.schema_version, 3);
+    assert_eq!(persisted.schema_version, 4);
     // The saved stable identity also applies when the real embedded dictionary
     // includes additional candidates not present in the original fixture.
     assert!(Lexicon::builtin()

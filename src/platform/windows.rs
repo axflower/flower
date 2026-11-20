@@ -36,7 +36,7 @@ mod windows_exports {
     use crate::engine::{
         map_windows_virtual_key, CompositionUpdate, EngineRouter, KeyEvent, Modifiers,
     };
-    use crate::engine::{promote_order, Lexicon, RankingOrder};
+    use crate::engine::{Lexicon, RankingOrder};
     use crate::platform::candidate::{
         deferred_action_is_valid, edit_publish_decision, AcceptedCandidateAction,
         CandidatePopupAction, DeferredActionState, DeferredActionTicket, EditPublishDecision,
@@ -47,8 +47,7 @@ mod windows_exports {
     use crate::platform::{CandidatePopupModel, CandidatePopupWindow, PopupError};
     use crate::settings::{Settings, SettingsStore};
     use crate::user_dictionary::{
-        auto_phrases_tsv, remember_auto_phrases, AutoPhrase, DictionaryError, DictionaryStore,
-        LearningWorker,
+        auto_phrases_tsv, AutoPhrase, DictionaryError, DictionaryStore, LearningWorker,
     };
     use windows::core::{implement, AsImpl, Error, IUnknown, Interface, Result, GUID, HRESULT};
     use windows::Win32::Foundation::{
@@ -358,6 +357,8 @@ mod windows_exports {
         settings: Settings,
         lexicon: Lexicon,
         rankings: Arc<Vec<RankingOrder>>,
+        ranking_data: crate::user_dictionary::UserDictionary,
+        ranking_snapshot: Arc<crate::engine::RankingSnapshot>,
         auto_phrases: Arc<Vec<AutoPhrase>>,
         auto_phrase_lexicon: Option<Arc<Lexicon>>,
         adaptive_ranking_enabled: bool,
@@ -635,6 +636,7 @@ mod windows_exports {
             const { RefCell::new(None) };
         static WRITING_CAPTURE_CALLS: Cell<usize> = const { Cell::new(0) };
         static WRITING_BODY_READS: Cell<usize> = const { Cell::new(0) };
+        static RANKING_BODY_READS: Cell<usize> = const { Cell::new(0) };
     }
 
     fn writing_selection(
@@ -2661,6 +2663,7 @@ mod windows_exports {
         if let Ok(activation) = shared.try_borrow() {
             if let Some(active) = activation.as_ref().filter(|a| a.token == token) {
                 router.set_ranking_orders(Arc::clone(&active.rankings));
+                router.set_ranking_snapshot(Arc::clone(&active.ranking_snapshot));
                 router.set_auto_phrase_lexicon(active.auto_phrase_lexicon.clone());
             }
         }
@@ -3114,6 +3117,7 @@ mod windows_exports {
         controller: CompositionController,
         caret: Option<RECT>,
         learning_allowed: bool,
+        learning_prefix: String,
     }
 
     fn learning_scope_value_is_safe(scope: i32) -> bool {
@@ -3368,7 +3372,7 @@ mod windows_exports {
         cookie: u32,
         policy: ScopePolicy,
     ) -> std::result::Result<(), ScopeBlockReason> {
-        use windows::Win32::UI::TextServices::{ITfInputScope, GUID_PROP_INPUTSCOPE};
+        use windows::Win32::UI::TextServices::GUID_PROP_INPUTSCOPE;
         // Read the application's declaration over the actual selection inside
         // this edit session. Missing, unsupported, or mixed unsafe scopes deny
         // learning; never fall back to a different property channel.
@@ -3393,6 +3397,16 @@ mod windows_exports {
             let Ok(value) = value else {
                 return Err(ScopeBlockReason::Value);
             };
+            application_scope_value(&value, policy)
+        }
+    }
+
+    fn application_scope_value(
+        value: &windows::core::VARIANT,
+        policy: ScopePolicy,
+    ) -> std::result::Result<(), ScopeBlockReason> {
+        use windows::Win32::UI::TextServices::ITfInputScope;
+        unsafe {
             // VARIANT's discriminant must be checked before querying its payload.
             let vt = value.as_raw().Anonymous.Anonymous.vt;
             if vt == 0 {
@@ -3401,7 +3415,7 @@ mod windows_exports {
             if vt != 13 {
                 return Err(ScopeBlockReason::InvalidValue);
             }
-            let Ok(unknown) = windows::core::IUnknown::try_from(&value) else {
+            let Ok(unknown) = windows::core::IUnknown::try_from(value) else {
                 return Err(ScopeBlockReason::InvalidValue);
             };
             let Ok(scope) = unknown.cast::<ITfInputScope>() else {
@@ -3430,6 +3444,118 @@ mod windows_exports {
                 std::slice::from_raw_parts(allocation.0, count as usize),
                 policy,
             )
+        }
+    }
+
+    /// No native-window or undeclared-selection fallback proves safety of a
+    /// different range. Every nonempty property segment must cover it exactly.
+    fn application_scope_range(
+        context: &ITfContext,
+        cookie: u32,
+        range: &ITfRange,
+        policy: ScopePolicy,
+    ) -> std::result::Result<(), ScopeBlockReason> {
+        use windows::Win32::UI::TextServices::GUID_PROP_INPUTSCOPE;
+        unsafe {
+            let property = context
+                .GetAppProperty(&GUID_PROP_INPUTSCOPE)
+                .map_err(|_| ScopeBlockReason::Property)?;
+            if property.GetType().map_err(|_| ScopeBlockReason::Property)? != GUID_PROP_INPUTSCOPE {
+                return Err(ScopeBlockReason::InvalidValue);
+            }
+            let owner = property
+                .GetContext()
+                .map_err(|_| ScopeBlockReason::Property)?;
+            if context_key(&owner).map_err(|_| ScopeBlockReason::Property)?
+                != context_key(context).map_err(|_| ScopeBlockReason::Property)?
+            {
+                return Err(ScopeBlockReason::Property);
+            }
+            let enumeration_target = range.Clone().map_err(|_| ScopeBlockReason::Read)?;
+            let mut enumeration = None;
+            property
+                .EnumRanges(cookie, &mut enumeration, &enumeration_target)
+                .map_err(|_| ScopeBlockReason::Read)?;
+            let enumeration = enumeration.ok_or(ScopeBlockReason::Read)?;
+            let mut cursor = range.Clone().map_err(|_| ScopeBlockReason::Read)?;
+            cursor
+                .Collapse(cookie, TF_ANCHOR_START)
+                .map_err(|_| ScopeBlockReason::Read)?;
+            // At most 64 nonempty UTF-16 segments plus one terminal read.
+            for _ in 0..=64 {
+                let mut segments = [None];
+                let mut fetched = 0;
+                enumeration
+                    .Next(&mut segments, &mut fetched)
+                    .map_err(|_| ScopeBlockReason::Read)?;
+                let [segment] = segments;
+                if fetched == 0 {
+                    if segment.is_some()
+                        || cursor
+                            .CompareStart(cookie, range, TF_ANCHOR_END)
+                            .map_err(|_| ScopeBlockReason::Read)?
+                            != 0
+                    {
+                        return Err(ScopeBlockReason::Read);
+                    }
+                    return Ok(());
+                }
+                if fetched != 1 {
+                    return Err(ScopeBlockReason::Read);
+                }
+                let segment = segment.ok_or(ScopeBlockReason::Read)?;
+                // EnumRanges may return a whole constant-property span which
+                // overlaps the target. Validate its intersection, never read or
+                // move application-owned range objects outside that target.
+                let segment = segment.Clone().map_err(|_| ScopeBlockReason::Read)?;
+                if segment
+                    .CompareStart(cookie, range, TF_ANCHOR_START)
+                    .map_err(|_| ScopeBlockReason::Read)?
+                    < 0
+                {
+                    segment
+                        .ShiftStartToRange(cookie, range, TF_ANCHOR_START)
+                        .map_err(|_| ScopeBlockReason::Read)?;
+                }
+                if segment
+                    .CompareEnd(cookie, range, TF_ANCHOR_END)
+                    .map_err(|_| ScopeBlockReason::Read)?
+                    > 0
+                {
+                    segment
+                        .ShiftEndToRange(cookie, range, TF_ANCHOR_END)
+                        .map_err(|_| ScopeBlockReason::Read)?;
+                }
+                if segment
+                    .IsEmpty(cookie)
+                    .map_err(|_| ScopeBlockReason::Read)?
+                    .as_bool()
+                    || segment
+                        .CompareStart(cookie, &cursor, TF_ANCHOR_START)
+                        .map_err(|_| ScopeBlockReason::Read)?
+                        != 0
+                    || segment
+                        .CompareEnd(cookie, &cursor, TF_ANCHOR_START)
+                        .map_err(|_| ScopeBlockReason::Read)?
+                        <= 0
+                    || segment
+                        .CompareEnd(cookie, range, TF_ANCHOR_END)
+                        .map_err(|_| ScopeBlockReason::Read)?
+                        > 0
+                {
+                    return Err(ScopeBlockReason::Read);
+                }
+                let value_range = segment.Clone().map_err(|_| ScopeBlockReason::Read)?;
+                let value = property
+                    .GetValue(cookie, &value_range)
+                    .map_err(|_| ScopeBlockReason::Value)?;
+                application_scope_value(&value, policy)?;
+                cursor = segment.Clone().map_err(|_| ScopeBlockReason::Read)?;
+                cursor
+                    .Collapse(cookie, TF_ANCHOR_END)
+                    .map_err(|_| ScopeBlockReason::Read)?;
+            }
+            Err(ScopeBlockReason::Read)
         }
     }
 
@@ -3492,6 +3618,117 @@ mod windows_exports {
         composition: Option<ActiveComposition>,
         controller: CompositionController,
         outcome: Option<EditSessionOutcome>,
+    }
+
+    #[implement(ITfEditSession)]
+    struct RankingCapture {
+        target: EditTarget,
+        context: ITfContext,
+        composition: Option<ActiveComposition>,
+        allow_undeclared: bool,
+        result: Rc<RefCell<String>>,
+    }
+
+    impl ITfEditSession_Impl for RankingCapture_Impl {
+        fn DoEditSession(&self, cookie: u32) -> Result<()> {
+            let this = self.get_impl();
+            if !this.target.is_current()
+                || check_learning_scope(&this.context, cookie, this.allow_undeclared).is_err()
+            {
+                return Ok(());
+            }
+            let (selection, _) = writing_selection(&this.context, cookie)?;
+            unsafe {
+                if !selection.IsEmpty(cookie)?.as_bool() {
+                    return Ok(());
+                }
+                let range = if let Some(composition) = &this.composition {
+                    if composition.terminated.get() {
+                        return Ok(());
+                    }
+                    let range = composition.GetRange()?;
+                    // A same-context mouse move outside our composition is not
+                    // proof of continuity. Never reuse its old host prefix.
+                    if selection.CompareStart(cookie, &range, TF_ANCHOR_START)? < 0
+                        || selection.CompareEnd(cookie, &range, TF_ANCHOR_END)? > 0
+                    {
+                        return Ok(());
+                    }
+                    range
+                } else {
+                    selection
+                };
+                // Returned selection/composition ranges may share their COM
+                // object with the host. Move only an independent clone.
+                let range = range.Clone()?;
+                range.Collapse(cookie, TF_ANCHOR_START)?;
+                let mut shifted = 0;
+                range.ShiftStart(cookie, -64, &mut shifted, std::ptr::null())?;
+                if !(-64..=0).contains(&shifted) {
+                    return Ok(());
+                }
+                if range.IsEmpty(cookie)?.as_bool() {
+                    return Ok(());
+                }
+                // Recheck after application COM calls, before accessing text.
+                if !this.target.is_current()
+                    || application_scope_range(&this.context, cookie, &range, ScopePolicy::Learning)
+                        .is_err()
+                    || !this.target.is_current()
+                {
+                    return Ok(());
+                }
+                let mut units = [0u16; 64];
+                let mut fetched = 0;
+                #[cfg(test)]
+                RANKING_BODY_READS.with(|reads| reads.set(reads.get() + 1));
+                range.GetText(cookie, 0, &mut units, &mut fetched)?;
+                if fetched > 64 {
+                    return Ok(());
+                }
+                let Ok(text) = String::from_utf16(&units[..fetched as usize]) else {
+                    return Ok(());
+                };
+                if !this.target.is_current() {
+                    return Ok(());
+                }
+                *this.result.borrow_mut() = text
+                    .chars()
+                    .rev()
+                    .take_while(|c| crate::engine::is_han(*c))
+                    .take(32)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+            }
+            Ok(())
+        }
+    }
+
+    fn capture_ranking_prefix(
+        context: &ITfContext,
+        client: u32,
+        composition: Option<ActiveComposition>,
+        target: EditTarget,
+        allow_undeclared: bool,
+    ) -> String {
+        let result = Rc::new(RefCell::new(String::new()));
+        let session: ITfEditSession = RankingCapture {
+            target,
+            context: context.clone(),
+            composition,
+            allow_undeclared,
+            result: Rc::clone(&result),
+        }
+        .into();
+        let status =
+            unsafe { context.RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READ) };
+        if matches!(status, Ok(hr) if hr.is_ok()) {
+            result.borrow().clone()
+        } else {
+            String::new()
+        }
     }
 
     #[implement(ITfEditSession)]
@@ -3620,6 +3857,26 @@ mod windows_exports {
                 });
             let learning_allowed = this.update.commit.is_some()
                 && check_learning_scope(&this.context, edit_cookie, allow_undeclared).is_ok();
+            let prefix_result = Rc::new(RefCell::new(String::new()));
+            if learning_allowed {
+                if let Some(target) = this
+                    .key_preflight
+                    .as_ref()
+                    .or_else(|| completion.as_ref().map(|c| &c.target))
+                {
+                    // The commit callback uses its current edit cookie again;
+                    // mouse actions must not persist a previously cached prefix.
+                    let capture: ITfEditSession = RankingCapture {
+                        target: target.clone(),
+                        context: this.context.clone(),
+                        composition: composition.clone(),
+                        allow_undeclared,
+                        result: Rc::clone(&prefix_result),
+                    }
+                    .into();
+                    let _ = unsafe { capture.DoEditSession(edit_cookie) };
+                }
+            }
             let mut host = TfCompositionHost::new(this.context.clone(), composition, edit_cookie);
             let mut controller = controller;
             let result = controller
@@ -3654,6 +3911,7 @@ mod windows_exports {
                     controller,
                     caret,
                     learning_allowed,
+                    learning_prefix: crate::engine::short_suffix(&prefix_result.borrow()),
                 })
             } else {
                 None
@@ -4212,6 +4470,12 @@ mod windows_exports {
         } else {
             Vec::new()
         };
+        let word_events = if update.commit.is_some() {
+            entry.router.pending_learning().to_vec()
+        } else {
+            Vec::new()
+        };
+        let word_prefix = outcome.learning_prefix.clone();
         entry.composition = outcome.composition;
         entry.controller = outcome.controller;
         let caret = outcome.caret;
@@ -4355,35 +4619,41 @@ mod windows_exports {
                 if target.switch_to_english && still_focused {
                     active.english = true;
                 }
-                if (!events.is_empty() || !phrase_events.is_empty())
+                if (!events.is_empty() || !phrase_events.is_empty() || !word_events.is_empty())
                     && claim_promotion(
                         &target.promotion_claim,
                         still_focused && learning_allowed && active.adaptive_ranking_enabled,
                     )
                 {
-                    let mut orders = active.rankings.as_ref().clone();
-                    for event in &events {
-                        promote_order(&mut orders, event);
-                    }
-                    let mut phrases = active.auto_phrases.as_ref().clone();
-                    let index =
-                        remember_auto_phrases(&mut phrases, &phrase_events).and_then(|()| {
-                            if phrases == *active.auto_phrases {
+                    let mut ranking_data = active.ranking_data.clone();
+                    ranking_data.rankings = active.rankings.as_ref().clone();
+                    ranking_data.auto_phrases = active.auto_phrases.as_ref().clone();
+                    let index = ranking_data
+                        .remember_commit(&events, &phrase_events, &word_events, &word_prefix)
+                        .and_then(|()| {
+                            if ranking_data.auto_phrases == *active.auto_phrases {
                                 Ok(active.auto_phrase_lexicon.clone())
                             } else {
-                                auto_phrase_index(&phrases)
+                                auto_phrase_index(&ranking_data.auto_phrases)
                             }
                         });
                     match index {
-                        Ok(index)
-                            if orders.iter().map(|o| o.candidates.len()).sum::<usize>()
-                                <= 100_000 =>
-                        {
-                            active.rankings = Arc::new(orders);
-                            active.auto_phrases = Arc::new(phrases);
+                        Ok(index) => {
+                            active.rankings = Arc::new(ranking_data.rankings.clone());
+                            active.auto_phrases = Arc::new(ranking_data.auto_phrases.clone());
+                            active.ranking_snapshot = Arc::new(ranking_data.ranking_snapshot());
+                            active.ranking_data = ranking_data;
                             active.auto_phrase_lexicon = index;
                             if let Some(worker) = active.learning.as_ref() {
-                                if worker.submit_commit(&events, &phrase_events).is_err() {
+                                if worker
+                                    .submit_selection_commit(
+                                        &events,
+                                        &phrase_events,
+                                        &word_events,
+                                        &word_prefix,
+                                    )
+                                    .is_err()
+                                {
                                     active.local_data_error = true;
                                 }
                             }
@@ -4411,6 +4681,9 @@ mod windows_exports {
                         entry
                             .router
                             .set_ranking_orders(Arc::clone(&active.rankings));
+                        entry
+                            .router
+                            .set_ranking_snapshot(Arc::clone(&active.ranking_snapshot));
                         entry
                             .router
                             .set_auto_phrase_lexicon(active.auto_phrase_lexicon.clone());
@@ -4611,6 +4884,7 @@ mod windows_exports {
             let mut local_data_error = false;
             let mut learning = None;
             let mut rankings = Arc::new(Vec::new());
+            let mut ranking_data = crate::user_dictionary::UserDictionary::default();
             let mut auto_phrases = Arc::new(Vec::new());
             let mut auto_phrase_lexicon = None;
             let mut adaptive_ranking_enabled = false;
@@ -4634,6 +4908,7 @@ mod windows_exports {
                         }
                         adaptive_ranking_enabled = data.adaptive_ranking_enabled;
                         if adaptive_ranking_enabled {
+                            ranking_data = data.clone();
                             rankings = Arc::new(data.rankings.clone());
                             match LearningWorker::start(store, data.generation) {
                                 Ok(worker) => learning = Some(worker),
@@ -4787,6 +5062,8 @@ mod windows_exports {
                         settings,
                         lexicon,
                         rankings,
+                        ranking_snapshot: Arc::new(ranking_data.ranking_snapshot()),
+                        ranking_data,
                         auto_phrases,
                         auto_phrase_lexicon,
                         adaptive_ranking_enabled,
@@ -5021,6 +5298,30 @@ mod windows_exports {
         }
 
         sync_idle_rankings(shared, token, &mut entry.router);
+        // Only the real key path requests a read edit session; OnTest remains
+        // prediction-only. Always replace, including failure with empty context.
+        let prefix = if entry.router.is_composing() || event.is_some_and(starts_pinyin) {
+            capture_ranking_prefix(
+                context,
+                client_id,
+                entry.composition.clone(),
+                EditTarget {
+                    context_generation: Some(context_generation),
+                    switch_to_english: false,
+                    promotion_claim: Rc::new(Cell::new(false)),
+                    activation: Rc::clone(shared),
+                    thread_manager: thread_manager.clone(),
+                    token,
+                    owner_thread,
+                    key,
+                    focus_epoch,
+                },
+                settings.ai_undeclared_scope_compatibility,
+            )
+        } else {
+            String::new()
+        };
+        entry.router.set_host_prefix(&prefix);
         let update = match match event {
             Some(event) if event.is_script_toggle() => {
                 Ok(entry.router.project_chinese_script(settings.chinese_script))
@@ -6353,6 +6654,7 @@ mod windows_exports {
             let _apartment = Apartment;
             let host = NativeDocument::new().unwrap();
             let (service, shared) = basic_service(&host);
+            let _settings = isolated_writing_settings(&shared);
             let sink: ITfKeyEventSink = service.cast().unwrap();
             let token = shared.borrow().as_ref().unwrap().token;
             shared
@@ -6886,6 +7188,7 @@ mod windows_exports {
             let _apartment = Apartment;
             let host = NativeDocument::new().unwrap();
             let (_service, shared) = basic_service(&host);
+            let _settings = isolated_writing_settings(&shared);
             shared
                 .borrow_mut()
                 .as_mut()
@@ -7021,6 +7324,7 @@ mod windows_exports {
             let _apartment = Apartment;
             let host = NativeDocument::new().unwrap();
             let (service, shared) = basic_service(&host);
+            let _settings = isolated_writing_settings(&shared);
             let sink: ITfKeyEventSink = service.cast().unwrap();
             let _keys = LocalKeyboard::set(Modifiers::NONE);
             send_key(&sink, &host.context, b'N');
@@ -7467,6 +7771,37 @@ mod windows_exports {
             super::context_key(context).expect("fixture canonical IUnknown")
         }
 
+        struct IsolatedWritingSettings {
+            previous: Option<crate::settings::SettingsStore>,
+            path: std::path::PathBuf,
+        }
+
+        impl Drop for IsolatedWritingSettings {
+            fn drop(&mut self) {
+                WRITING_TEST_STORE.with(|s| *s.borrow_mut() = self.previous.take());
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+
+        fn isolated_writing_settings(shared: &SharedActivation) -> IsolatedWritingSettings {
+            let root = std::path::PathBuf::from(
+                std::env::var_os("FLOWER_TEST_SCRATCH")
+                    .expect("writing tests require an explicitly isolated scratch root"),
+            );
+            assert!(root.is_absolute());
+            let path = root.join(format!(
+                "writing-settings-{}-{}.json",
+                std::process::id(),
+                shared.borrow().as_ref().unwrap().token
+            ));
+            let store = crate::settings::SettingsStore::new(&path);
+            store
+                .save(&shared.borrow().as_ref().unwrap().settings)
+                .unwrap();
+            let previous = WRITING_TEST_STORE.with(|s| s.borrow_mut().replace(store));
+            IsolatedWritingSettings { previous, path }
+        }
+
         fn basic_service(host: &NativeDocument) -> (ITfTextInputProcessor, SharedActivation) {
             let service: ITfTextInputProcessor = TextService::new().into();
             let implementation =
@@ -7510,6 +7845,8 @@ mod windows_exports {
                 settings: fixture_settings,
                 lexicon: Lexicon::from_tsv("ni\t你\t100\nhao\t好\t100\nni'hao\t你好\t200").unwrap(),
                 rankings: Arc::new(Vec::new()),
+                ranking_data: crate::user_dictionary::UserDictionary::default(),
+                ranking_snapshot: Arc::new(crate::engine::RankingSnapshot::default()),
                 auto_phrases: Arc::new(Vec::new()),
                 auto_phrase_lexicon: None,
                 adaptive_ranking_enabled: true,
@@ -7522,9 +7859,9 @@ mod windows_exports {
             (service, shared)
         }
 
-        // Identity-only tear-offs exercise the exact QI/key and key prediction
-        // paths. They are borrowed stack objects, never passed to a TSF edit
-        // request or used to invoke an ITfContext method beyond IUnknown.
+        // Borrowed tear-offs exercise canonical identity and isolated property
+        // providers. A scope fixture retains its stack object through the whole
+        // synchronous request; every other context operation forwards to TSF.
         #[repr(C)]
         struct IdentityAlias {
             vtable: *const windows::Win32::UI::TextServices::ITfContext_Vtbl,
@@ -7551,8 +7888,7 @@ mod windows_exports {
             1
         }
 
-        // Keep a complete, correctly typed context vtable even though this
-        // fixture only exercises identity paths. Any accidental context call
+        // Keep a complete, correctly typed context vtable. Any context call
         // forwards using the real context's `this`, never the tear-off address.
         macro_rules! alias_forward {
             ($name:ident, $field:ident, $($arg:ident: $ty:ty),*) => {
@@ -7574,7 +7910,20 @@ mod windows_exports {
         alias_forward!(alias_views, EnumViews, result: *mut *mut c_void);
         alias_forward!(alias_status, GetStatus, result: *mut TS_STATUS);
         alias_forward!(alias_property, GetProperty, guid: *const GUID, result: *mut *mut c_void);
-        alias_forward!(alias_app_property, GetAppProperty, guid: *const GUID, result: *mut *mut c_void);
+        unsafe extern "system" fn alias_app_property(
+            this: *mut c_void,
+            guid: *const GUID,
+            result: *mut *mut c_void,
+        ) -> HRESULT {
+            if !guid.is_null() && unsafe { *guid } == GUID_PROP_INPUTSCOPE {
+                if let Some(property) = RANGE_SCOPE_PROPERTY.with(|slot| slot.borrow().clone()) {
+                    unsafe { *result = property.into_raw() };
+                    return S_OK;
+                }
+            }
+            let context = unsafe { &(*(this as *const IdentityAlias)).context };
+            unsafe { (context.vtable().GetAppProperty)(context.as_raw(), guid, result) }
+        }
         alias_forward!(alias_track, TrackProperties, props: *const *const GUID, count: u32,
             apps: *const *const GUID, app_count: u32, result: *mut *mut c_void);
         alias_forward!(alias_properties, EnumProperties, result: *mut *mut c_void);
@@ -7728,15 +8077,18 @@ mod windows_exports {
             .expect("same-identity alias must pass real edit preflight");
             assert_eq!(read_document(&host, None), "n");
             read_document(&host, outcome.composition);
-            assert!(
-                !unsafe { sink.OnKeyDown(&host.context, WPARAM(0xA0), LPARAM(0)) }
-                    .unwrap()
-                    .as_bool()
-            );
+            let _keys = LocalKeyboard::set(Modifiers::SHIFT);
+            assert!(!unsafe {
+                legacy_trace_key_down(&shared, &sink, &host.context, WPARAM(0xA0), LPARAM(0))
+            }
+            .unwrap()
+            .as_bool());
             assert!(shared.borrow().as_ref().unwrap().shift.pressed.is_some());
-            assert!(!unsafe { sink.OnKeyUp(&*failed, WPARAM(0xA0), LPARAM(0)) }
-                .unwrap()
-                .as_bool());
+            assert!(!unsafe {
+                legacy_trace_key_up(&shared, &sink, &failed, WPARAM(0xA0), LPARAM(0))
+            }
+            .unwrap()
+            .as_bool());
             assert!(shared.borrow().as_ref().unwrap().shift.pressed.is_none());
             assert!(!shared.borrow().as_ref().unwrap().english);
             assert!(shared.borrow().as_ref().unwrap().contexts.is_empty());
@@ -9271,6 +9623,8 @@ mod windows_exports {
                     },
                     lexicon: Lexicon::builtin().unwrap(),
                     rankings: Arc::new(Vec::new()),
+                    ranking_data: crate::user_dictionary::UserDictionary::default(),
+                    ranking_snapshot: Arc::new(crate::engine::RankingSnapshot::default()),
                     auto_phrases: Arc::new(Vec::new()),
                     auto_phrase_lexicon: None,
                     adaptive_ranking_enabled: !matches!(index, 17 | 18),
@@ -9445,11 +9799,8 @@ mod windows_exports {
                 }
                 assert_eq!(
                     read_document(&host, None),
-                    if allowed {
-                        "文体文体"
-                    } else {
-                        "文体问题"
-                    }
+                    "文体问题",
+                    "one occasional selection must not absolutely override frequency"
                 );
                 // A newly created TSF context must inherit the activation's orders,
                 // not the stale snapshot of the context that committed the word.
@@ -9476,7 +9827,7 @@ mod windows_exports {
                     let entry = &state.as_ref().unwrap().contexts[&context_key(&fresh)];
                     assert_eq!(
                         entry.popup_model.snapshot().unwrap().candidates[0].text,
-                        if allowed { "文体" } else { "问题" },
+                        "问题",
                     );
                 }
                 send_key(&sink, &fresh, 0x1B);
@@ -9493,8 +9844,13 @@ mod windows_exports {
                 drop(active);
                 let persisted = DictionaryStore::new(&path).load().unwrap();
                 assert_eq!(!persisted.rankings.is_empty(), allowed);
+                assert_eq!(persisted.selection_sequence, if allowed { 2 } else { 0 });
+                assert_eq!(persisted.learned.len(), if allowed { 2 } else { 0 });
                 if allowed {
-                    assert_eq!(persisted.rankings[0].candidates[0].text, "文体");
+                    assert!(persisted.learned.iter().any(|word| word.pinyin == "wen'ti"
+                        && word.text == "文体"
+                        && word.count == 1));
+                    assert_eq!(persisted.rankings[0].candidates[0].text, "问题");
                     let mut restarted =
                         PinyinSession::from_lexicon(Lexicon::builtin().unwrap(), 9).unwrap();
                     restarted.set_ranking_orders(Arc::new(persisted.rankings));
@@ -9503,7 +9859,7 @@ mod windows_exports {
                             .process_key(KeyEvent::plain(Key::Char(letter)))
                             .unwrap();
                     }
-                    assert_eq!(restarted.candidates_on_current_page()[0].text, "文体");
+                    assert_eq!(restarted.candidates_on_current_page()[0].text, "问题");
                 }
                 COMPAT_VIEW.with(|v| v.set(Default::default()));
                 let _ = unsafe { SetFocus(previous) };
@@ -9659,6 +10015,8 @@ mod windows_exports {
                     },
                     lexicon: base.clone(),
                     rankings: Arc::new(Vec::new()),
+                    ranking_data: crate::user_dictionary::UserDictionary::default(),
+                    ranking_snapshot: Arc::new(crate::engine::RankingSnapshot::default()),
                     auto_phrases: Arc::new(Vec::new()),
                     auto_phrase_lexicon: None,
                     adaptive_ranking_enabled: adaptive,
@@ -9785,6 +10143,129 @@ mod windows_exports {
             .unwrap();
         }
 
+        #[test]
+        fn native_ranking_prefix_is_fresh_bounded_and_scope_gated() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for (scope, allowed) in [(0, true), (31, false)] {
+                let calls = Rc::new(Cell::new(0));
+                let declared: IUnknown = TestScope(vec![scope]).into();
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(declared)),
+                    calls: calls.clone(),
+                    fail: false,
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let (service, shared) = ai_fixture(&host, &Rc::new(CapturedAi::default()), &calls);
+                // ai_fixture starts a sample composition. Cancel that owned
+                // sample before replacing its document with ranking probes.
+                let sink: ITfKeyEventSink = service.cast().unwrap();
+                send_key(&sink, &host.context, 0x1B);
+                let target = {
+                    let state = shared.borrow();
+                    let active = state.as_ref().unwrap();
+                    EditTarget {
+                        context_generation: Some(active.context_generation.get()),
+                        switch_to_english: false,
+                        promotion_claim: Rc::new(Cell::new(false)),
+                        activation: shared.clone(),
+                        thread_manager: host.manager.clone(),
+                        token: active.token,
+                        owner_thread: active.owner_thread,
+                        key: super::context_key(&host.context).unwrap(),
+                        focus_epoch: active.focus_epoch,
+                    }
+                };
+                for (text, expected) in [
+                    ("甲".repeat(40), "甲".repeat(32)),
+                    ("𠀀".repeat(40), "𠀀".repeat(32)),
+                    ("𠀀".to_owned() + &"甲".repeat(63), String::new()),
+                    ("原文。新的位置".into(), "新的位置".into()),
+                    ("另一个位置".into(), "另一个位置".into()),
+                ] {
+                    writing_fixture_edit(&host, Some(&text), false);
+                    let before = RANKING_BODY_READS.with(Cell::get);
+                    let prefix = capture_ranking_prefix(
+                        &host.context,
+                        host.client,
+                        None,
+                        target.clone(),
+                        false,
+                    );
+                    assert_eq!(prefix, if allowed { expected } else { String::new() });
+                    assert_eq!(
+                        RANKING_BODY_READS.with(Cell::get) - before,
+                        usize::from(allowed)
+                    );
+                }
+                writing_fixture_edit(&host, None, true);
+                let before = RANKING_BODY_READS.with(Cell::get);
+                assert!(capture_ranking_prefix(
+                    &host.context,
+                    host.client,
+                    None,
+                    target.clone(),
+                    false
+                )
+                .is_empty());
+                assert_eq!(
+                    RANKING_BODY_READS.with(Cell::get),
+                    before,
+                    "noncollapsed selection must not read text"
+                );
+                if allowed {
+                    writing_fixture_edit(&host, Some("宿主前文"), false);
+                    shared.borrow_mut().as_mut().unwrap().lexicon =
+                        Lexicon::from_tsv("shi\t市\t1024").unwrap();
+                    let sink: ITfKeyEventSink = service.cast().unwrap();
+                    for key in b"SHI" {
+                        send_key(&sink, &host.context, *key);
+                    }
+                    let composition = shared.borrow().as_ref().unwrap().contexts
+                        [&super::context_key(&host.context).unwrap()]
+                        .composition
+                        .clone();
+                    assert!(composition.is_some());
+                    assert_eq!(
+                        read_document(&host, None),
+                        "宿主前文shi",
+                        "ranking capture must never mutate host selection or text"
+                    );
+                    assert!(
+                        target.is_current(),
+                        "fixture target must still match the current activation and focus"
+                    );
+                    assert_eq!(
+                        capture_ranking_prefix(
+                            &host.context,
+                            host.client,
+                            composition,
+                            target.clone(),
+                            false
+                        ),
+                        "宿主前文",
+                        "preedit must not be mistaken for host text"
+                    );
+                    send_key(&sink, &host.context, 0x1B);
+                }
+                let before = RANKING_BODY_READS.with(Cell::get);
+                shared.borrow_mut().as_mut().unwrap().focus_epoch += 1;
+                assert!(
+                    capture_ranking_prefix(&host.context, host.client, None, target, false)
+                        .is_empty()
+                );
+                assert_eq!(
+                    RANKING_BODY_READS.with(Cell::get),
+                    before,
+                    "stale focus must not read text"
+                );
+                shared.borrow_mut().take();
+            }
+        }
+
         #[implement(ITfEditSession)]
         struct ReadDocument {
             context: ITfContext,
@@ -9838,13 +10319,20 @@ mod windows_exports {
         }
 
         include!("keyboard_trace_tests.rs");
+        include!("ranking_scope_tests.rs");
 
         fn send_key(sink: &ITfKeyEventSink, context: &ITfContext, key: u8) {
+            let reads_before = RANKING_BODY_READS.with(Cell::get);
             assert!(
                 unsafe { sink.OnTestKeyDown(context, WPARAM(key as usize), LPARAM(0)) }
                     .unwrap()
                     .as_bool(),
                 "native TSF prediction for key {key:#x} must succeed"
+            );
+            assert_eq!(
+                RANKING_BODY_READS.with(Cell::get),
+                reads_before,
+                "OnTest must not read ranking context"
             );
             assert!(
                 unsafe { sink.OnKeyDown(context, WPARAM(key as usize), LPARAM(0)) }
@@ -10131,6 +10619,8 @@ mod windows_exports {
                 settings: Settings::default(),
                 lexicon: Lexicon::from_tsv("jin'tian'xin'qing\t今天新情\t100").unwrap(),
                 rankings: Arc::new(Vec::new()),
+                ranking_data: crate::user_dictionary::UserDictionary::default(),
+                ranking_snapshot: Arc::new(crate::engine::RankingSnapshot::default()),
                 auto_phrases: Arc::new(Vec::new()),
                 auto_phrase_lexicon: None,
                 adaptive_ranking_enabled: true,
@@ -11107,10 +11597,10 @@ mod windows_exports {
                 let capture = Rc::new(CapturedAi::default());
                 let (service, shared) = ai_fixture(&host, &capture, &calls);
                 assert!(capture.requests.borrow().is_empty());
-                assert_eq!(calls.get(), 0);
+                let calls_before_ai = calls.get();
                 tick_ai(&shared);
                 pump_ai(&shared);
-                assert!(calls.get() > 0);
+                assert!(calls.get() > calls_before_ai);
                 assert_eq!(capture.requests.borrow().len(), usize::from(allowed));
                 assert_eq!(
                     ai_status(shared.borrow().as_ref().unwrap()),
@@ -11346,9 +11836,9 @@ mod windows_exports {
                         .snapshot()
                         .unwrap()
                         .clone();
-                    // flower-dict 0.2.0 adds 悬在; the builtin guide also uses 那.
+                    // Combined local ranking retains 悬在 and now prefers 哪.
                     // The positive response repairs only the edited first syllable.
-                    assert_eq!(snapshot.candidates[0].text, "悬在在那里上班");
+                    assert_eq!(snapshot.candidates[0].text, "悬在在哪里上班");
                     (active.token, active.owner_thread, snapshot)
                 };
                 struct PopupGuard(ActivationToken, ThreadId);
@@ -11390,17 +11880,17 @@ mod windows_exports {
                         let requests = capture.requests.borrow();
                         assert_eq!(requests.len(), 1);
                         let request = &requests[0];
-                        assert_eq!(request.text, "悬在在那里上班");
+                        assert_eq!(request.text, "悬在在哪里上班");
                         assert_eq!(request.raw, "xuanzaizainalishangban");
                         assert_eq!(request.reading, "xuan'zai'zai'na'li'shang'ban");
                         *capture.response.borrow_mut() = Some(Response {
                             id: request.id,
                             corrected: Some(
                                 if accepted {
-                                    "现在在那里上班"
-                                } else {
-                                    // A valid first repair cannot authorize an unrelated 那→哪.
                                     "现在在哪里上班"
+                                } else {
+                                    // A valid first repair cannot authorize an unrelated 哪→那.
+                                    "现在在那里上班"
                                 }
                                 .into(),
                             ),
@@ -11439,7 +11929,7 @@ mod windows_exports {
                         .unwrap();
                     assert_eq!(snapshot.candidates[0], original.candidates[0]);
                     if accepted {
-                        assert_eq!(snapshot.candidates[1].text, "现在在那里上班");
+                        assert_eq!(snapshot.candidates[1].text, "现在在哪里上班");
                         assert!(snapshot.candidates[1].is_ai());
                         assert_eq!(ai_status(active), AiStatus::Suggested);
                     } else {
@@ -11449,7 +11939,7 @@ mod windows_exports {
                 }
                 if accepted {
                     send_key(&sink, &host.context, b'2');
-                    assert_eq!(read_document(&host, None), "现在在那里上班");
+                    assert_eq!(read_document(&host, None), "现在在哪里上班");
                 }
                 {
                     let state = shared.borrow();
@@ -12006,6 +12496,8 @@ mod windows_exports {
                 settings: Settings::default(),
                 lexicon: Lexicon::from_tsv("ni\t你\t100\nhao\t好\t100\nni'hao\t你好\t200").unwrap(),
                 rankings: Arc::new(Vec::new()),
+                ranking_data: crate::user_dictionary::UserDictionary::default(),
+                ranking_snapshot: Arc::new(crate::engine::RankingSnapshot::default()),
                 auto_phrases: Arc::new(Vec::new()),
                 auto_phrase_lexicon: None,
                 adaptive_ranking_enabled: true,
@@ -12275,6 +12767,8 @@ mod windows_exports {
                 settings: Settings::default(),
                 lexicon: Lexicon::builtin().unwrap(),
                 rankings: Arc::new(Vec::new()),
+                ranking_data: crate::user_dictionary::UserDictionary::default(),
+                ranking_snapshot: Arc::new(crate::engine::RankingSnapshot::default()),
                 auto_phrases: Arc::new(Vec::new()),
                 auto_phrase_lexicon: None,
                 adaptive_ranking_enabled: false,

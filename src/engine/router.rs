@@ -132,6 +132,14 @@ impl EngineRouter {
         self.session.set_ranking_orders(orders);
     }
 
+    pub fn set_ranking_snapshot(&mut self, snapshot: std::sync::Arc<super::RankingSnapshot>) {
+        self.session.set_ranking_snapshot(snapshot);
+    }
+
+    pub fn set_host_prefix(&mut self, prefix: &str) {
+        self.session.set_host_prefix(prefix);
+    }
+
     /// Returns the owned session for read-only inspection.
     pub fn session(&self) -> &PinyinSession {
         &self.session

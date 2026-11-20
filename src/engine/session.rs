@@ -1,5 +1,5 @@
 use super::{
-    decoder::{decode, Choice},
+    decoder::{decode, decode_ranked, Choice},
     LearningEvent,
 };
 use super::{ranking_indices, PromotionEvent, RankingCandidate, RankingOrder};
@@ -27,6 +27,8 @@ pub struct PinyinSession {
     candidate_width: Option<u32>,
     page_ranges: Vec<Range<usize>>,
     ranking_orders: Arc<Vec<RankingOrder>>,
+    ranking_snapshot: Option<Arc<super::RankingSnapshot>>,
+    host_prefix: String,
     pending_promotions: Vec<PromotionEvent>,
     preedit: String,
     raw: String,
@@ -82,6 +84,8 @@ impl PinyinSession {
             candidate_width: None,
             page_ranges: Vec::new(),
             ranking_orders: Arc::new(Vec::new()),
+            ranking_snapshot: None,
+            host_prefix: String::new(),
             pending_promotions: Vec::new(),
             preedit: String::new(),
             raw: String::new(),
@@ -531,6 +535,32 @@ impl PinyinSession {
         self.ranking_orders = orders;
     }
 
+    pub fn set_ranking_snapshot(&mut self, snapshot: Arc<super::RankingSnapshot>) {
+        self.ranking_snapshot = Some(snapshot);
+    }
+
+    /// Caller supplies only freshly verified text, never preedit or AI context.
+    pub fn set_host_prefix(&mut self, prefix: &str) {
+        let prefix: String = prefix
+            .chars()
+            .rev()
+            .take_while(|c| super::is_han(*c))
+            .take(32)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if self.host_prefix == prefix {
+            return;
+        }
+        let selected = self.selected_identity();
+        self.host_prefix = prefix;
+        if self.is_composing() {
+            self.refresh_candidates();
+            self.restore_selected_identity(selected);
+        }
+    }
+
     /// Events require a successful, safe host commit before they may be applied.
     pub fn pending_promotions(&self) -> &[PromotionEvent] {
         &self.pending_promotions
@@ -732,11 +762,14 @@ impl PinyinSession {
             .map(|s| s.text.as_str())
             .collect::<String>()
             + &self.raw;
-        let events: Vec<_> = self
-            .confirmed
-            .iter()
-            .flat_map(|s| s.events.clone())
-            .collect();
+        let events: Vec<_> = if self.raw.is_empty() {
+            self.confirmed
+                .iter()
+                .flat_map(|s| s.events.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let phrase = self.completed_phrase();
         self.clear_composition();
         self.pending_learning = events;
@@ -787,12 +820,29 @@ impl PinyinSession {
                 .collect::<String>()
                 + &self.raw),
         );
+        let prefix = self.host_prefix.clone()
+            + &self
+                .confirmed
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>();
+        let decode_current = |lexicon: &Lexicon| match &self.ranking_snapshot {
+            Some(snapshot) => decode_ranked(lexicon, &self.raw, snapshot, &prefix),
+            None => decode(lexicon, &self.raw),
+        };
         self.choices = self
             .auto_phrase_lexicon
             .as_ref()
-            .map(|lexicon| decode(lexicon, &self.raw))
+            .map(|lexicon| decode_current(lexicon))
             .unwrap_or_default();
-        self.choices.extend(decode(&self.lexicon, &self.raw));
+        self.choices.extend(decode_current(&self.lexicon));
+        if self.ranking_snapshot.is_some() {
+            self.choices.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| a.candidate.text.cmp(&b.candidate.text))
+            });
+        }
         let mut seen_choices = std::collections::HashSet::new();
         self.choices.retain(|choice| {
             seen_choices.insert((
@@ -810,6 +860,7 @@ impl PinyinSession {
             .ranking_orders
             .iter()
             .find(|order| order.input == self.raw)
+            .filter(|_| self.ranking_snapshot.is_none())
         {
             self.choices = ranking_indices(&identities, saved)
                 .into_iter()
@@ -829,16 +880,6 @@ impl PinyinSession {
             .is_some_and(|c| c.candidate.text.chars().count() > 3);
         self.long_pending_body = long;
         if long {
-            let mut kept_full = false;
-            self.choices.retain(|c| {
-                if c.consumed == self.raw.len() {
-                    let keep = !kept_full;
-                    kept_full = true;
-                    keep
-                } else {
-                    true
-                }
-            });
             self.choices.sort_by_key(|c| {
                 if c.consumed == self.raw.len() {
                     0
@@ -868,9 +909,15 @@ impl PinyinSession {
         }
         let mut spelling = Vec::new();
         for choice in proposals {
-            self.choices.retain(|c| {
-                c.consumed != self.raw.len() || c.candidate.text != choice.candidate.text
-            });
+            // A valid full/mixed match is already an ordinary word. A nearby
+            // spelling probe must not replace its canonical identity or learning.
+            if self
+                .choices
+                .iter()
+                .any(|c| c.consumed == self.raw.len() && c.candidate.text == choice.candidate.text)
+            {
+                continue;
+            }
             spelling.push(choice);
             if spelling.len() == 1 {
                 break;
@@ -1143,6 +1190,7 @@ impl PinyinSession {
     }
 
     fn clear_composition(&mut self) {
+        self.host_prefix.clear();
         self.long_pending_body = false;
         self.preedit.clear();
         self.raw.clear();
@@ -1259,6 +1307,7 @@ mod candidate_contract_tests {
         let ordinary: Vec<_> = s
             .choices
             .iter()
+            .take(s.page_size)
             .filter(|c| !c.candidate.is_spelling() && !c.candidate.is_ai())
             .collect();
         assert_eq!(

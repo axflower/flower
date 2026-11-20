@@ -4,6 +4,8 @@ mod lexicon_index;
 #[allow(dead_code)]
 #[path = "build_support/spelling_seed.rs"]
 mod spelling_seed;
+#[path = "build_support/word_list_links.rs"]
+mod word_list_links;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,12 @@ fn main() {
         flower_dict::EVERYDAY_TSV,
     );
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    // Weak lexical adjacency evidence only; ignore weights and never label this
+    // list as corpus frequency. Select by distinct-word support, not Unicode
+    // position; duplicate polyphonic rows do not inflate lexical evidence.
+    let links = word_list_links::select(flower_dict::DEFAULT_TSV, 65536);
+    std::fs::write(output.join("word-list-links.rs"), format!("&{links:?}"))
+        .expect("write bounded word-list adjacency prior");
     {
         let mut keys: Vec<_> = entries.keys().collect();
         keys.sort();
@@ -64,6 +72,7 @@ fn main() {
     );
     println!("cargo:rerun-if-changed=build_support/lexicon_index.rs");
     println!("cargo:rerun-if-changed=build_support/spelling_seed.rs");
+    println!("cargo:rerun-if-changed=build_support/word_list_links.rs");
     for file in [
         "assets/flower.rc",
         "assets/flower.ico",

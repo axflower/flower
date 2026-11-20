@@ -1,11 +1,16 @@
 //! Bounded word graph: exact results stay complete, composed alternatives are Top-K.
-use super::{Candidate, LearningEvent, Lexicon};
+use super::{Candidate, LearningEvent, Lexicon, RankingSnapshot};
 use std::collections::HashSet;
 use std::rc::Rc;
 
 const BEAM: usize = 8;
 const EDGE_ALTERNATIVES: usize = 4;
 const MIXED_DECODE_BUDGET: usize = 16384;
+// Weights are lexical weights, not normalized probabilities. Charge each word
+// transition in the combined score so repeated high-weight single characters
+// cannot win merely by accumulating independent unigram rewards. This is a
+// finite cost, never a lexicographic preference for fewer words.
+const RANKED_WORD_COST: i64 = 1024;
 
 pub(crate) fn lexical_score(weight: u32, characters: usize) -> i64 {
     let logarithm = 31 - weight.leading_zeros();
@@ -19,7 +24,7 @@ pub(crate) struct Choice {
     pub candidate: Candidate,
     pub consumed: usize,
     pub events: Vec<LearningEvent>,
-    score: i64,
+    pub(crate) score: i64,
     pub(crate) supplemental_score: i64,
     pub(crate) abbreviated: usize,
 }
@@ -93,6 +98,33 @@ pub(crate) fn decode(lexicon: &Lexicon, raw: &str) -> Vec<Choice> {
     decode_with_budget(lexicon, raw, &mut 0, MIXED_DECODE_BUDGET)
 }
 
+pub(crate) fn decode_ranked(
+    lexicon: &Lexicon,
+    raw: &str,
+    snapshot: &RankingSnapshot,
+    prefix: &str,
+) -> Vec<Choice> {
+    decode_ranked_lanes(
+        lexicon,
+        raw,
+        &mut 0,
+        MIXED_DECODE_BUDGET,
+        false,
+        Some((snapshot, prefix)),
+    )
+}
+
+fn choice_bonus(choice: &Choice, snapshot: &RankingSnapshot, prefix: &str) -> i64 {
+    let mut previous = prefix.to_owned();
+    let mut bonus = 0;
+    for event in &choice.events {
+        bonus += snapshot.word_bonus(&event.pinyin, &event.text)
+            + snapshot.link_bonus(&previous, &event.pinyin, &event.text);
+        previous = event.text.clone();
+    }
+    bonus
+}
+
 fn supplemental_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
     b.supplemental_score
         .cmp(&a.supplemental_score)
@@ -164,6 +196,17 @@ fn decode_lanes(
     limit: usize,
     supplement: bool,
 ) -> Vec<Choice> {
+    decode_ranked_lanes(lexicon, raw, expanded, limit, supplement, None)
+}
+
+fn decode_ranked_lanes(
+    lexicon: &Lexicon,
+    raw: &str,
+    expanded: &mut usize,
+    limit: usize,
+    supplement: bool,
+    ranking: Option<(&RankingSnapshot, &str)>,
+) -> Vec<Choice> {
     if raw.is_empty()
         || raw.len() > 128
         || !raw.bytes().all(|b| b.is_ascii_lowercase() || b == b'\'')
@@ -173,25 +216,43 @@ fn decode_lanes(
         return Vec::new();
     }
     let mut output = lexicon.exact_choices(raw);
+    if ranking.is_some() {
+        for choice in &mut output {
+            choice.score = choice.supplemental_score - RANKED_WORD_COST;
+        }
+    }
     if raw.len() == 1 {
         if !b"aeiouv".contains(&raw.as_bytes()[0]) {
             let mut seen = HashSet::new();
-            return lexicon
+            let mut choices: Vec<_> = lexicon
                 .single_initial_choices(raw)
                 .into_iter()
                 .filter(|choice| seen.insert(choice.candidate.text.clone()))
                 .collect();
+            if ranking.is_some() {
+                for choice in &mut choices {
+                    choice.score = choice.supplemental_score - RANKED_WORD_COST;
+                }
+            }
+            rank_choices(&mut choices, ranking);
+            return choices;
         }
         let mut seen: HashSet<_> = output
             .iter()
             .map(|choice| choice.candidate.text.clone())
             .collect();
+        let mut initials = lexicon.single_initial_choices(raw);
+        if ranking.is_some() {
+            for choice in &mut initials {
+                choice.score = choice.supplemental_score - RANKED_WORD_COST;
+            }
+        }
         output.extend(
-            lexicon
-                .single_initial_choices(raw)
+            initials
                 .into_iter()
                 .filter(|choice| seen.insert(choice.candidate.text.clone())),
         );
+        rank_choices(&mut output, ranking);
         return output;
     }
     let mut whole_mixed = Vec::new();
@@ -221,7 +282,14 @@ fn decode_lanes(
                 .cloned()
                 .collect();
         }
-        let mut edges = lexicon.graph_choices(&raw[start..], EDGE_ALTERNATIVES);
+        let mut edges = lexicon.graph_choices(
+            &raw[start..],
+            if ranking.is_some() {
+                32
+            } else {
+                EDGE_ALTERNATIVES
+            },
+        );
         edges.extend(mixed);
         if !supplemental[start].is_empty() {
             supplemental_step(&mut supplemental, start, &edges);
@@ -229,6 +297,28 @@ fn decode_lanes(
         // Exact/initial candidates keep their existing rank within equal abbreviation
         // counts. Sort before the per-end cap so less abbreviated mixed edges survive.
         edges.sort_by_key(|edge| edge.abbreviated);
+        if let Some((snapshot, prefix)) = ranking {
+            // Evaluate every enumerated edge against surviving path contexts
+            // before the bounded per-end cap, not only after Top-K decoding.
+            edges.sort_by_cached_key(|edge| {
+                let bonus = graph[start]
+                    .iter()
+                    .map(|path| {
+                        choice_bonus(
+                            edge,
+                            snapshot,
+                            if path.text.is_empty() {
+                                prefix
+                            } else {
+                                &path.text
+                            },
+                        )
+                    })
+                    .max()
+                    .unwrap_or(0);
+                std::cmp::Reverse(edge.supplemental_score + bonus)
+            });
+        }
         let mut per_end = std::collections::HashMap::new();
         let mut edge_seen = HashSet::new();
         let paths = graph[start].clone();
@@ -246,8 +336,19 @@ fn decode_lanes(
             }
             *count += 1;
             let end = start + edge.consumed;
-            let edge_events: Rc<[LearningEvent]> = edge.events.into();
+            let edge_events: Rc<[LearningEvent]> = edge.events.clone().into();
             for path in &paths {
+                let bonus = ranking.map_or(0, |(snapshot, prefix)| {
+                    choice_bonus(
+                        &edge,
+                        snapshot,
+                        if path.text.is_empty() {
+                            prefix
+                        } else {
+                            &path.text
+                        },
+                    )
+                });
                 let mut events = path.events.clone();
                 events.push(edge_events.clone());
                 graph[end].push(Path {
@@ -258,13 +359,36 @@ fn decode_lanes(
                         format!("{}'{}", path.reading, edge.candidate.comment)
                     },
                     events,
-                    score: path.score + edge.score,
-                    supplemental_score: path.supplemental_score + edge.supplemental_score,
+                    score: path.score
+                        + if ranking.is_some() {
+                            edge.supplemental_score - RANKED_WORD_COST
+                        } else {
+                            edge.score
+                        }
+                        + bonus,
+                    supplemental_score: path.supplemental_score + edge.supplemental_score
+                        - if ranking.is_some() {
+                            RANKED_WORD_COST
+                        } else {
+                            0
+                        },
                     words: path.words + 1,
                     abbreviated: path.abbreviated + edge.abbreviated,
                 });
             }
-            trim(&mut graph[end]);
+            if ranking.is_some() {
+                graph[end].sort_by(|a, b| {
+                    b.score
+                        .cmp(&a.score)
+                        .then_with(|| a.text.cmp(&b.text))
+                        .then_with(|| a.reading.cmp(&b.reading))
+                });
+                let mut seen = HashSet::new();
+                graph[end].retain(|p| seen.insert(p.text.clone()));
+                graph[end].truncate(BEAM);
+            } else {
+                trim(&mut graph[end]);
+            }
         }
     }
     let mut seen: HashSet<_> = output
@@ -275,11 +399,30 @@ fn decode_lanes(
         lexicon
             .initial_choices(raw)
             .into_iter()
+            .map(|mut choice| {
+                if ranking.is_some() {
+                    choice.abbreviated = choice
+                        .candidate
+                        .comment
+                        .split('\'')
+                        .filter(|s| s.len() > 1)
+                        .count();
+                    choice.penalize_abbreviations();
+                    choice.score = choice.supplemental_score - RANKED_WORD_COST;
+                }
+                choice
+            })
             .filter(|c| seen.insert((c.candidate.text.clone(), c.consumed))),
     );
     output.extend(
         whole_mixed
             .into_iter()
+            .map(|mut choice| {
+                if ranking.is_some() {
+                    choice.score = choice.supplemental_score - RANKED_WORD_COST;
+                }
+                choice
+            })
             .filter(|c| seen.insert((c.candidate.text.clone(), c.consumed))),
     );
     let legacy = &graph[raw.len()];
@@ -307,7 +450,13 @@ fn decode_lanes(
                     .iter()
                     .flat_map(|events| events.iter().cloned())
                     .collect(),
-                score: path.score,
+                // Context has already influenced pruning; final candidates
+                // receive the same contribution exactly once below.
+                score: if ranking.is_some() {
+                    path.supplemental_score
+                } else {
+                    path.score
+                },
                 supplemental_score: path.supplemental_score,
                 abbreviated: path.abbreviated,
             });
@@ -316,6 +465,12 @@ fn decode_lanes(
     let mut partial: Vec<_> = lexicon
         .prefix_choices(raw)
         .into_iter()
+        .map(|mut choice| {
+            if ranking.is_some() {
+                choice.score = choice.supplemental_score - RANKED_WORD_COST;
+            }
+            choice
+        })
         .filter(|c| c.consumed < raw.len())
         .collect();
     partial.sort_by(|a, b| {
@@ -329,7 +484,22 @@ fn decode_lanes(
             .into_iter()
             .filter(|c| seen.insert((c.candidate.text.clone(), c.consumed))),
     );
+    rank_choices(&mut output, ranking);
     output
+}
+
+fn rank_choices(choices: &mut [Choice], ranking: Option<(&RankingSnapshot, &str)>) {
+    if let Some((snapshot, prefix)) = ranking {
+        for choice in choices.iter_mut() {
+            choice.score += choice_bonus(choice, snapshot, prefix);
+        }
+        choices.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.candidate.text.cmp(&b.candidate.text))
+                .then_with(|| a.candidate.comment.cmp(&b.candidate.comment))
+        });
+    }
 }
 
 #[cfg(test)]

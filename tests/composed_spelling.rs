@@ -9,6 +9,26 @@ fn type_text(s: &mut PinyinSession, raw: &str) {
 const WORDS: &str = "jin'tian\t今天\t1000\nzao'shang\t早上\t900\nwo'men\t我们\t1000\ngong'zuo\t工作\t900\nxue'xi\t学习\t800";
 
 #[test]
+fn valid_mixed_word_keeps_ordinary_identity_when_also_a_spelling_proposal() {
+    let mut session =
+        PinyinSession::from_lexicon_tsv("zui'tai\t醉态\t1000\nzui'ti\t嘴替\t100", 9).unwrap();
+    type_text(&mut session, "zuit");
+    let index = session
+        .candidates_on_current_page()
+        .iter()
+        .position(|c| c.text == "嘴替" && c.comment == "zui'ti")
+        .expect("a valid mixed match must not be replaced by a spelling identity");
+    assert!(!session.candidates_on_current_page()[index].is_spelling());
+    assert_eq!(
+        session.select_candidate(index).unwrap().commit.as_deref(),
+        Some("嘴替")
+    );
+    assert_eq!(session.pending_learning().len(), 1);
+    assert_eq!(session.pending_learning()[0].pinyin, "zui'ti");
+    assert_eq!(session.pending_learning()[0].text, "嘴替");
+}
+
+#[test]
 fn a_correct_word_survives_all_four_edit_types_in_the_other_word() {
     for (raw, gold) in [
         ("jintainzaoshang", "今天早上"),
