@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1755,12 +1756,19 @@ class AuditArchiveTests(unittest.TestCase):
 
 class CompressionLicenseTests(unittest.TestCase):
     def test_exact_full_text_and_all_or_terms_required(self):
-        registry = Path("C:/Users/baiqi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f")
+        metadata = json.loads(subprocess.check_output(
+            ["cargo", "metadata", "--locked", "--format-version=1"],
+            cwd=REPO_ROOT, encoding="utf-8",
+        ))
+        manifests = {
+            f"{package['name']}-{package['version']}": Path(package["manifest_path"]).parent
+            for package in metadata["packages"]
+        }
         for directory, name, spdx in (
             ("miniz_oxide-0.8.9", "LICENSE-ZLIB.md", "Zlib"),
             ("adler2-2.0.1", "LICENSE-0BSD", "0BSD"),
         ):
-            root = registry / directory
+            root = manifests[directory]
             original = (root / name).read_bytes()
             package = {"name": directory.rsplit("-", 1)[0], "version": directory.rsplit("-", 1)[1],
                        "license": "MIT OR Zlib OR Apache-2.0" if spdx == "Zlib" else "0BSD OR MIT OR Apache-2.0",

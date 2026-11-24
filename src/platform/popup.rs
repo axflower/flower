@@ -53,7 +53,7 @@ fn target_candidate_width_budget(work_width: i32, target_dpi: u32) -> u32 {
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::ffi::c_void;
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -63,8 +63,9 @@ mod windows_impl {
     use thiserror::Error;
     use windows::core::{Error as WindowsError, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{
-        COLORREF, ERROR_CLASS_ALREADY_EXISTS, ERROR_CLASS_DOES_NOT_EXIST, E_UNEXPECTED, HINSTANCE,
-        HMODULE, HWND, LPARAM, LRESULT, RECT, SIZE, TRUE, WPARAM,
+        GetLastError, SetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS,
+        ERROR_CLASS_DOES_NOT_EXIST, ERROR_SUCCESS, E_UNEXPECTED, HINSTANCE, HMODULE, HWND, LPARAM,
+        LRESULT, RECT, SIZE, TRUE, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
@@ -81,17 +82,20 @@ mod windows_impl {
         GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     };
+    use windows::Win32::UI::Accessibility::NotifyWinEvent;
     use windows::Win32::UI::HiDpi::{
         AreDpiAwarenessContextsEqual, GetDpiForWindow, GetWindowDpiAwarenessContext,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
-        IsWindowVisible, LoadCursorW, PostMessageW, RegisterClassExW, SetWindowLongPtrW,
-        SetWindowPos, ShowWindow, UnregisterClassW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-        GWLP_USERDATA, HCURSOR, HMENU, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SYSCOLORCHANGE,
-        WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindow,
+        GetWindowLongPtrW, IsWindowVisible, LoadCursorW, PostMessageW, RegisterClassExW,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW, CREATESTRUCTW, CS_HREDRAW,
+        CS_VREDRAW, EVENT_OBJECT_IME_CHANGE, EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW,
+        GWLP_HWNDPARENT, GWLP_USERDATA, GW_OWNER, HCURSOR, HMENU, HWND_NOTOPMOST, HWND_TOPMOST,
+        IDC_ARROW, MA_NOACTIVATE, OBJID_CLIENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_DPICHANGED, WM_ERASEBKGND,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+        WM_SYSCOLORCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     use crate::ai::AiStatus;
@@ -568,6 +572,8 @@ mod windows_impl {
         hwnd: HWND,
         state: Option<Box<RefCell<PopupState>>>,
         class_lease: Option<ClassLease>,
+        fallback_topmost: Cell<bool>,
+        fallback_owner: Cell<HWND>,
     }
 
     impl CandidatePopupWindow {
@@ -596,14 +602,28 @@ mod windows_impl {
                 pending_settings: None,
                 idle_sink: None,
             }));
-            let state_pointer: *const c_void =
-                (state.as_ref() as *const RefCell<PopupState>).cast::<c_void>();
+            let hwnd = Self::create_hwnd(instance, &state, HWND::default())?;
+            Ok(Self {
+                hwnd,
+                state: Some(state),
+                class_lease: Some(class_lease),
+                fallback_topmost: Cell::new(false),
+                fallback_owner: Cell::new(HWND::default()),
+            })
+        }
+
+        fn create_hwnd(
+            instance: HINSTANCE,
+            state: &RefCell<PopupState>,
+            owner: HWND,
+        ) -> Result<HWND, PopupError> {
+            let state_pointer = (state as *const RefCell<PopupState>).cast::<c_void>();
 
             // SAFETY: The class is registered, the optional create parameter is
             // a live pointer to `state`, and the window remains hidden until
             // `show_at` is called. `state` is retained by this struct for the
             // window's entire lifetime.
-            let hwnd = unsafe {
+            unsafe {
                 CreateWindowExW(
                     WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                     POPUP_CLASS_NAME,
@@ -613,19 +633,13 @@ mod windows_impl {
                     0,
                     1,
                     1,
-                    HWND::default(),
+                    owner,
                     HMENU::default(),
                     instance,
                     Some(state_pointer),
                 )
             }
-            .map_err(|error| PopupError::win32("window creation", error))?;
-
-            Ok(Self {
-                hwnd,
-                state: Some(state),
-                class_lease: Some(class_lease),
-            })
+            .map_err(|error| PopupError::win32("window creation", error))
         }
 
         /// Selects the candidate colors used by subsequent repaints.
@@ -841,7 +855,20 @@ mod windows_impl {
             &mut self,
             snapshot: &CandidatePopupSnapshot,
         ) -> Result<(), PopupError> {
-            self.ensure_alive()?;
+            if !self.window_is_owned() {
+                // Windows destroys owned popups when their owner is destroyed.
+                // The Rust state remains ours; rebuild only the native HWND.
+                let state = self.state.as_deref().ok_or(PopupError::Destroyed)?;
+                let idle = {
+                    let mut state = state.try_borrow_mut().map_err(|_| state_busy_error())?;
+                    state.last_caret = None;
+                    state.idle_sink.clone()
+                };
+                self.hwnd = Self::create_hwnd(popup_module_instance()?, state, HWND::default())?;
+                if idle.is_some() {
+                    self.set_idle_sink(idle)?;
+                }
+            }
             let mut state = self
                 .state
                 .as_deref()
@@ -935,10 +962,152 @@ mod windows_impl {
         /// 让 `GetDpiForWindow` 返回目标 DPI，再按工作区限制尺寸。
         pub fn show_at(&self, caret: PopupRect) -> Result<(), PopupError> {
             let result = self.show_at_inner(caret);
+            use crate::platform::diagnostics::{record, Stage};
+            record(
+                Stage::PopupShow,
+                match &result {
+                    Ok(()) => windows::Win32::Foundation::S_OK,
+                    Err(PopupError::Win32 { source, .. }) => source.code(),
+                    Err(_) => E_UNEXPECTED,
+                },
+            );
+            record(
+                Stage::PopupVisible,
+                if self.is_visible() {
+                    windows::Win32::Foundation::S_OK
+                } else {
+                    windows::Win32::Foundation::S_FALSE
+                },
+            );
             if result.is_err() {
                 self.hide();
             }
             result
+        }
+
+        /// Associate the non-activating top-level popup with the text host.
+        /// GWLP_HWNDPARENT sets an owner here; the popup never becomes a child.
+        pub(crate) fn show_at_owned(
+            &mut self,
+            caret: PopupRect,
+            owner: HWND,
+        ) -> Result<(), PopupError> {
+            self.show_at_owned_with(caret, owner, bind_popup_owner, Self::recreate_owned)
+        }
+
+        fn show_at_owned_with(
+            &mut self,
+            caret: PopupRect,
+            owner: HWND,
+            bind: impl FnOnce(HWND, HWND) -> Result<(), PopupError>,
+            recreate: impl FnOnce(&mut Self, HWND) -> Result<(), PopupError>,
+        ) -> Result<(), PopupError> {
+            use windows::Win32::System::Threading::GetCurrentThreadId;
+            use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+            self.ensure_alive()?;
+            unsafe {
+                crate::platform::diagnostics::record(
+                    crate::platform::diagnostics::Stage::PopupOwner,
+                    if owner.0.is_null() {
+                        windows::Win32::Foundation::S_FALSE
+                    } else {
+                        windows::Win32::Foundation::S_OK
+                    },
+                );
+                if !owner.0.is_null()
+                    && (owner == self.hwnd
+                        || GetWindowThreadProcessId(owner, None) != GetCurrentThreadId())
+                {
+                    self.hide();
+                    return Err(PopupError::win32(
+                        "invalid text window owner",
+                        WindowsError::from_hresult(E_UNEXPECTED),
+                    ));
+                }
+                if (self.fallback_topmost.get() && self.fallback_owner.get() != owner)
+                    || (!self.fallback_topmost.get()
+                        && GetWindow(self.hwnd, GW_OWNER).unwrap_or_default() != owner)
+                {
+                    self.hide();
+                    let bound = bind(self.hwnd, owner);
+                    crate::platform::diagnostics::record(
+                        crate::platform::diagnostics::Stage::PopupBind,
+                        match &bound {
+                            Ok(()) => windows::Win32::Foundation::S_OK,
+                            Err(PopupError::Win32 { source, .. }) => source.code(),
+                            Err(_) => E_UNEXPECTED,
+                        },
+                    );
+                    let recreated = if bound.is_err() && !owner.0.is_null() {
+                        let result = recreate(self, owner);
+                        crate::platform::diagnostics::record(
+                            crate::platform::diagnostics::Stage::PopupOwnedCreate,
+                            match &result {
+                                Ok(()) => windows::Win32::Foundation::S_OK,
+                                Err(PopupError::Win32 { source, .. }) => source.code(),
+                                Err(_) => E_UNEXPECTED,
+                            },
+                        );
+                        result.is_ok()
+                    } else {
+                        false
+                    };
+                    if bound.is_err() && !recreated {
+                        // Some system surfaces reject classic owned windows.
+                        // Detach before temporarily raising only our own popup.
+                        bind_popup_owner(self.hwnd, HWND::default())?;
+                        self.fallback_topmost.set(true);
+                        self.fallback_owner.set(owner);
+                        crate::platform::diagnostics::record(
+                            crate::platform::diagnostics::Stage::PopupFallback,
+                            windows::Win32::Foundation::S_OK,
+                        );
+                    } else {
+                        self.fallback_topmost.set(false);
+                        self.fallback_owner.set(HWND::default());
+                    }
+                }
+            }
+            self.show_at(caret)
+        }
+
+        fn recreate_owned(&mut self, owner: HWND) -> Result<(), PopupError> {
+            self.ensure_alive()?;
+            self.hide();
+            let instance = popup_module_instance()?;
+            let state = self.state.as_deref().ok_or(PopupError::Destroyed)?;
+            let idle = {
+                let mut state = state.try_borrow_mut().map_err(|_| state_busy_error())?;
+                state.last_caret = None;
+                state.idle_sink.clone()
+            };
+            unsafe { DestroyWindow(self.hwnd) }
+                .map_err(|e| PopupError::win32("replace window", e))?;
+            self.hwnd = HWND::default();
+            let created = Self::create_hwnd(instance, state, owner);
+            let original_error = match created {
+                Ok(hwnd) => {
+                    self.hwnd = hwnd;
+                    None
+                }
+                Err(error) => {
+                    self.hwnd = Self::create_hwnd(instance, state, HWND::default())?;
+                    Some(error)
+                }
+            };
+            if idle.is_some() {
+                self.set_idle_sink(idle)?;
+            }
+            if let Some(error) = original_error {
+                return Err(error);
+            }
+            if unsafe { GetWindow(self.hwnd, GW_OWNER) }.unwrap_or_default() != owner {
+                return Err(PopupError::win32(
+                    "verify created window owner",
+                    WindowsError::from_hresult(E_UNEXPECTED),
+                ));
+            }
+            Ok(())
         }
 
         fn show_at_inner(&self, caret: PopupRect) -> Result<(), PopupError> {
@@ -1071,11 +1240,17 @@ mod windows_impl {
                 windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut current)
             }
             .map_err(|error| PopupError::win32("window geometry", error))?;
-            if !self.is_visible() || rect_from_windows(current) != placement {
+            let was_visible = self.is_visible();
+            let moved = rect_from_windows(current) != placement;
+            if !was_visible || moved {
                 unsafe {
                     SetWindowPos(
                         self.hwnd,
-                        HWND::default(),
+                        if self.fallback_topmost.get() {
+                            HWND_TOPMOST
+                        } else {
+                            HWND::default()
+                        },
                         placement.left,
                         placement.top,
                         layout.size.width,
@@ -1084,6 +1259,18 @@ mod windows_impl {
                     )
                 }
                 .map_err(|error| PopupError::win32("show", error))?;
+                unsafe {
+                    NotifyWinEvent(
+                        if was_visible {
+                            EVENT_OBJECT_IME_CHANGE
+                        } else {
+                            EVENT_OBJECT_IME_SHOW
+                        },
+                        self.hwnd,
+                        OBJID_CLIENT.0,
+                        0,
+                    );
+                }
             }
 
             // SAFETY: The window is live and the null rectangle invalidates the
@@ -1114,13 +1301,31 @@ mod windows_impl {
                 state.pending_settings = None;
                 state.presented = None;
             }
-            if self.ensure_alive().is_err() {
-                return;
+            if self.window_is_owned() {
+                let was_visible = self.is_visible();
+                // Hide before notifying the shell; never demote an owned host.
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+                if self.fallback_topmost.get() {
+                    let _ = unsafe {
+                        SetWindowPos(
+                            self.hwnd,
+                            HWND_NOTOPMOST,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                        )
+                    };
+                }
+                if was_visible {
+                    unsafe {
+                        NotifyWinEvent(EVENT_OBJECT_IME_HIDE, self.hwnd, OBJID_CLIENT.0, 0);
+                    }
+                }
             }
-
-            // SAFETY: The handle belongs to this live popup. SW_HIDE hides the
-            // window without changing keyboard focus.
-            let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
         }
 
         /// Reports whether the popup is currently visible.
@@ -1243,6 +1448,29 @@ mod windows_impl {
 
             let _ = self.release_class_lease();
         }
+    }
+
+    fn bind_popup_owner(hwnd: HWND, owner: HWND) -> Result<(), PopupError> {
+        unsafe {
+            if GetWindow(hwnd, GW_OWNER).unwrap_or_default() == owner {
+                return Ok(());
+            }
+            SetLastError(ERROR_SUCCESS);
+            let previous = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
+            if previous == 0 && GetLastError() != ERROR_SUCCESS {
+                return Err(PopupError::win32(
+                    "bind text window owner",
+                    WindowsError::from_win32(),
+                ));
+            }
+            if GetWindow(hwnd, GW_OWNER).unwrap_or_default() != owner {
+                return Err(PopupError::win32(
+                    "verify text window owner",
+                    WindowsError::from_hresult(E_UNEXPECTED),
+                ));
+            }
+        }
+        Ok(())
     }
 
     unsafe extern "system" fn popup_window_proc(
@@ -1501,8 +1729,10 @@ mod windows_impl {
                     if let Ok(mut state) = state.try_borrow_mut() {
                         state.pending_actions.clear();
                         state.pending_settings = None;
-                        state.action_sink = None;
-                        state.idle_sink = None;
+                        state.presented = None;
+                        // Callback ownership follows the Rust popup, not this
+                        // HWND. A host closing its owned windows may destroy
+                        // the HWND while the TSF activation is still live.
                     }
                 }
                 // SAFETY: The window is being destroyed. Clear the non-owning
@@ -3191,6 +3421,154 @@ mod windows_impl {
                 .scroll_offset
                 .is_none());
             popup.destroy().unwrap();
+        }
+
+        #[test]
+        fn native_rejected_owner_fallback_is_temporary_and_never_activates() {
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+            use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, WS_EX_TOPMOST};
+            let host = unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE,
+                    windows::core::w!("STATIC"),
+                    PCWSTR::null(),
+                    WS_POPUP,
+                    20,
+                    20,
+                    160,
+                    100,
+                    HWND::default(),
+                    HMENU::default(),
+                    HINSTANCE::default(),
+                    None,
+                )
+            }
+            .unwrap();
+            let focus = unsafe { GetFocus() };
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let snapshot = long_snapshot();
+            let caret = PopupRect::new(25, 25, 25, 40);
+            popup.update_snapshot(&snapshot).unwrap();
+            popup
+                .show_at_owned_with(
+                    caret,
+                    host,
+                    |_, _| {
+                        Err(PopupError::win32(
+                            "injected owner rejection",
+                            WindowsError::from_hresult(E_UNEXPECTED),
+                        ))
+                    },
+                    |_, _| Err(PopupError::Destroyed),
+                )
+                .unwrap();
+            let popup_hwnd = popup.hwnd;
+            let topmost = || unsafe {
+                GetWindowLongPtrW(popup_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0
+            };
+            assert!(popup.is_visible());
+            assert!(topmost());
+            assert_eq!(
+                unsafe { GetWindow(popup.hwnd, GW_OWNER) }.unwrap_or_default(),
+                HWND::default()
+            );
+            assert_eq!(unsafe { GetFocus() }, focus);
+            popup
+                .show_at_owned_with(
+                    caret,
+                    host,
+                    |_, _| panic!("same owner rejection is cached"),
+                    |_, _| panic!("cached fallback"),
+                )
+                .unwrap();
+            popup.hide();
+            assert!(!popup.is_visible());
+            assert!(!topmost(), "hidden fallback must not retain topmost");
+            popup.show_at_owned(caret, host).unwrap();
+            assert!(topmost(), "valid reshow restores temporary elevation");
+            assert_eq!(unsafe { GetFocus() }, focus);
+            popup.hide();
+            assert!(!topmost());
+            popup.fallback_topmost.set(false);
+            popup
+                .show_at_owned_with(
+                    caret,
+                    host,
+                    |_, _| Err(PopupError::Destroyed),
+                    CandidatePopupWindow::recreate_owned,
+                )
+                .unwrap();
+            assert_eq!(unsafe { GetWindow(popup.hwnd, GW_OWNER) }.unwrap(), host);
+            assert!(
+                !popup.fallback_topmost.get(),
+                "owned recreation avoids fallback"
+            );
+            assert_eq!(unsafe { GetFocus() }, focus);
+            drop(popup);
+            unsafe { DestroyWindow(host) }.unwrap();
+        }
+
+        #[test]
+        fn native_candidate_popup_follows_host_owner_and_recovers_after_host_close() {
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+            let new_host = || unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE,
+                    windows::core::w!("STATIC"),
+                    PCWSTR::null(),
+                    WS_POPUP,
+                    20,
+                    20,
+                    160,
+                    100,
+                    HWND::default(),
+                    HMENU::default(),
+                    HINSTANCE::default(),
+                    None,
+                )
+                .unwrap()
+            };
+            struct Host(HWND);
+            impl Drop for Host {
+                fn drop(&mut self) {
+                    let _ = unsafe { DestroyWindow(self.0) };
+                }
+            }
+            let host = Host(new_host());
+            let next_host = Host(new_host());
+            let focus = unsafe { GetFocus() };
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let caret = PopupRect::new(25, 25, 25, 40);
+            let snapshot = long_snapshot();
+            let timer_calls = Rc::new(std::cell::Cell::new(0));
+            let counter = Rc::clone(&timer_calls);
+            popup
+                .set_idle_sink(Some(Rc::new(move || counter.set(counter.get() + 1))))
+                .unwrap();
+            popup.update_snapshot(&snapshot).unwrap();
+            popup.show_at_owned(caret, host.0).unwrap();
+            assert_eq!(unsafe { GetWindow(popup.hwnd, GW_OWNER) }.unwrap(), host.0);
+            assert_eq!(unsafe { GetFocus() }, focus);
+            drop(host);
+            assert!(!popup.window_is_owned());
+            popup.update_snapshot(&snapshot).unwrap();
+            assert!(!popup.is_visible(), "replacement starts hidden");
+            assert!(popup.state.as_ref().unwrap().borrow().presented.is_none());
+            popup.show_at_owned(caret, next_host.0).unwrap();
+            assert_eq!(
+                unsafe { GetWindow(popup.hwnd, GW_OWNER) }.unwrap(),
+                next_host.0
+            );
+            assert_eq!(unsafe { GetFocus() }, focus);
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_TIMER};
+                SendMessageW(popup.hwnd, WM_TIMER, WPARAM(AI_IDLE_TIMER), LPARAM(0));
+            }
+            assert_eq!(
+                timer_calls.get(),
+                1,
+                "replacement uses the original idle callback"
+            );
         }
 
         #[test]

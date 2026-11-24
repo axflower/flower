@@ -52,7 +52,7 @@ mod windows_exports {
     use windows::core::{implement, AsImpl, Error, IUnknown, Interface, Result, GUID, HRESULT};
     use windows::Win32::Foundation::{
         BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_POINTER,
-        E_UNEXPECTED, FALSE, LPARAM, POINT, RECT, S_FALSE, S_OK, TRUE, WPARAM,
+        E_UNEXPECTED, FALSE, HWND, LPARAM, POINT, RECT, S_FALSE, S_OK, TRUE, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
@@ -444,7 +444,12 @@ mod windows_exports {
 
     fn close_writing_panel(token: ActivationToken) {
         close_polish_popup(token);
-        let panel = WRITING_PANELS.with(|panels| panels.borrow_mut().remove(&token));
+        // TSF can release the service after Rust has destroyed this thread's
+        // window map. The map already dropped its windows in that case.
+        let panel = WRITING_PANELS
+            .try_with(|panels| panels.borrow_mut().remove(&token))
+            .ok()
+            .flatten();
         // Closing joins the worker. Keep its registration alive until then.
         if let Some(mut panel) = panel {
             panel.window.close();
@@ -452,7 +457,10 @@ mod windows_exports {
     }
 
     fn close_polish_popup(token: ActivationToken) {
-        let popup = POLISH_POPUPS.with(|p| p.borrow_mut().remove(&token));
+        let popup = POLISH_POPUPS
+            .try_with(|popups| popups.borrow_mut().remove(&token))
+            .ok()
+            .flatten();
         if let Some(mut popup) = popup {
             popup.window.close();
         }
@@ -2169,15 +2177,34 @@ mod windows_exports {
                     if popup.window.update_snapshot(&snapshot).is_ok() {
                         if let Some(caret) = caret.filter(|_| ui_allows(&shared, this.ticket.token))
                         {
-                            let _ = popup.window.show_at(PopupRect::new(
-                                caret.left,
-                                caret.top,
-                                caret.right,
-                                caret.bottom,
-                            ));
+                            let _ = popup.window.show_at_owned(
+                                PopupRect::new(caret.left, caret.top, caret.right, caret.bottom),
+                                candidate_popup_owner(&this.context),
+                            );
                         } else {
                             popup.window.hide();
                         }
+                    }
+                    // Native window creation/notifications can synchronously
+                    // change focus while this popup is leased out of the map.
+                    let manager = shared.try_borrow().ok().and_then(|state| {
+                        state
+                            .as_ref()
+                            .filter(|active| {
+                                active.token == this.ticket.token
+                                    && active.foreground
+                                    && active.focus_epoch == this.ticket.epoch
+                                    && active.context_generation.get() == this.ticket.generation
+                                    && active.shown_context == Some(this.ticket.key)
+                            })
+                            .map(|active| active.thread_manager.clone())
+                    });
+                    if !ui_allows(&shared, this.ticket.token)
+                        || !manager.is_some_and(|manager| {
+                            focused_context_key(&manager) == Some(this.ticket.key)
+                        })
+                    {
+                        popup.window.hide();
                     }
                     if let Some(ui) = activation_ui(&shared, this.ticket.token) {
                         ui.set_shown(popup.window.is_visible());
@@ -3815,6 +3842,7 @@ mod windows_exports {
                 .as_ref()
                 .is_some_and(|target| !target.is_current())
             {
+                record(Stage::EditTargetRejected, E_UNEXPECTED);
                 return Err(E_UNEXPECTED.into());
             }
             let completion = this.take_completion();
@@ -3894,6 +3922,9 @@ mod windows_exports {
                     }
                 });
             record_result(Stage::ApplyUpdate, &result);
+            if this.update.commit.is_some() {
+                record_result(Stage::CommitUpdate, &result);
+            }
             let caret = if result.is_ok() && controller.is_active() {
                 host.composition.as_ref().and_then(|composition| {
                     composition_caret(&this.context, composition, edit_cookie)
@@ -3961,16 +3992,82 @@ mod windows_exports {
                     }
                 }
             }
-            let viewport = view
-                .GetScreenExt()
+            let screen_ext = view.GetScreenExt();
+            record_result(Stage::LayoutScreenExt, &screen_ext);
+            let viewport = screen_ext
                 .ok()
-                .filter(|r| r.right > r.left && r.bottom > r.top)?;
-            if let Some(rect) = gui_caret_for_view(&view, viewport) {
+                .filter(|r| r.right > r.left && r.bottom > r.top);
+            let view_window = view.GetWnd();
+            record_result(Stage::LayoutViewWindow, &view_window);
+            let view_window = view_window.ok().filter(|wnd| !wnd.0.is_null());
+            let bounds = viewport.or_else(|| view_window.and_then(focused_view_bounds));
+            record(
+                Stage::AnchorBounds,
+                if bounds.is_some() { S_OK } else { S_FALSE },
+            );
+            let bounds = bounds?;
+            if let Some(rect) = gui_caret_for_view(&view, bounds) {
                 record(Stage::AnchorGui, S_OK);
                 return Some(rect);
             }
             record(Stage::AnchorView, S_OK);
-            viewport_edge_anchor(viewport)
+            if viewport.is_some() {
+                viewport_edge_anchor(bounds)
+            } else {
+                // An outer HWND is less precise than a TSF viewport. Use its
+                // upper edge rather than placing a list below the entire host.
+                Some(RECT {
+                    left: bounds.left,
+                    right: bounds.left,
+                    top: bounds.top,
+                    bottom: bounds.top.saturating_add(1),
+                })
+            }
+        }
+    }
+
+    fn candidate_popup_owner(context: &ITfContext) -> HWND {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};
+        unsafe {
+            let focus = GetFocus();
+            let from_view = context
+                .GetActiveView()
+                .and_then(|view| view.GetWnd())
+                .ok()
+                .filter(|hwnd| !hwnd.0.is_null());
+            let window = from_view.unwrap_or(focus);
+            let root = GetAncestor(window, GA_ROOT);
+            let thread = GetCurrentThreadId();
+            if GetWindowThreadProcessId(window, None) != thread
+                || GetWindowThreadProcessId(root, None) != thread
+                || (!focus.0.is_null() && GetAncestor(focus, GA_ROOT) != root)
+            {
+                return HWND::default();
+            }
+            root
+        }
+    }
+
+    fn focused_view_bounds(window: HWND) -> Option<RECT> {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetAncestor, GetWindowRect, IsWindowVisible, GA_ROOT,
+        };
+        unsafe {
+            let focus = GetFocus();
+            if focus.0.is_null()
+                || GetWindowThreadProcessId(window, None) != GetCurrentThreadId()
+                || GetAncestor(window, GA_ROOT) != GetAncestor(focus, GA_ROOT)
+                || !IsWindowVisible(window).as_bool()
+            {
+                return None;
+            }
+            let mut bounds = RECT::default();
+            GetWindowRect(window, &mut bounds).ok()?;
+            (bounds.right > bounds.left && bounds.bottom > bounds.top).then_some(bounds)
         }
     }
 
@@ -4575,12 +4672,10 @@ mod windows_exports {
                     && caret.is_some_and(|caret| {
                         popup
                             .window
-                            .show_at(PopupRect::new(
-                                caret.left,
-                                caret.top,
-                                caret.right,
-                                caret.bottom,
-                            ))
+                            .show_at_owned(
+                                PopupRect::new(caret.left, caret.top, caret.right, caret.bottom),
+                                candidate_popup_owner(&entry.context),
+                            )
                             .is_ok()
                     });
             }
@@ -4920,7 +5015,9 @@ mod windows_exports {
                 },
                 Err(_) => local_data_error = true,
             }
-            let ui_manager: ITfUIElementMgr = thread_manager.cast()?;
+            let ui_manager: Result<ITfUIElementMgr> = thread_manager.cast();
+            record_result(Stage::UiElementManager, &ui_manager);
+            let ui_manager = ui_manager?;
             let keystroke_manager: ITfKeystrokeMgr = thread_manager.cast()?;
             let key_sink: ITfKeyEventSink =
                 <Self as ComObjectInterface<ITfKeyEventSink>>::as_interface_ref(self).to_owned();
@@ -4934,7 +5031,9 @@ mod windows_exports {
                 thread_manager,
                 Rc::clone(&context_generation),
                 Some(Rc::downgrade(&ui)),
-            )?;
+            );
+            record_result(Stage::AdviseThreadEvents, &thread_events);
+            let thread_events = thread_events?;
             let popup = CandidatePopupWindow::new();
             if let Err(error) = &popup {
                 record(Stage::PopupCreate, popup_activation_hresult(error));
@@ -5024,7 +5123,9 @@ mod windows_exports {
                 return Err(popup_activation_hresult(&error).into());
             }
             let key_trace =
-                KeyTraceEvents::subscribe(thread_manager, &self.get_impl().activation, token)?;
+                KeyTraceEvents::subscribe(thread_manager, &self.get_impl().activation, token);
+            record_result(Stage::AdviseKeyTrace, &key_trace);
+            let key_trace = key_trace?;
             if !register_thread_popup(token, popup) {
                 return Err(E_UNEXPECTED.into());
             }
@@ -5122,13 +5223,17 @@ mod windows_exports {
             client: u32,
             flags: u32,
         ) -> Result<()> {
-            self.activate_internal(manager, client, flags)
+            let result = self.activate_internal(manager, client, flags);
+            record_result(Stage::ActivateResult, &result);
+            result
         }
     }
 
     impl ITfTextInputProcessor_Impl for TextService_Impl {
         fn Activate(&self, manager: Option<&ITfThreadMgr>, client: u32) -> Result<()> {
-            self.activate_internal(manager, client, 0)
+            let result = self.activate_internal(manager, client, 0);
+            record_result(Stage::ActivateResult, &result);
+            result
         }
         fn Deactivate(&self) -> Result<()> {
             if !self.get_impl().owns_current_thread() {
@@ -5241,8 +5346,11 @@ mod windows_exports {
             if active.processing {
                 return Ok(FALSE);
             }
-            if event.is_some_and(starts_pinyin) {
-                ensure_input_lexicon(active)?;
+            if event.is_some_and(starts_pinyin) && active.pending_lexicon.is_some() {
+                record(Stage::KeyLexiconBegin, S_OK);
+                let loaded = ensure_input_lexicon(active);
+                record_result(Stage::KeyLexicon, &loaded);
+                loaded?;
             }
             let entry = active.contexts.remove(&key);
             let client_id = active.client_id;
@@ -5552,9 +5660,11 @@ mod windows_exports {
                 return Err(E_UNEXPECTED.into());
             }
             let Some(context) = context else {
+                record(Stage::TestKeyFocus, E_INVALIDARG);
                 return Ok(FALSE);
             };
             let Some((_, english)) = self.key_mode(context) else {
+                record(Stage::TestKeyFocus, S_FALSE);
                 return Ok(FALSE);
             };
             if current_writing_shortcut(&self.get_impl().activation, wparam.0).is_some() {
@@ -5639,10 +5749,18 @@ mod windows_exports {
             lparam: LPARAM,
         ) -> Result<BOOL> {
             record(Stage::KeyDown, S_OK);
+            struct KeyDone;
+            impl Drop for KeyDone {
+                fn drop(&mut self) {
+                    record(Stage::KeyDone, S_OK);
+                }
+            }
+            let _done = KeyDone;
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
             let Some(context) = context else {
+                record(Stage::KeyFocus, E_INVALIDARG);
                 if let Ok(mut state) = self.get_impl().activation.try_borrow_mut() {
                     if let Some(active) = state.as_mut() {
                         active.writing_gesture = WritingGesture::default();
@@ -5652,7 +5770,9 @@ mod windows_exports {
                 return Ok(FALSE);
             };
             let shift = shift_identity(wparam.0, lparam);
+            record(Stage::KeyModeQuery, S_OK);
             let Some((epoch, english)) = self.key_mode(context) else {
+                record(Stage::KeyFocus, S_FALSE);
                 if let Ok(mut state) = self.get_impl().activation.try_borrow_mut() {
                     if let Some(active) = state.as_mut() {
                         active.writing_gesture = WritingGesture::default();
@@ -5661,6 +5781,7 @@ mod windows_exports {
                 }
                 return Ok(FALSE);
             };
+            record(Stage::KeyModeReady, S_OK);
             if let Some(token) =
                 polish_escape_target(&self.get_impl().activation, context, wparam.0)
             {
@@ -5733,6 +5854,7 @@ mod windows_exports {
             let Some(event) = map_key_event(wparam) else {
                 return Ok(FALSE);
             };
+            record(Stage::KeyRoute, S_OK);
             self.apply_engine_key(context, Some(event))
         }
 
@@ -5840,7 +5962,45 @@ mod windows_exports {
             assert!(!WRITING_BUSY.with(|busy| busy.borrow().contains(&token)));
         }
 
+        struct LateWritingClose {
+            token: ActivationToken,
+            result: Arc<Mutex<Option<(bool, bool)>>>,
+        }
+
+        impl Drop for LateWritingClose {
+            fn drop(&mut self) {
+                let maps_destroyed = WRITING_PANELS.try_with(|_| ()).is_err()
+                    && POLISH_POPUPS.try_with(|_| ()).is_err();
+                let token = self.token;
+                let closed_cleanly = catch_unwind(|| close_writing_panel(token)).is_ok();
+                *self.result.lock().unwrap() = Some((maps_destroyed, closed_cleanly));
+            }
+        }
+
+        #[test]
+        fn native_writing_close_after_thread_local_teardown_does_not_panic() {
+            let result = Arc::new(Mutex::new(None));
+            let report = Arc::clone(&result);
+            std::thread::spawn(move || {
+                // Initialize the later cleanup first so Windows destroys the
+                // two panel maps before invoking it on this owned thread.
+                LATE_WRITING_CLOSE.with(|state| {
+                    *state.borrow_mut() = Some(LateWritingClose {
+                        token: next_activation_token(),
+                        result: report,
+                    });
+                });
+                WRITING_PANELS.with(|_| ());
+                POLISH_POPUPS.with(|_| ());
+            })
+            .join()
+            .unwrap();
+            assert_eq!(*result.lock().unwrap(), Some((true, true)));
+        }
+
         thread_local! {
+            static LATE_WRITING_CLOSE: RefCell<Option<LateWritingClose>> =
+                const { RefCell::new(None) };
             static WRITING_REENTRY: RefCell<Option<Box<dyn FnOnce()>>> =
                 const { RefCell::new(None) };
         }

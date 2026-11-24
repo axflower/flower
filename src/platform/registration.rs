@@ -14,8 +14,8 @@ use crate::registration::{
     InstallationSnapshot, OperationError, OperationOutcome, RegistrationBackend,
     RegistrationResource, ResourceInstallation, ResourceState, UserLayoutBackend,
     UserLayoutOperation, FLOWER_LANGID_ZH_CN, FLOWER_LANGUAGE_PROFILE_DESCRIPTION,
-    FLOWER_LANGUAGE_PROFILE_GUID_U128, FLOWER_PROFILE_ICON_INDEX, FLOWER_TEXT_SERVICE_CLSID,
-    FLOWER_TEXT_SERVICE_CLSID_U128, FLOWER_TEXT_SERVICE_DESCRIPTION,
+    FLOWER_LANGUAGE_PROFILE_GUID, FLOWER_LANGUAGE_PROFILE_GUID_U128, FLOWER_PROFILE_ICON_INDEX,
+    FLOWER_TEXT_SERVICE_CLSID, FLOWER_TEXT_SERVICE_CLSID_U128, FLOWER_TEXT_SERVICE_DESCRIPTION,
 };
 use windows::core::{s, w, GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -819,7 +819,15 @@ fn inspect_language_profile() -> Result<ResourceState, String> {
             return Ok(ResourceState::Conflict);
         }
     }
-    if !found_exact {
+    // EnumProfiles can retain a user/session cache after UnregisterProfile.
+    // That ghost has no description and must not prevent installing again.
+    let machine_profile = open_registry_key(
+        &format!(
+            r"Software\Microsoft\CTF\TIP\{FLOWER_TEXT_SERVICE_CLSID}\LanguageProfile\0x00000804\{FLOWER_LANGUAGE_PROFILE_GUID}"
+        ),
+        KEY_READ,
+    )?;
+    if !profile_requires_description(found_exact, machine_profile.is_some())? {
         return Ok(ResourceState::Missing);
     }
 
@@ -841,6 +849,23 @@ fn inspect_language_profile() -> Result<ResourceState, String> {
     } else {
         ResourceState::Conflict
     })
+}
+
+fn profile_requires_description(enumerated: bool, machine_present: bool) -> Result<bool, String> {
+    match (enumerated, machine_present) {
+        (_, false) => Ok(false),
+        (true, true) => Ok(true),
+        (false, true) => Err("机器语言配置存在但 TSF 未能枚举；未覆盖。".to_owned()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn cached_profile_without_machine_registration_does_not_require_description() {
+    assert_eq!(profile_requires_description(true, false), Ok(false));
+    assert_eq!(profile_requires_description(false, false), Ok(false));
+    assert_eq!(profile_requires_description(true, true), Ok(true));
+    assert!(profile_requires_description(false, true).is_err());
 }
 
 const FLOWER_CATEGORIES: [GUID; 3] = [

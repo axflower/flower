@@ -95,6 +95,9 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 ## 桌面排障
 
+- 开始搜索能空格上屏但无候选时，分别记录 UIElement 允许、布局、owner 绑定、创建与显示。现代系统表面对已有 HWND 改绑 owner 可能返回 0x80070057；按 `design/startup-uiless-and-mixed-composition.md` 优先在创建时指定归属，保留回调/定时器并撤销旧命中帧。API visible 不等于真实可见，须结合用户候选/提交/失焦隐藏确认；不要只加置顶或凭 Responding=true 否定搜索关闭/无响应，结束 SearchHost 须明确授权，不连带杀 Explorer。
+- 临时注册切换须核验旧绑定/新载荷哈希并保留恢复路径。注销后 EnumProfiles 可能保留缓存而机器配置已不存在，描述读取失败不等于未知机器安装；依设计以机器存在性复核，仍拒绝冲突，不手写或清用户缓存。PowerShell 5.1 原生命令 stderr 在 ErrorActionPreference=Stop 下可能先抛异常，Run-Checked 应先收集真实退出码再抛出，恢复分支独立记录结果；UAC 取消绝不算部署成功。
+
 - 必须记录用户实际宿主和具体现象：英文直通、吞键、已有预编辑但不能提交、卡住/崩溃，不能仅凭“无法输入”推断故障位置。
 - 输入法不显示时先只读检查机器 profile、HKCU Enable、排序和用户语言列表；登录会话刷新是用户操作，不自动注销或重启。
 - 开始菜单/设置搜索的切换列表缺项时，除用户启用外，单独只读核对 TSF `IMMERSIVESUPPORT` 分类以及安装根和实际 DLL 对普通/受限应用容器的读执行授权；`UIELEMENTENABLED` 不代替前者。保护用户 ACL 和数据，旧版按停用、卸载、重装流程升级；源代码、类别、ACL 和两个搜索框实际切换后选词上屏分别取证。

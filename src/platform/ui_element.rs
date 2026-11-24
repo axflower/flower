@@ -46,12 +46,23 @@ fn render_ui(data: &UiData) {
         popup.window.cancel_pending_actions();
         if data.alive.get() && data.negotiated.get() && data.allowed.get() {
             let snapshot = data.snapshot.borrow().clone();
-            if popup.window.update(&snapshot).is_ok() {
+            if popup.window.update_snapshot(&snapshot).is_ok() {
                 if let Some(rect) = data.caret.get() {
-                    let _ = popup.window.show_at(rect);
+                    let _ = popup
+                        .window
+                        .show_at_owned(rect, candidate_popup_owner(&data.context));
+                } else {
+                    popup.window.hide();
                 }
+            } else {
+                popup.window.hide();
             }
         } else {
+            popup.window.hide();
+        }
+        // Owner creation and IME notifications may reenter the host and end
+        // this element while the popup is leased out of the thread map.
+        if !data.alive.get() || !data.negotiated.get() || !data.allowed.get() || data.closed.get() {
             popup.window.hide();
         }
         data.shown
@@ -78,6 +89,7 @@ impl ITfUIElement_Impl for CandidateUi_Impl {
             return Err(E_UNEXPECTED.into());
         }
         data.requested.set(Some(show.as_bool()));
+        record(Stage::UiShow, if show.as_bool() { S_OK } else { S_FALSE });
         data.allowed.set(show.as_bool());
         render_ui(data);
         Ok(())
@@ -249,6 +261,7 @@ impl UiState {
         let mut show = TRUE;
         let mut id = u32::MAX;
         let result = unsafe { manager.BeginUIElement(&element, &mut show, &mut id) };
+        record_result(Stage::UiBegin, &result);
         self.busy.set(false);
         if result.is_err() || self.closed.get() || self.serial.get() != serial {
             data.alive.set(false);
@@ -264,6 +277,10 @@ impl UiState {
         }
         data.allowed
             .set(show.as_bool() && data.requested.get().unwrap_or(true));
+        record(
+            Stage::UiPermission,
+            if data.allowed.get() { S_OK } else { S_FALSE },
+        );
         data.negotiated.set(true);
         *self.live.borrow_mut() = Some(LiveUi { id, data });
     }

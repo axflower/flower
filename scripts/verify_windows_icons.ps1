@@ -44,8 +44,13 @@ public static class FlowerIconVerifier {
                 if (group[entry] != expected[source] || group[entry+1] != expected[source+1])
                     throw new Exception("Icon dimensions differ");
                 byte[] actual = Resource(module, BitConverter.ToUInt16(group, entry+12), 3);
-                if (actual.Length != size || !actual.AsSpan().SequenceEqual(expected.AsSpan(offset, size)))
+                // Windows PowerShell 5.1 uses .NET Framework, without Span<T>.
+                if (actual.Length != size || offset < 0 || size < 0 || offset > expected.Length - size)
                     throw new Exception("Embedded image differs from source ICO");
+                for (int j = 0; j < size; j++) {
+                    if (actual[j] != expected[offset + j])
+                        throw new Exception("Embedded image differs from source ICO");
+                }
             }
             Console.WriteLine(Path.GetFileName(binary) + ": 9 embedded icon images match source ICO");
         } finally { FreeLibrary(module); }
