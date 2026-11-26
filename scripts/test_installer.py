@@ -158,9 +158,44 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertNotIn("UserFilesFailed", source)
         uninstall = source.split("function InitializeUninstall", 1)[1]
         self.assertLess(uninstall.index("FileCopy("), uninstall.index("SafeInstallPath"))
-        self.assertLess(uninstall.index("SafeInstallPath"), uninstall.index("if not Exec(PayloadDir"))
-        self.assertLess(uninstall.index("TrustedPayload"), uninstall.index("if not Exec(PayloadDir"))
+        self.assertLess(uninstall.index("SafeInstallPath"), uninstall.index("if not Exec(PathChecker"))
+        self.assertLess(uninstall.index("TrustedPayload"), uninstall.index("if not Exec(PathChecker"))
         self.assertNotIn("PrepareInstallPath(", uninstall)
+
+    def test_deferred_uninstall_safety_and_engine_file_contract(self):
+        # Static Pascal wiring checks only: actual locked-DLL deletion needs a VM.
+        source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
+        uninstall = source.split("function InitializeUninstall", 1)[1]
+        self.assertNotIn("DllNotInUse", uninstall)
+        gates = ["if not FixedInstallRoot", "if UninstallSilent", "mbConfirmation",
+                 "FileCopy(", "SafeInstallPath", "if not TrustedPayload",
+                 "if not HasFlowerRegistration", "RegQueryStringValue",
+                 "CanonicalFile", "if not Exec(PathChecker",
+                 "if (ExitCode <> 0) or HasFlowerRegistration"]
+        positions = [uninstall.index(gate) for gate in gates]
+        self.assertEqual(positions, sorted(positions))
+        for start, end in [("if not TrustedPayload", "if not HasFlowerRegistration"),
+                           ("if not Exec(PathChecker", "if (ExitCode <> 0)"),
+                           ("if (ExitCode <> 0)", "  Result := True;\nend;")]:
+            block = uninstall[uninstall.index(start):uninstall.index(end, uninstall.index(start))]
+            self.assertIn("Exit;", block)
+            self.assertNotIn("Result := True", block)
+        unregister = uninstall[uninstall.index("if not Exec(PathChecker"):]
+        self.assertIn("'unregister', ExpandConstant('{tmp}')", unregister)
+        verification = uninstall[uninstall.index("if CompareText(GetSHA256OfFile(PathChecker)"):uninstall.index("if not Exec(PathChecker")]
+        self.assertIn("'{#ExpectedToolHash}'", verification)
+        self.assertIn("<> 0 then begin", verification)
+        self.assertIn("Exit;", verification)
+        self.assertNotIn("Exec(PayloadDir", uninstall)
+        files = source.split("[Files]", 1)[1].split("[Icons]", 1)[0]
+        managed = [line for line in files.splitlines() if line.startswith("Source:") and "dontcopy" not in line]
+        self.assertEqual(len(managed), 2)
+        for line in managed:
+            self.assertEqual(line.split("Flags: ")[1].split(), ["ignoreversion", "uninsrestartdelete"])
+        for forbidden in ["[UninstallDelete]", "DelTree(", "MoveFileEx", "taskkill", "RestartComputer"]:
+            self.assertNotIn(forbidden, source)
+        self.assertIn("CloseApplications=no", source)
+        self.assertIn("RestartApplications=no", source)
 
 
 class InstallerTests(unittest.TestCase):
@@ -291,6 +326,11 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("{commonpf64}", include)
         for line in include.splitlines():
             self.assertIn(r'DestDir: "{app}\versions\{#BuildId}', line)
+            self.assertEqual(line.split("Flags: ")[1].split(), ["ignoreversion", "uninsrestartdelete"])
+        self.assertEqual(
+            options["ExpectedToolHash"],
+            hashlib.sha256((payload / "flower-register.exe").read_bytes()).hexdigest(),
+        )
         self.assertEqual(
             options["ExpectedDllHash"],
             hashlib.sha256((payload / "flower.dll").read_bytes()).hexdigest(),

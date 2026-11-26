@@ -72,8 +72,8 @@ Name: "zh"; MessagesFile: "compiler:Default.isl,zh-CN.isl"
 [Files]
 Source: "{#PackageDir}\flower-register.exe"; DestName: "flower-path-check.exe"; Flags: dontcopy
 #include FilesInclude
-Source: "notice.zh-CN.txt"; DestDir: "{app}\versions\{#BuildId}"; DestName: "INSTALLER-README.txt"; Flags: ignoreversion
-Source: "{#EngineLicense}"; DestDir: "{app}\versions\{#BuildId}\licenses\installer"; DestName: "INNO-SETUP.txt"; Flags: ignoreversion
+Source: "notice.zh-CN.txt"; DestDir: "{app}\versions\{#BuildId}"; DestName: "INSTALLER-README.txt"; Flags: ignoreversion uninsrestartdelete
+Source: "{#EngineLicense}"; DestDir: "{app}\versions\{#BuildId}\licenses\installer"; DestName: "INNO-SETUP.txt"; Flags: ignoreversion uninsrestartdelete
 
 [Icons]
 Name: "{commonprograms}\Flower\启动 Flower"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "enable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
@@ -211,20 +211,6 @@ begin
   end;
 end;
 
-function DllNotInUse: Boolean;
-var
-  Name: String;
-  Handle: THandle;
-begin
-  Name := PayloadDir + '\flower.dll';
-  Result := True;
-  if not FileExists(Name) then Exit;
-  { Request write access exclusively, but never write or truncate the file. }
-  Handle := CreateFileW(Name, $C0000000, 0, 0, 3, 0, 0);
-  Result := Handle <> THandle(-1);
-  if Result then CloseHandle(Handle);
-end;
-
 function TrustedPayload: Boolean;
 begin
   Result := False;
@@ -360,7 +346,7 @@ begin
     Exit;
   end;
   if SuppressibleMsgBox(
-    '请确认每个用户已先运行“关闭开机自启动”再“停用 Flower”，并保存工作、退出所有使用过 Flower 的应用。卸载不会替任何账户清理自启动或停用；未关闭的项可能成为失效引用。用户词典和设置均保留。是否继续？',
+    '请确认每个用户已先运行“关闭开机自启动”再“停用 Flower”，并保存工作。可正常关闭应用以减少占用；未退出的宿主不阻止注销和延后文件清理，占用文件可能需要稍后重启才能删除。卸载不会自动强制结束应用或重启，也不会替任何账户清理自启动或停用；未关闭的自启动项可能成为失效引用。用户词典和设置均保留。是否继续？',
     mbConfirmation, MB_YESNO, IDNO) <> IDYES then Exit;
   { Never execute a helper directly out of a tree whose ACL may have changed.
     Copy to Inno's private temporary directory, verify the copy, then inspect. }
@@ -373,8 +359,8 @@ begin
     MsgBox('安装目录权限已改变或文件校验失败，已停止卸载并保留文件。请先由管理员检查目录安全性。', mbError, MB_OK);
     Exit;
   end;
-  if not DllNotInUse then begin
-    MsgBox('Flower DLL 仍被占用或不可写。请退出宿主或注销登录后重试；未开始清理文件。', mbError, MB_OK);
+  if not TrustedPayload then begin
+    MsgBox('本包文件校验失败，已停止卸载并保留文件。', mbError, MB_OK);
     Exit;
   end;
   if not HasFlowerRegistration then begin
@@ -387,19 +373,24 @@ begin
   end;
   Expected := CanonicalFile(PayloadDir + '\flower.dll');
   if (Expected = '') or
-     (CompareStringOrdinal(Registered, -1, Expected, -1, True) <> 2) or
-     (not TrustedPayload) then begin
+     (CompareStringOrdinal(Registered, -1, Expected, -1, True) <> 2) then begin
     MsgBox('当前 Flower 注册不属于本次文件，或文件校验失败。已停止卸载，未触及其他安装。', mbError, MB_OK);
     Exit;
   end;
-  if not Exec(PayloadDir + '\flower-register.exe', 'unregister', PayloadDir,
+  { Recheck the private copy immediately before executing it for mutation. }
+  if CompareText(GetSHA256OfFile(PathChecker), '{#ExpectedToolHash}') <> 0 then begin
+    MsgBox('临时注册清理工具校验失败，已停止卸载并保留文件。', mbError, MB_OK);
+    Exit;
+  end;
+  if not Exec(PathChecker, 'unregister', ExpandConstant('{tmp}'),
     SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
     MsgBox('无法启动 Flower 注册清理工具，已停止卸载并保留文件。', mbError, MB_OK);
     Exit;
   end;
-  if (ExitCode <> 0) or HasFlowerRegistration or (not DllNotInUse) then begin
-    MsgBox('Flower 注册清理或占用复查失败。已停止文件清理，保留 DLL 和工具供修复后重试。', mbError, MB_OK);
+  if (ExitCode <> 0) or HasFlowerRegistration then begin
+    MsgBox('Flower 注册清理失败或仍有注册。已停止文件清理，保留 DLL 和工具供修复后重试。', mbError, MB_OK);
     Exit;
   end;
+  Log('Flower registration removed; Inno will remove logged files, deferring locked files until restart if needed.');
   Result := True;
 end;

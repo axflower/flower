@@ -309,7 +309,7 @@ def build_installer(
             suffix = "" if parent == "." else "\\" + parent.replace("/", "\\")
             lines.append(
                 f'Source: "{{#PackageDir}}\\{windows_path}"; '
-                f'DestDir: "{{app}}\\versions\\{{#BuildId}}{suffix}"; Flags: ignoreversion'
+                f'DestDir: "{{app}}\\versions\\{{#BuildId}}{suffix}"; Flags: ignoreversion uninsrestartdelete'
             )
         include = stage / "payload.iss"
         include.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
