@@ -9062,11 +9062,15 @@ mod windows_exports {
             }
 
             fn writable_document() -> (NativeDocument, ITextStoreACP) {
+                writable_document_with_scope(VARIANT::default())
+            }
+
+            fn writable_document_with_scope(value: VARIANT) -> (NativeDocument, ITextStoreACP) {
                 let store: ITextStoreACP = Store {
                     sink: RefCell::new(None),
                     locked: Cell::new(false),
                     requested: Cell::new(false),
-                    value: VARIANT::default(),
+                    value,
                     trace: Rc::new(RefCell::new(Vec::new())),
                     text: RefCell::new(Vec::new()),
                     selection: Cell::new((0, 0)),
@@ -9093,6 +9097,90 @@ mod windows_exports {
                 unsafe { host.document.Push(&host.context) }.unwrap();
                 unsafe { host.manager.SetFocus(&host.document) }.unwrap();
                 (host, store)
+            }
+
+            #[test]
+            fn native_acp_builtin_huiyi_numeric_feedback_in_safe_text_store() {
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                    .ok()
+                    .unwrap();
+                let _apartment = Apartment;
+                let scope: IUnknown = TestScope(vec![0]).into();
+                let (host, store) = writable_document_with_scope(VARIANT::from(scope));
+                let (service, shared) = basic_service(&host);
+                {
+                    let mut state = shared.borrow_mut();
+                    let active = state.as_mut().unwrap();
+                    active.lexicon = Lexicon::builtin().unwrap();
+                    active.settings.ai_correction_enabled = false;
+                    let data = historical_huiyi_data();
+                    active.ranking_snapshot = Arc::new(data.ranking_snapshot());
+                    active.ranking_data = data;
+                }
+                let sink: ITfKeyEventSink = service.cast().unwrap();
+                for key in b"HUIYI2" {
+                    send_key(&sink, &host.context, *key);
+                }
+                assert_eq!(read_document(&host, None), "回忆");
+                for key in b"HUIYI" {
+                    send_key(&sink, &host.context, *key);
+                }
+                assert_eq!(
+                    shared.borrow().as_ref().unwrap().contexts[&context_key(&host.context)]
+                        .popup_model
+                        .snapshot()
+                        .unwrap()
+                        .candidates[0]
+                        .text,
+                    "回忆"
+                );
+                send_key(&sink, &host.context, b' ');
+                let implementation = unsafe { <ITextStoreACP as AsImpl<Store>>::as_impl(&store) };
+                assert_eq!(
+                    String::from_utf16(&implementation.text.borrow()).unwrap(),
+                    "回忆回忆"
+                );
+                // Host-side deletion, not an IME reset. Notify TSF so its ACP
+                // ranges and selection follow the now-empty document.
+                let before = shared.borrow().as_ref().unwrap().ranking_data.clone();
+                let old_end = implementation.text.borrow().len() as i32;
+                implementation.text.borrow_mut().clear();
+                implementation.selection.set((0, 0));
+                let store_sink = implementation.sink.borrow().clone().unwrap();
+                unsafe {
+                    store_sink
+                        .OnTextChange(
+                            TEXT_STORE_TEXT_CHANGE_FLAGS(0),
+                            &TS_TEXTCHANGE {
+                                acpStart: 0,
+                                acpOldEnd: old_end,
+                                acpNewEnd: 0,
+                            },
+                        )
+                        .unwrap();
+                    store_sink.OnSelectionChange().unwrap();
+                }
+                assert_eq!(read_document(&host, None), "");
+                for key in b"HUIYI" {
+                    send_key(&sink, &host.context, *key);
+                }
+                assert_eq!(
+                    shared.borrow().as_ref().unwrap().contexts[&context_key(&host.context)]
+                        .popup_model
+                        .snapshot()
+                        .unwrap()
+                        .candidates[0]
+                        .text,
+                    "回忆"
+                );
+                send_key(&sink, &host.context, 0x1B);
+                assert_eq!(
+                    shared.borrow().as_ref().unwrap().ranking_data,
+                    before,
+                    "host deletion and cancelled input must not rewrite learning"
+                );
+                assert!(!shared.borrow().as_ref().unwrap().local_data_error);
+                shared.borrow_mut().take();
             }
 
             #[test]
@@ -9624,6 +9712,116 @@ mod windows_exports {
             }
         }
 
+        fn historical_huiyi_data() -> crate::user_dictionary::UserDictionary {
+            use crate::user_dictionary::{LearnedEntry, UserDictionary};
+            let mut data = UserDictionary::default();
+            for (text, count) in [("会议", 6), ("回忆", 20)] {
+                data.learned.push(LearnedEntry {
+                    pinyin: "hui'yi".into(),
+                    text: text.into(),
+                    count,
+                });
+            }
+            for text in ["回忆", "会议"] {
+                data.remember_selection(
+                    &[crate::engine::LearningEvent {
+                        pinyin: "hui'yi".into(),
+                        text: text.into(),
+                    }],
+                    "",
+                )
+                .unwrap();
+            }
+            data
+        }
+
+        #[test]
+        fn native_builtin_huiyi_numeric_feedback_is_immediate_and_durable() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let root = std::path::PathBuf::from(
+                std::env::var_os("FLOWER_TEST_SCRATCH").expect("isolated scratch"),
+            );
+            let path = root.join(format!(
+                "huiyi-{}-{}.json",
+                std::process::id(),
+                next_activation_token()
+            ));
+            assert!(!path.exists());
+            let store = DictionaryStore::new(&path);
+            for restored in [false, true] {
+                let scope: IUnknown = TestScope(vec![0]).into();
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(scope)),
+                    fail: false,
+                    calls: Rc::new(Cell::new(0)),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                unsafe { host.manager.SetFocus(&host.document) }.unwrap();
+                let (service, shared) = basic_service(&host);
+                {
+                    let data = store.load().unwrap();
+                    let mut state = shared.borrow_mut();
+                    let active = state.as_mut().unwrap();
+                    active.lexicon = Lexicon::builtin().unwrap();
+                    active.settings.ai_correction_enabled = false;
+                    active.rankings = Arc::new(data.rankings.clone());
+                    active.ranking_snapshot = Arc::new(data.ranking_snapshot());
+                    active.ranking_data = data.clone();
+                    active.learning =
+                        Some(LearningWorker::start(store.clone(), data.generation).unwrap());
+                }
+                let sink: ITfKeyEventSink = service.cast().unwrap();
+                for key in b"HUIYI" {
+                    send_key(&sink, &host.context, *key);
+                }
+                let candidates = || {
+                    shared.borrow().as_ref().unwrap().contexts[&context_key(&host.context)]
+                        .popup_model
+                        .snapshot()
+                        .unwrap()
+                        .candidates
+                        .clone()
+                };
+                assert_eq!(candidates()[0].text, if restored { "回忆" } else { "会议" });
+                if !restored {
+                    assert_eq!(candidates()[1].text, "回忆");
+                    send_key(&sink, &host.context, b'2');
+                    assert_eq!(read_document(&host, None), "回忆");
+                    for key in b"HUIYI" {
+                        send_key(&sink, &host.context, *key);
+                    }
+                    assert_eq!(
+                        candidates()[0].text,
+                        "回忆",
+                        "next input in the same context"
+                    );
+                }
+                send_key(&sink, &host.context, 0x1B);
+                let mut active = shared.borrow_mut().take().unwrap();
+                active.learning.as_mut().unwrap().shutdown().unwrap();
+                assert!(!active.local_data_error);
+            }
+            let persisted = store.load().unwrap();
+            assert_eq!(
+                persisted
+                    .learned
+                    .iter()
+                    .find(|word| word.text == "回忆")
+                    .unwrap()
+                    .count,
+                1
+            );
+            assert!(persisted
+                .recent_words
+                .iter()
+                .any(|word| word.pinyin == "hui'yi" && word.text == "回忆"));
+            std::fs::remove_file(path).unwrap();
+        }
+
         #[test]
         fn native_scope_commit_publishes_rankings_and_worker() {
             use crate::engine::{Key, PinyinSession};
@@ -9959,8 +10157,12 @@ mod windows_exports {
                 }
                 assert_eq!(
                     read_document(&host, None),
-                    "文体问题",
-                    "one occasional selection must not absolutely override frequency"
+                    if allowed {
+                        "文体文体"
+                    } else {
+                        "文体问题"
+                    },
+                    "only a safe successful selection may gain the independent recent preference"
                 );
                 // A newly created TSF context must inherit the activation's orders,
                 // not the stale snapshot of the context that committed the word.
@@ -9987,7 +10189,7 @@ mod windows_exports {
                     let entry = &state.as_ref().unwrap().contexts[&context_key(&fresh)];
                     assert_eq!(
                         entry.popup_model.snapshot().unwrap().candidates[0].text,
-                        "问题",
+                        if allowed { "文体" } else { "问题" },
                     );
                 }
                 send_key(&sink, &fresh, 0x1B);
@@ -10005,21 +10207,22 @@ mod windows_exports {
                 let persisted = DictionaryStore::new(&path).load().unwrap();
                 assert_eq!(!persisted.rankings.is_empty(), allowed);
                 assert_eq!(persisted.selection_sequence, if allowed { 2 } else { 0 });
-                assert_eq!(persisted.learned.len(), if allowed { 2 } else { 0 });
+                assert_eq!(persisted.learned.len(), if allowed { 1 } else { 0 });
                 if allowed {
                     assert!(persisted.learned.iter().any(|word| word.pinyin == "wen'ti"
                         && word.text == "文体"
-                        && word.count == 1));
-                    assert_eq!(persisted.rankings[0].candidates[0].text, "问题");
+                        && word.count == 2));
+                    assert_eq!(persisted.rankings[0].candidates[0].text, "文体");
                     let mut restarted =
                         PinyinSession::from_lexicon(Lexicon::builtin().unwrap(), 9).unwrap();
+                    restarted.set_ranking_snapshot(Arc::new(persisted.ranking_snapshot()));
                     restarted.set_ranking_orders(Arc::new(persisted.rankings));
                     for letter in "wenti".chars() {
                         restarted
                             .process_key(KeyEvent::plain(Key::Char(letter)))
                             .unwrap();
                     }
-                    assert_eq!(restarted.candidates_on_current_page()[0].text, "问题");
+                    assert_eq!(restarted.candidates_on_current_page()[0].text, "文体");
                 }
                 COMPAT_VIEW.with(|v| v.set(Default::default()));
                 let _ = unsafe { SetFocus(previous) };

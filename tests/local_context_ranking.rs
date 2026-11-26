@@ -10,6 +10,159 @@ fn event(text: &str) -> LearningEvent {
 }
 
 #[test]
+fn one_numeric_builtin_selection_changes_close_word_ranking_without_absolute_order() {
+    let mut data = UserDictionary::default();
+    let mut s =
+        PinyinSession::from_lexicon(flower::engine::Lexicon::builtin().unwrap(), 9).unwrap();
+    let type_raw = |s: &mut PinyinSession| {
+        for c in "huiyi".chars() {
+            s.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+    };
+    s.set_ranking_snapshot(Arc::new(data.ranking_snapshot()));
+    type_raw(&mut s);
+    assert_eq!(s.candidates_on_current_page()[0].text, "会议");
+    assert_eq!(s.candidates_on_current_page()[1].text, "回忆");
+    assert_eq!(
+        s.process_key(KeyEvent::plain(Key::Char('2')))
+            .unwrap()
+            .commit
+            .as_deref(),
+        Some("回忆")
+    );
+    data.remember_commit(
+        s.pending_promotions(),
+        s.pending_phrase_learning(),
+        s.pending_learning(),
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        data.learned
+            .iter()
+            .find(|word| word.text == "回忆")
+            .unwrap()
+            .count,
+        1
+    );
+    s.set_ranking_snapshot(Arc::new(data.ranking_snapshot()));
+    type_raw(&mut s);
+    assert_eq!(s.candidates_on_current_page()[0].text, "回忆");
+    // A large frequency gap is still not an unconditional last-choice override.
+    let mut extremes =
+        PinyinSession::from_lexicon_tsv("hui'yi\t会议\t4294967295\nhui'yi\t回忆\t1", 9).unwrap();
+    extremes.set_ranking_snapshot(Arc::new(data.ranking_snapshot()));
+    type_raw(&mut extremes);
+    assert_eq!(extremes.candidates_on_current_page()[0].text, "会议");
+}
+
+#[test]
+fn conversation_words_beat_unrelated_names_without_replacing_source_frequency() {
+    let lexicon = flower::engine::Lexicon::builtin().unwrap();
+    for (raw, familiar, less_typical) in [
+        ("keyi", "可疑", "柯怡"),
+        ("keyi", "刻意", "柯怡"),
+        ("yiyi", "异议", "一医"),
+        ("yijing", "一经", "义井"),
+        ("yijing", "意境", "义井"),
+        ("shijie", "时节", "使节"),
+    ] {
+        let mut session = PinyinSession::from_lexicon(lexicon.clone(), 9).unwrap();
+        session.set_ranking_snapshot(Arc::new(Default::default()));
+        for c in raw.chars() {
+            session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        let mut ordinary = Vec::new();
+        for _ in 0..session.page_count() {
+            ordinary.extend(
+                session
+                    .candidates_on_current_page()
+                    .iter()
+                    .filter(|c| !c.is_ai() && !c.is_spelling() && !c.is_completion())
+                    .map(|c| c.text.clone()),
+            );
+            session.next_page().unwrap();
+        }
+        let position = |text: &str| ordinary.iter().position(|word| word == text).unwrap();
+        assert!(
+            position(familiar) < position(less_typical),
+            "{raw}: {ordinary:?}"
+        );
+    }
+}
+
+#[test]
+fn builtin_existing_homophone_history_survives_cleared_prefix_and_store_reload() {
+    use flower::engine::{LearningEvent, Lexicon};
+    use flower::user_dictionary::LearnedEntry;
+    let mut data = UserDictionary::default();
+    for (text, count) in [("会议", 7), ("回忆", 21)] {
+        data.learned.push(LearnedEntry {
+            pinyin: "hui'yi".into(),
+            text: text.into(),
+            count,
+        });
+        data.remember_selection(
+            &[LearningEvent {
+                pinyin: "hui'yi".into(),
+                text: text.into(),
+            }],
+            "",
+        )
+        .unwrap();
+    }
+    let lexicon = Lexicon::builtin().unwrap();
+    let compose = |data: &UserDictionary, prefix: &str| {
+        let mut s = PinyinSession::from_lexicon(lexicon.clone(), 9).unwrap();
+        s.set_ranking_snapshot(Arc::new(data.ranking_snapshot()));
+        s.set_host_prefix(prefix);
+        for c in "huiyi".chars() {
+            s.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        s
+    };
+    // Both competing words already have recent and count bonuses, unlike the
+    // empty-history 0.5.17 regression. Select by identity, not a fixed index.
+    for prefix in ["", "回忆"] {
+        let mut s = compose(&data, prefix);
+        let index = s
+            .candidates_on_current_page()
+            .iter()
+            .position(|c| c.text == "回忆" && c.comment == "hui'yi")
+            .unwrap();
+        assert_eq!(
+            s.select_candidate(index).unwrap().commit.as_deref(),
+            Some("回忆")
+        );
+        data.remember_commit(
+            s.pending_promotions(),
+            s.pending_phrase_learning(),
+            s.pending_learning(),
+            prefix,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        compose(&data, "回忆").candidates_on_current_page()[0].text,
+        "回忆"
+    );
+    assert_eq!(
+        compose(&data, "").candidates_on_current_page()[0].text,
+        "回忆",
+        "clearing host text must not remove the independent recent preference"
+    );
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    // Exercise the real schema serialization without using the user's store.
+    std::fs::write(store.path(), serde_json::to_vec_pretty(&data).unwrap()).unwrap();
+    let restored = store.load().unwrap();
+    assert_eq!(
+        compose(&restored, "").candidates_on_current_page()[0].text,
+        "回忆"
+    );
+}
+
+#[test]
 fn successful_words_count_decay_and_context_are_independent_of_raw_spelling() {
     let mut data = UserDictionary::default();
     for _ in 0..16 {
@@ -195,7 +348,7 @@ fn fixed_builtin_samples_report_recall_first_and_top_three_separately() {
 }
 
 #[test]
-fn builtin_same_reading_learns_distinct_prefixes_without_changing_neutral_frequency() {
+fn builtin_same_reading_preserves_context_with_independent_recent_preference() {
     use flower::engine::Lexicon;
     let lexicon = Lexicon::builtin().unwrap();
     let mut data = UserDictionary::default();
@@ -264,12 +417,19 @@ fn builtin_same_reading_learns_distinct_prefixes_without_changing_neutral_freque
     without_links.word_links.clear();
     assert_eq!(
         compose(&without_links, "函数").candidates_on_current_page()[0].text,
+        "映射",
+        "the latest same-reading choice now works without a learned prefix"
+    );
+    without_links.recent_words.clear();
+    assert_eq!(
+        compose(&without_links, "函数").candidates_on_current_page()[0].text,
         "影射",
-        "equal word counts and the public prior alone must not explain the contextual improvement"
+        "equal word counts and public prior alone still fall back to source frequency"
     );
     assert_eq!(
         compose(&data, "").candidates_on_current_page()[0].text,
-        "影射"
+        "映射",
+        "the last explicit selection is independent of host prefix"
     );
 }
 
@@ -365,10 +525,48 @@ fn sequence_overflow_rebases_ages_without_reusing_generation() {
     data.recent_words[0].sequence = u64::MAX;
     data.word_links[0].sequence = u64::MAX;
     data.remember_selection(&[event("是")], "").unwrap();
-    assert_eq!(data.selection_sequence, 1025);
-    assert_eq!(data.recent_words[0].sequence, 1024);
+    assert_eq!(data.selection_sequence, 2049);
+    assert_eq!(data.recent_words[0].sequence, 2048);
     assert_eq!(data.generation, 0);
     assert!(data.ranking_snapshot().word_bonus("shi", "市") > 0);
+}
+
+#[test]
+fn overflow_keeps_words_in_the_extended_recency_window() {
+    let mut data = UserDictionary::default();
+    data.remember_selection(&[event("市")], "").unwrap();
+    data.selection_sequence = u64::MAX;
+    data.recent_words[0].sequence = u64::MAX - 1100;
+    let before = data.ranking_snapshot().word_bonus("shi", "市");
+    assert!(
+        before > 32,
+        "the extended recent component is still effective"
+    );
+    data.remember_selection(&[event("是")], "").unwrap();
+    assert_eq!(data.ranking_snapshot().word_bonus("shi", "市"), before);
+    assert_eq!(data.generation, 0);
+}
+
+#[test]
+fn overflow_preserves_the_still_active_independent_same_reading_preference() {
+    let mut data = UserDictionary::default();
+    data.remember_selection(&[event("市")], "").unwrap();
+    data.selection_sequence = u64::MAX;
+    data.recent_words[0].sequence = u64::MAX - 1000;
+    let before = data.ranking_snapshot().word_bonus("shi", "市");
+    assert_eq!(before, 32 + 70 + 6);
+    // A different reading advances activity without transferring shi's choice.
+    data.remember_selection(
+        &[LearningEvent {
+            pinyin: "si".into(),
+            text: "四".into(),
+        }],
+        "",
+    )
+    .unwrap();
+    assert_eq!(data.ranking_snapshot().word_bonus("shi", "市"), before);
+    assert_eq!(data.selection_sequence, 2049);
+    assert_eq!(data.generation, 0);
 }
 
 #[test]

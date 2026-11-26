@@ -1,4 +1,4 @@
-//! Version 2 safe, little-endian column index. Header is 208 bytes:
+//! Version 3 safe, little-endian column index. Header is 208 bytes:
 //! magic/version/length, label width, legacy table counts, then 20 fixed
 //! (absolute offset, element count) descriptors. Columns: entry text offset,
 //! text length, reading offset, reading length, weight, everyday byte;
@@ -7,6 +7,7 @@
 //! countFlag high bit denotes contiguous IDs; low 31 bits are count. Explicit
 //! starts are absolute byte offsets, range starts are entry IDs. Edge ordinal
 //! i always targets BFS node i+1. Labels are u16 or u32, selected in header.
+//! Header offset 24 selects 1/2/4-byte string lengths; offsets remain u32.
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -213,16 +214,24 @@ pub fn classify(entries: &mut HashMap<String, Vec<Entry>>, pairs: &str, phrases:
 #[derive(Debug, Clone, Copy)]
 pub struct Index<'a> {
     bytes: &'a [u8],
+    length_width: usize,
 }
 impl<'a> Index<'a> {
     pub fn open(bytes: &'a [u8]) -> Option<Self> {
         if bytes.len() < HEADER || bytes.get(..8)? != MAGIC {
             return None;
         }
-        let this = Self { bytes };
-        if this.u32(8)? != 2
+        let length_width = u32::from_le_bytes(bytes.get(24..28)?.try_into().ok()?) as usize;
+        if !matches!(length_width, 1 | 2 | 4) {
+            return None;
+        }
+        let this = Self {
+            bytes,
+            length_width,
+        };
+        if this.u32(8)? != 3
             || this.n(12) != bytes.len()
-            || [24, 32, 40].iter().any(|at| this.n(*at) != 0)
+            || [32, 40].iter().any(|at| this.n(*at) != 0)
         {
             return None;
         }
@@ -253,6 +262,7 @@ impl<'a> Index<'a> {
             }
             let w = match col {
                 5 => 1,
+                1 | 3 | 7 | 11 | 18 => length_width,
                 19 => width,
                 _ => 4,
             };
@@ -283,9 +293,26 @@ impl<'a> Index<'a> {
             .checked_add(id.checked_mul(4).expect("column offset"))
             .expect("column offset"))
     }
+    #[inline]
+    fn length(self, col: usize, id: usize) -> usize {
+        assert!(id < self.n(52 + col * 8), "length ID");
+        let width = self.length_width;
+        let at = self
+            .n(48 + col * 8)
+            .checked_add(id.checked_mul(width).expect("column offset"))
+            .expect("column offset");
+        match width {
+            1 => self.bytes[at] as usize,
+            2 => {
+                u16::from_le_bytes(self.range(at, 2).expect("length").try_into().unwrap()) as usize
+            }
+            4 => self.n(at),
+            _ => unreachable!(),
+        }
+    }
     fn text(self, col: usize, id: usize) -> &'a str {
         std::str::from_utf8(
-            self.range(self.col(col, id), self.col(col + 1, id))
+            self.range(self.col(col, id), self.length(col + 1, id))
                 .expect("string range"),
         )
         .expect("UTF-8")
@@ -367,7 +394,7 @@ impl<'a> Index<'a> {
         // Validate the entire range and reject empty strings here; full UTF-8
         // validation remains in indexed_edge when the edge is consumed.
         *self
-            .range(self.col(17, label), self.col(18, label))
+            .range(self.col(17, label), self.length(18, label))
             .expect("syllable range")
             .first()
             .expect("nonempty syllable")
@@ -819,6 +846,11 @@ fn put(bytes: &mut [u8], at: usize, n: usize) {
     bytes[at..at + 4].copy_from_slice(&num(n).to_le_bytes());
 }
 fn column(bytes: &mut Vec<u8>, col: usize, values: &[u32], width: usize) {
+    let width = if matches!(col, 1 | 3 | 7 | 11 | 18) {
+        u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize
+    } else {
+        width
+    };
     let start = bytes.len();
     put(bytes, 48 + col * 8, start);
     put(bytes, 52 + col * 8, values.len());
@@ -906,7 +938,23 @@ pub fn encode(entries: &HashMap<String, Vec<Entry>>) -> Vec<u8> {
     assert_eq!(bfs.len(), trie.count);
     let mut bytes = vec![0; HEADER];
     bytes[..8].copy_from_slice(MAGIC);
-    put(&mut bytes, 8, 2);
+    put(&mut bytes, 8, 3);
+    let maximum_length = words
+        .iter()
+        .map(|e| e.text.len().max(e.reading.len()))
+        .chain(entries.keys().map(String::len))
+        .chain(initial.keys().map(String::len))
+        .max()
+        .unwrap_or(0);
+    // Every syllable string is a substring of an entry reading.
+    let length_width = if maximum_length <= u8::MAX as usize {
+        1
+    } else if maximum_length <= u16::MAX as usize {
+        2
+    } else {
+        4
+    };
+    put(&mut bytes, 24, length_width);
     put(&mut bytes, 20, words.len());
     put(&mut bytes, 28, entries.len());
     put(&mut bytes, 36, initial.len());
@@ -1030,6 +1078,26 @@ mod tests {
     fn finish(bytes: &mut [u8]) {
         let len = bytes.len();
         put(bytes, 12, len);
+    }
+
+    #[test]
+    fn length_columns_choose_lossless_width_and_reject_invalid_header() {
+        for (characters, width) in [(85, 1), (86, 2), (21845, 2), (21846, 4)] {
+            let text = "阿".repeat(characters);
+            let encoded = encode(&parse(&format!("a\t{text}\t1")).unwrap());
+            let index = Index::open(&encoded).unwrap();
+            assert_eq!(index.length_width, width);
+            assert_eq!(index.entry(0).text, text);
+            assert_eq!(
+                index.get(24, "a").unwrap().iter().next().unwrap().text,
+                text
+            );
+            for invalid in [0, 3, 8, u32::MAX as usize] {
+                let mut bad = encoded.clone();
+                put(&mut bad, 24, invalid);
+                assert!(Index::open(&bad).is_none());
+            }
+        }
     }
 
     #[test]
@@ -1159,7 +1227,7 @@ mod tests {
         let index = Index::open(&bytes).unwrap();
         let label = index.label(1);
         let offset_at = index.n(48 + 17 * 8) + label * 4;
-        let length_at = index.n(48 + 18 * 8) + label * 4;
+        let length_at = index.n(48 + 18 * 8) + label * index.length_width;
         let original_offset = index.col(17, label);
         for (offset, len) in [
             (original_offset, 0),
@@ -1169,7 +1237,8 @@ mod tests {
         ] {
             let mut bad = bytes.clone();
             put(&mut bad, offset_at, offset);
-            put(&mut bad, length_at, len);
+            bad[length_at..length_at + index.length_width]
+                .copy_from_slice(&(len as u32).to_le_bytes()[..index.length_width]);
             assert!(std::panic::catch_unwind(|| {
                 let _ = Index::open(&bad).unwrap().node(0).edges.group(b'z');
             })

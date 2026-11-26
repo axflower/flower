@@ -118,7 +118,8 @@ fn choice_bonus(choice: &Choice, snapshot: &RankingSnapshot, prefix: &str) -> i6
     let mut previous = prefix.to_owned();
     let mut bonus = 0;
     for event in &choice.events {
-        bonus += snapshot.word_bonus(&event.pinyin, &event.text)
+        bonus += super::ranking::dialogue_bonus(&event.pinyin, &event.text)
+            + snapshot.word_bonus(&event.pinyin, &event.text)
             + snapshot.link_bonus(&previous, &event.pinyin, &event.text);
         previous = event.text.clone();
     }

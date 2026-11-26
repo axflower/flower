@@ -156,6 +156,7 @@ impl UserDictionary {
                 (link.count, link.sequence),
             );
         }
+        snapshot.index_recent_choices(&self.recent_words);
         snapshot
     }
 
@@ -199,12 +200,13 @@ impl UserDictionary {
         if self.selection_sequence == u64::MAX {
             let old = self.selection_sequence;
             for word in &mut self.recent_words {
-                word.sequence = 1024u64.saturating_sub(old.saturating_sub(word.sequence).min(1024));
+                word.sequence = 2048u64.saturating_sub(old.saturating_sub(word.sequence).min(2048));
             }
             for link in &mut self.word_links {
-                link.sequence = 1024u64.saturating_sub(old.saturating_sub(link.sequence).min(1024));
+                link.sequence = 2048u64.saturating_sub(old.saturating_sub(link.sequence).min(2048));
             }
-            self.selection_sequence = 1024;
+            // Covers the 320 * 4 commit word-recency horizon as well as links.
+            self.selection_sequence = 2048;
         }
         self.selection_sequence += 1;
         let sequence = self.selection_sequence;
