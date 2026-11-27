@@ -15,6 +15,7 @@ mod router;
 mod segment;
 mod session;
 mod spelling;
+mod spoken_ranking;
 mod types;
 
 pub mod keymap;

@@ -544,6 +544,29 @@ CONVERSION_IDENTITIES = {
     "LICENSE-APACHE-2.0.txt": (11558, "1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6"),
 }
 CONVERSION_FILES = frozenset(CONVERSION_PREFIX + name for name in CONVERSION_IDENTITIES)
+SPOKEN_RANKING_PREFIX = "data/spoken_ranking/"
+SPOKEN_RANKING_INTRODUCED = (0, 5, 20)
+SPOKEN_RANKING_TABLE = SPOKEN_RANKING_PREFIX + "word-diversity.bin"
+SPOKEN_RANKING_IDENTITIES = {
+    SPOKEN_RANKING_TABLE: "a8f63e844690609baad348f6503758e4449944d883c19e68e6d5ca5574676dc7",
+    SPOKEN_RANKING_PREFIX + "LICENSE-CC-BY-4.0.txt":
+        "9ba9550ad48438d0836ddab3da480b3b69ffa0aac7b7878b5a0039e7ab429411",
+    SPOKEN_RANKING_PREFIX + "NOTICE.md":
+        "052c86154fd03d1799bc99a1b158f7e1eeb4ddbe0ff6da01df14cb332081602c",
+}
+
+
+def _verify_spoken_ranking_payload(payload: Mapping[str, bytes]) -> dict:
+    if {p for p in payload if p.startswith(SPOKEN_RANKING_PREFIX)} != set(SPOKEN_RANKING_IDENTITIES):
+        raise PackagingError("字幕排序数据、归属或完整许可缺失，或者包含未知路径")
+    files = {}
+    for path, digest in SPOKEN_RANKING_IDENTITIES.items():
+        if _sha256(payload[path]) != digest:
+            raise PackagingError(f"字幕排序数据可信摘要不匹配：{path}")
+        files[path] = {"size": len(payload[path]), "sha256": digest}
+    if payload[SPOKEN_RANKING_TABLE] not in payload["flower.dll"]:
+        raise PackagingError("Flower DLL 未内嵌本包的字幕排序数据")
+    return {"files": files, "license": "CC-BY-4.0", "source_doi": "10.1371/journal.pone.0010729.s002"}
 
 
 def _verify_conversion_payload(payload: Mapping[str, bytes]) -> dict:
@@ -1729,6 +1752,11 @@ def _build_payloads(
         "data/pinyin/mvp_lexicon.tsv": lexicon,
         "Cargo.lock": cargo_lock,
     }
+    spoken_ranking_record = None
+    if release >= SPOKEN_RANKING_INTRODUCED:
+        for path in SPOKEN_RANKING_IDENTITIES:
+            payload[path] = _read_bytes(repo_root / path, "字幕排序数据或许可")
+        spoken_ranking_record = _verify_spoken_ranking_payload(payload)
     for source in (dependency_payload, rust_payload, dictionary_payload, phrase_payload,
                    everyday_payload, category_payload, vocabulary_payload, conversion_payload):
         for relative, data in source.items():
@@ -1746,6 +1774,11 @@ def _build_payloads(
         "归属、修改说明、相同方式共享条件和完整许可见 `licenses/phrases/NOTICE.md`。\n"
         "数据许可不改写 Flower 程序代码的许可。\n"
     ).encode("utf-8")
+    if spoken_ranking_record is not None:
+        payload["THIRD-PARTY-NOTICES.md"] += (
+            "\n## SUBTLEX-CH 字幕词语统计\n\nCai Q、Brysbaert M (2010)，CC BY 4.0。"
+            "归属、来源、转换说明及完整许可见 `data/spoken_ranking/NOTICE.md`。\n"
+        ).encode("utf-8")
 
     if ai_bundle is not None:
         payload.update(ai_bundle[0])
@@ -1775,6 +1808,8 @@ def _build_payloads(
         manifest["expanded_vocabulary"] = vocabulary_record
     if conversion_record is not None:
         manifest["chinese_conversion"] = conversion_record
+    if spoken_ranking_record is not None:
+        manifest["spoken_ranking"] = spoken_ranking_record
     manifest_bytes = (
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")

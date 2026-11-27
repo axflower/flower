@@ -1683,6 +1683,24 @@ class ExpandedVocabularyTests(unittest.TestCase):
 
 
 class AuditArchiveTests(unittest.TestCase):
+    def test_spoken_ranking_requires_the_table_attribution_and_embedded_identity(self):
+        names = flower_package.SPOKEN_RANKING_IDENTITIES
+        payload = {path: (REPO_ROOT / path).read_bytes() for path in names}
+        table = payload[flower_package.SPOKEN_RANKING_TABLE]
+        payload["flower.dll"] = b"test image with table" + table
+        result = flower_package._verify_spoken_ranking_payload(payload)
+        self.assertEqual(result["license"], "CC-BY-4.0")
+        self.assertEqual(set(result["files"]), set(names))
+        for path in names:
+            absent = dict(payload)
+            del absent[path]
+            with self.subTest(path=path), self.assertRaises(flower_package.PackagingError):
+                flower_package._verify_spoken_ranking_payload(absent)
+            with self.subTest(path=path), self.assertRaises(flower_package.PackagingError):
+                flower_package._verify_spoken_ranking_payload({**payload, path: b"changed"})
+        with self.assertRaisesRegex(flower_package.PackagingError, "未内嵌"):
+            flower_package._verify_spoken_ranking_payload({**payload, "flower.dll": b"wrong table"})
+
     def test_real_archive_roundtrip_and_conversion(self):
         payload, record = flower_package._vocabulary_archive_bundle(dictionary_root())
         self.assertEqual(record["representation"], "audit-zip")

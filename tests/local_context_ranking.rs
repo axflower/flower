@@ -10,6 +10,173 @@ fn event(text: &str) -> LearningEvent {
 }
 
 #[test]
+fn builtin_common_collocations_are_first_and_commit_the_complete_spelling() {
+    use flower::engine::Lexicon;
+
+    let lexicon = Lexicon::builtin().unwrap();
+    let snapshot = Arc::new(UserDictionary::default().ranking_snapshot());
+    let mut failures = Vec::new();
+    for (raw, reading, text) in [
+        ("gangcai", "gang'cai", "刚才"),
+        ("gangcaishuo", "gang'cai'shuo", "刚才说"),
+        ("gangcaijiage", "gang'cai'jia'ge", "钢材价格"),
+        ("yuanyuanbugou", "yuan'yuan'bu'gou", "远远不够"),
+        ("xianzaide", "xian'zai'de", "现在的"),
+        ("erbushi", "er'bu'shi", "而不是"),
+        ("bijiaokaohou", "bi'jiao'kao'hou", "比较靠后"),
+        ("xianshide", "xian'shi'de", "显示的"),
+        ("bijiaokaoqian", "bi'jiao'kao'qian", "比较靠前"),
+        ("bijiaoqingchu", "bi'jiao'qing'chu", "比较清楚"),
+        ("jintiande", "jin'tian'de", "今天的"),
+        ("mingtiande", "ming'tian'de", "明天的"),
+        ("changyongde", "chang'yong'de", "常用的"),
+        ("yebushi", "ye'bu'shi", "也不是"),
+        ("bingbushi", "bing'bu'shi", "并不是"),
+        ("tamenbushi", "ta'men'bu'shi", "他们不是"),
+        ("zaihoumian", "zai'hou'mian", "在后面"),
+        ("zheshiyige", "zhe'shi'yi'ge", "这是一个"),
+        ("zheshism", "zhe'shi'shen'me", "这是什么"),
+        ("you'de'shi'hou", "you'de'shi'hou", "有的时候"),
+        ("kaoshihou", "kao'shi'hou", "考试后"),
+        ("laideji", "lai'de'ji", "来得及"),
+        ("nh", "ni'hao", "你好"),
+    ] {
+        let mut session = PinyinSession::from_lexicon(lexicon.clone(), 9).unwrap();
+        session.set_ranking_snapshot(Arc::clone(&snapshot));
+        for c in raw.chars() {
+            session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        let first = &session.candidates_on_current_page()[0];
+        if (first.text.as_str(), first.comment.as_str()) != (text, reading) {
+            failures.push(format!("{raw}: expected {text}/{reading}, got {first:?}"));
+            continue;
+        }
+        assert_eq!(
+            session
+                .process_key(KeyEvent::plain(Key::Char('1')))
+                .unwrap()
+                .commit
+                .as_deref(),
+            Some(text),
+            "{raw}: the first candidate must consume the whole input"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn large_spoken_frequency_gaps_withstand_a_single_selection_of_a_rare_homophone() {
+    let mut data = UserDictionary::default();
+    for (reading, text) in [("gang'cai", "钢材"), ("yuan'yuan", "袁媛")] {
+        data.remember_selection(
+            &[LearningEvent {
+                pinyin: reading.into(),
+                text: text.into(),
+            }],
+            "",
+        )
+        .unwrap();
+    }
+    let snapshot = Arc::new(data.ranking_snapshot());
+    let lexicon = flower::engine::Lexicon::builtin().unwrap();
+    for (raw, first) in [("gangcai", "刚才"), ("yuanyuanbugou", "远远不够")] {
+        let mut session = PinyinSession::from_lexicon(lexicon.clone(), 9).unwrap();
+        session.set_ranking_snapshot(Arc::clone(&snapshot));
+        for c in raw.chars() {
+            session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        assert_eq!(session.candidates_on_current_page()[0].text, first, "{raw}");
+        if raw == "gangcai" {
+            let steel = session
+                .candidates_on_current_page()
+                .iter()
+                .position(|candidate| candidate.text == "钢材")
+                .expect("钢材 is a valid homophone for manufacturing contexts");
+            assert_eq!(
+                session.select_candidate(steel).unwrap().commit.as_deref(),
+                Some("钢材")
+            );
+        }
+    }
+}
+
+#[test]
+fn stronger_segmentation_ranks_an_existing_compound_without_changing_its_identity() {
+    let fixture = "jia\t甲\t8388608\nyi\t乙\t8388608\njia'yi\t甲乙\t1\njia'yi\t甲一\t256";
+    let mut session = PinyinSession::from_lexicon_tsv(fixture, 9).unwrap();
+    session.set_ranking_snapshot(Arc::new(Default::default()));
+    for c in "jiayi".chars() {
+        session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+    }
+    let candidates = session.candidates_on_current_page();
+    assert_eq!(candidates[0].text, "甲乙");
+    assert_eq!(
+        session.select_candidate(0).unwrap().commit.as_deref(),
+        Some("甲乙")
+    );
+    assert_eq!(
+        session.pending_learning(),
+        &[LearningEvent {
+            pinyin: "jia'yi".into(),
+            text: "甲乙".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_high_weight_initial_match_does_not_reinterpret_a_typed_syllable() {
+    let fixture = "xian'zai'de\t现在的\t1\nxian'zai'di'er\t现在第二\t1048576\n";
+    for (raw, preferred, alternate) in [
+        ("xianzaide", "现在的", Some("现在第二")),
+        ("xianzai'd'e", "现在第二", None),
+    ] {
+        let mut session = PinyinSession::from_lexicon_tsv(fixture, 9).unwrap();
+        session.set_ranking_snapshot(Arc::new(Default::default()));
+        for c in raw.chars() {
+            session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        let candidates = session.candidates_on_current_page();
+        assert_eq!(candidates[0].text, preferred, "{raw}: {candidates:?}");
+        if let Some(text) = alternate {
+            assert!(candidates.iter().any(|candidate| candidate.text == text));
+        }
+    }
+}
+
+#[test]
+fn a_common_collocation_keeps_its_homophone_and_respects_personal_selection() {
+    let lexicon = flower::engine::Lexicon::builtin().unwrap();
+    let mut data = UserDictionary::default();
+    let compose = |data: &UserDictionary| {
+        let mut session = PinyinSession::from_lexicon(lexicon.clone(), 9).unwrap();
+        session.set_ranking_snapshot(Arc::new(data.ranking_snapshot()));
+        for c in "kaohou".chars() {
+            session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        session
+    };
+    let mut session = compose(&data);
+    let candidates = session.candidates_on_current_page();
+    assert_eq!(candidates[0].text, "靠后");
+    let exam = candidates
+        .iter()
+        .position(|candidate| candidate.text == "考后" && candidate.comment == "kao'hou")
+        .unwrap();
+    assert_eq!(
+        session.select_candidate(exam).unwrap().commit.as_deref(),
+        Some("考后")
+    );
+    data.remember_commit(
+        session.pending_promotions(),
+        session.pending_phrase_learning(),
+        session.pending_learning(),
+        "",
+    )
+    .unwrap();
+    assert_eq!(compose(&data).candidates_on_current_page()[0].text, "考后");
+}
+
+#[test]
 fn one_numeric_builtin_selection_changes_close_word_ranking_without_absolute_order() {
     let mut data = UserDictionary::default();
     let mut s =

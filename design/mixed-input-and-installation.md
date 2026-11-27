@@ -7,6 +7,9 @@
 `startup-uiless-and-mixed-composition.md` 为准；本页“完成页启动”中的打开设置行为
 是0.4.3历史约定，已由静默启用后退出取代。
 
+0.5.21 重新开放安装目录选择，替代本页的固定目录约定。当前契约见
+[自定义安装](input-and-installation.md#自定义安装)。
+
 ## anywork 取证
 
 已读取 `ZR233/anywork` 提交 `b8c7b9ca07412ba1703fd58b6e01fea5a5fdc760`

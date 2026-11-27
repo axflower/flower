@@ -50,6 +50,7 @@ impl LexiconEntry<'_> {
 #[derive(Debug, Clone)]
 pub struct Lexicon {
     dormant: bool,
+    builtin: bool,
     entries: Arc<Table>,
     initials: Arc<Table>,
     syllables: Arc<SyllableTrie>,
@@ -244,6 +245,7 @@ impl Lexicon {
                     })?;
                 Ok(Self {
                     dormant: false,
+                    builtin: true,
                     entries: Arc::new(Table::indexed(base, 24)),
                     initials: Arc::new(Table::indexed(base, 32)),
                     syllables: Arc::new(SyllableTrie::indexed(base)),
@@ -268,6 +270,10 @@ impl Lexicon {
         self.dormant
     }
 
+    pub(crate) fn uses_spoken_ranking(&self) -> bool {
+        self.builtin
+    }
+
     fn parse_entries(tsv: &str) -> Result<HashMap<String, Vec<Entry>>, EngineError> {
         index::parse(tsv).map_err(|error| match error {
             index::ParseError::Empty => EngineError::EmptyLexicon,
@@ -278,6 +284,7 @@ impl Lexicon {
     fn from_entries(entries: HashMap<String, Vec<Entry>>) -> Self {
         Self {
             dormant: false,
+            builtin: false,
             initials: Arc::new(Table::dynamic(index::initials(&entries))),
             syllables: Arc::new(SyllableTrie::build(&entries)),
             entries: Arc::new(Table::dynamic(entries)),
@@ -919,6 +926,7 @@ mod tests {
         let base = index::Index::open(Box::leak(bytes.into_boxed_slice())).unwrap();
         Lexicon {
             dormant: false,
+            builtin: false,
             entries: Arc::new(Table::indexed(base, 24)),
             initials: Arc::new(Table::indexed(base, 32)),
             syllables: Arc::new(SyllableTrie::indexed(base)),

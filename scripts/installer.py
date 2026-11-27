@@ -123,6 +123,7 @@ def verify_package(archive: Path) -> VerifiedPackage:
                     and relative not in pack.VOCABULARY_FILES
                     and relative != pack.VOCABULARY_ARCHIVE
                     and relative not in pack.CONVERSION_FILES
+                    and relative not in pack.SPOKEN_RANKING_IDENTITIES
                     and relative not in {"ai/" + name for name in pack.package_ai_assets.BUNDLE_FILES}
                     and not relative.startswith("licenses/")):
                 raise InstallerError(f"ZIP 存在白名单之外的文件：{relative}")
@@ -172,6 +173,10 @@ def verify_package(archive: Path) -> VerifiedPackage:
         conversion_record = pack._verify_conversion_payload(payload)
         if manifest.get("chinese_conversion") != conversion_record:
             raise InstallerError("manifest 简繁转换记录不匹配")
+    if (release >= pack.SPOKEN_RANKING_INTRODUCED or "spoken_ranking" in manifest
+            or any(p.startswith(pack.SPOKEN_RANKING_PREFIX) for p in payload)):
+        if manifest.get("spoken_ranking") != pack._verify_spoken_ranking_payload(payload):
+            raise InstallerError("manifest 字幕排序数据记录不匹配")
     if release >= (0, 4, 7) and variant != "ai":
         raise InstallerError("0.4.7 起必须提供完整 AI 分发包")
     ai_payload = {name[3:]: value for name, value in payload.items() if name.startswith("ai/")}

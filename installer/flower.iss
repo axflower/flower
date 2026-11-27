@@ -39,7 +39,8 @@ VersionInfoProductName=Flower
 VersionInfoDescription=Flower 测试版安装器
 DefaultDirName={commonpf64}\Flower
 DefaultGroupName=Flower
-DisableDirPage=yes
+DisableDirPage=no
+DirExistsWarning=no
 UninstallFilesDir={app}
 AllowUNCPath=no
 DisableProgramGroupPage=yes
@@ -121,6 +122,13 @@ begin
   Result := ExpandConstant('{tmp}\flower-path-check.exe');
 end;
 
+procedure ExtractPathChecker;
+begin
+  if PathCheckerReady then Exit;
+  ExtractTemporaryFile('flower-path-check.exe');
+  PathCheckerReady := True;
+end;
+
 function SafeInstallPath(Name: String): Boolean;
 var
   ExitCode: Integer;
@@ -133,16 +141,6 @@ begin
     Result := ExitCode = 0;
 end;
 
-function FixedInstallRoot: Boolean;
-begin
-  { ExpandFileName normalizes dot segments before the ordinal comparison.
-    SafeInstallPath separately rejects links, unsafe ACLs and nonlocal paths. }
-  Result := CompareStringOrdinal(
-    RemoveBackslashUnlessRoot(ExpandFileName(ExpandConstant('{app}'))), -1,
-    RemoveBackslashUnlessRoot(ExpandFileName(ExpandConstant('{commonpf64}\Flower'))),
-    -1, True) = 2;
-end;
-
 function PrepareInstallPath(Name: String): Boolean;
 var
   ExitCode: Integer;
@@ -153,6 +151,27 @@ begin
   if Exec(PathChecker, 'prepare-install-path --path "' + Name + '"',
     ExpandConstant('{tmp}'), SW_HIDE, ewWaitUntilTerminated, ExitCode) then
     Result := ExitCode = 0;
+end;
+
+function InstallRootAvailable(Name: String): Boolean;
+var
+  Entry: TFindRec;
+begin
+  if not DirExists(Name) then begin
+    Result := not FileExists(Name);
+    Exit;
+  end;
+  { Use a dedicated root so Inno cannot reuse an unrelated uninstall log. }
+  Result := False;
+  if not FindFirst(AddBackslash(Name) + '*', Entry) then Exit;
+  try
+    repeat
+      if (Entry.Name <> '.') and (Entry.Name <> '..') then Exit;
+    until not FindNext(Entry);
+    Result := True;
+  finally
+    FindClose(Entry);
+  end;
 end;
 
 function HasSubkeys(Key: String): Boolean;
@@ -242,7 +261,6 @@ function CanStartFlower: Boolean;
 begin
   Result := False;
   if RegistrationFailed then Exit;
-  if not FixedInstallRoot then Exit;
   if not SafeInstallPath(ExpandConstant('{app}')) then Exit;
   if not TrustedPayload then Exit;
   if not OwnedRegistrationComplete then Exit;
@@ -259,6 +277,21 @@ begin
     SuppressibleMsgBox('此测试版安装器仅支持交互安装。', mbError, MB_OK, IDOK);
 end;
 
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if CurPageID <> wpSelectDir then Exit;
+  ExtractPathChecker;
+  Result := SafeInstallPath(WizardDirValue);
+  if not Result then
+    MsgBox('此目录未通过安全检查。请选择本地固定盘上的新目录，例如 D:\Flower。已有目录及其父目录必须受保护，安装器不会修改已有权限。',
+      mbError, MB_OK)
+  else if not InstallRootAvailable(WizardDirValue) then begin
+    Result := False;
+    MsgBox('请选择新目录或空目录作为 Flower 的专用安装位置。', mbError, MB_OK);
+  end;
+end;
+
 function HasNativeRuntime: Boolean;
 var
   Previous: Boolean;
@@ -272,26 +305,23 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Root: String;
 begin
   Result := '';
-  if not FixedInstallRoot then begin
-    Result := 'Flower 固定安装到 Program Files\Flower，不支持 /DIR 更改安装目录。';
-    Exit;
-  end;
-  if not PathCheckerReady then begin
-    ExtractTemporaryFile('flower-path-check.exe');
-    PathCheckerReady := True;
-  end;
+  Root := ExpandConstant('{app}');
   if HasFlowerRegistration or RegKeyExists(HKLM64, InstallerKey) then
     Result := '已发现 Flower 注册或安装记录。请先由各用户停用 Flower、退出旧宿主，再使用旧安装工具注销或卸载；本安装器不会覆盖旧安装。'
-  else if DirExists(PayloadDir) then
-    Result := '目标版本目录已存在。为保护未知或未完成的安装，拒绝覆盖。'
+  else if not InstallRootAvailable(Root) then
+    Result := '目标位置已被占用。请为 Flower 选择新目录或空目录。'
   else if not HasNativeRuntime then
-    Result := '请先安装 Microsoft Visual C++ v14 x64 运行库。本离线安装器不会下载它。'
-  else if not PrepareInstallPath(WizardDirValue) then
-    Result := '安全准备目录失败：路径不安全、已有目标缺少 Windows 应用容器读取权限，或创建时发生竞争。已有权限未更改。若旧版已卸载且 Flower 目录确认完全为空，可删除该空目录后重试。'
-  else if not SafeInstallPath(ExpandConstant('{app}')) then
-    Result := '固定安装目录安全检查失败。已有父目录权限和所有者不会更改。';
+    Result := '请先安装 Microsoft Visual C++ v14 x64 运行库。本离线安装器不会下载它。';
+  if Result <> '' then Exit;
+  ExtractPathChecker;
+  if not PrepareInstallPath(Root) then
+    Result := '无法安全准备安装目录。请返回目录页选择本地固定盘上的新目录。已有目录权限不会更改。'
+  else if not SafeInstallPath(Root) then
+    Result := '安装目录安全检查失败。请返回目录页选择受保护的本地目录。';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -337,10 +367,6 @@ var
   ExitCode: Integer;
 begin
   Result := False;
-  if not FixedInstallRoot then begin
-    MsgBox('卸载目录不是固定 Program Files\Flower，已停止卸载并保留文件。', mbError, MB_OK);
-    Exit;
-  end;
   if UninstallSilent then begin
     SuppressibleMsgBox('此测试版仅支持交互卸载。', mbError, MB_OK, IDOK);
     Exit;

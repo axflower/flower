@@ -14,6 +14,16 @@ fn session(raw: &str, data: &UserDictionary) -> PinyinSession {
 
 fn main() {
     let data = UserDictionary::default();
+    let inputs: Vec<_> = std::env::args().skip(1).collect();
+    if !inputs.is_empty() {
+        for raw in inputs {
+            let session = session(&raw, &data);
+            for candidate in session.candidates_on_current_page() {
+                println!("{raw}\t{}\t{}", candidate.text, candidate.comment);
+            }
+        }
+        return;
+    }
     for raw in [
         "huiyi", "shishi", "yiyi", "zhidao", "yijing", "shijian", "wenti", "gongzuo", "xianzai",
         "keyi", "xiexie", "zaijian", "mingtian", "jintian", "pengyou", "xihuan", "dianhua",

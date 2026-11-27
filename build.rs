@@ -13,6 +13,14 @@ use std::process::Command;
 
 fn main() {
     use sha2::{Digest, Sha256};
+    let spoken_table = "data/spoken_ranking/word-diversity.bin";
+    println!("cargo:rerun-if-changed={spoken_table}");
+    let spoken_table = std::fs::read(spoken_table).expect("read SUBTLEX-CH ranking table");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&spoken_table)),
+        "a8f63e844690609baad348f6503758e4449944d883c19e68e6d5ca5574676dc7",
+        "SUBTLEX-CH ranking table changed"
+    );
     let mut entries =
         lexicon_index::parse(flower_dict::DEFAULT_TSV).expect("parse builtin dictionary");
     lexicon_index::classify(

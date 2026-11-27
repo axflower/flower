@@ -87,10 +87,58 @@ impl RankingSnapshot {
 pub(crate) fn dialogue_bonus(pinyin: &str, text: &str) -> i64 {
     if DIALOGUE_PAIRS.binary_search(&(pinyin, text)).is_ok() {
         128
+    } else if COMMON_COLLOCATIONS.binary_search(&(pinyin, text)).is_ok() {
+        // These ordinary chunks are present in the broad fallback lexicon,
+        // where a uniform weight does not distinguish them from names and
+        // other homophones. This bounded preference is not a source frequency.
+        512
     } else {
         0
     }
 }
+
+const COMMON_COLLOCATIONS: &[(&str, &str)] = &[
+    ("bing'bu'shi", "并不是"),
+    ("bing'mei'you", "并没有"),
+    ("bu'tong'de", "不同的"),
+    ("bu'xu'yao", "不需要"),
+    ("chang'jian'de", "常见的"),
+    ("chang'yong'de", "常用的"),
+    ("dang'qian'de", "当前的"),
+    ("er'bu", "而不"),
+    ("er'bu'shi", "而不是"),
+    ("he'shi'de", "合适的"),
+    ("jin'tian'de", "今天的"),
+    ("kao'hou", "靠后"),
+    ("kao'qian", "靠前"),
+    ("ke'yi'de", "可以的"),
+    ("ming'tian'de", "明天的"),
+    ("mo'ren'de", "默认的"),
+    ("shi'zhe'yang'de", "是这样的"),
+    ("ta'men'zai", "他们在"),
+    ("wo'men'zai", "我们在"),
+    ("xian'shi'de", "显示的"),
+    ("xian'you'de", "现有的"),
+    ("xian'zai'de", "现在的"),
+    ("xiang'guan'de", "相关的"),
+    ("ye'bu'shi", "也不是"),
+    ("ye'mei'you", "也没有"),
+    ("you'guan'de", "有关的"),
+    ("yuan'lai'de", "原来的"),
+    ("zai'hou'mian", "在后面"),
+    ("zai'na'bian", "在那边"),
+    ("zai'qian'mian", "在前面"),
+    ("zai'zhe'li", "在这里"),
+    ("zhe'bu'shi", "这不是"),
+    ("zhe'jiu'shi", "这就是"),
+    ("zhe'shi'shen'me", "这是什么"),
+    ("zhe'shi'yi'ge", "这是一个"),
+    ("zhe'shi'yin'wei", "这是因为"),
+    ("zhe'ye'shi", "这也是"),
+    ("zhi'qian'de", "之前的"),
+    ("zui'jin'de", "最近的"),
+    ("zui'xin'de", "最新的"),
+];
 
 pub(crate) const DIALOGUE_PAIRS: &[(&str, &str)] = &[
     ("bao'qian", "抱歉"),
@@ -315,15 +363,17 @@ mod dialogue_tests {
 
     #[test]
     fn conversation_prior_is_sorted_bounded_and_only_uses_real_readings() {
-        assert!(DIALOGUE_PAIRS.windows(2).all(|pair| pair[0] < pair[1]));
         let lexicon = crate::engine::Lexicon::builtin().unwrap();
-        for &(pinyin, text) in DIALOGUE_PAIRS {
-            assert!(
-                lexicon.contains_exact_pair(pinyin, text),
-                "{pinyin}: {text}"
-            );
-            assert_eq!(dialogue_bonus(pinyin, text), 128);
-            assert_eq!(dialogue_bonus("invalid", text), 0);
+        for (pairs, expected_bonus) in [(DIALOGUE_PAIRS, 128), (COMMON_COLLOCATIONS, 512)] {
+            assert!(pairs.windows(2).all(|pair| pair[0] < pair[1]));
+            for &(pinyin, text) in pairs {
+                assert!(
+                    lexicon.contains_exact_pair(pinyin, text),
+                    "{pinyin}: {text}"
+                );
+                assert_eq!(dialogue_bonus(pinyin, text), expected_bonus);
+                assert_eq!(dialogue_bonus("invalid", text), 0);
+            }
         }
         assert_eq!(
             dialogue_bonus("hui'yi", "回忆"),

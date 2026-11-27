@@ -57,32 +57,32 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertNotIn("fs::copy", copy)
         self.assertIn("user_directory_guard(directory)", source)
 
-    def test_fixed_directory_and_pre_copy_path_gate(self):
+    def test_custom_directory_and_pre_copy_path_gate(self):
         source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
-        self.assertIn("DisableDirPage=yes", source)
+        self.assertIn("DisableDirPage=no", source)
         self.assertIn(r"DefaultDirName={commonpf64}\Flower", source)
         self.assertIn("UsePreviousAppDir=no", source)
         self.assertIn(r"UninstallFilesDir={app}", source)
         self.assertIn(r"{app}\versions\{#BuildId}", source)
         self.assertNotIn("CreateInputDirPage", source)
         self.assertNotIn("SystemRoot", source)
-        self.assertIn("/DIR", source)
         self.assertIn("AllowUNCPath=no", source)
         self.assertIn("Flags: dontcopy", source)
+        self.assertNotIn("FixedInstallRoot", source)
+        page = source.split("function NextButtonClick", 1)[1].split("function HasNativeRuntime", 1)[0]
+        self.assertIn("wpSelectDir", page)
+        self.assertIn("SafeInstallPath(WizardDirValue)", page)
+        self.assertNotIn("PrepareInstallPath", page)
         prepare = source.split("function PrepareToInstall", 1)[1].split("procedure CurStepChanged", 1)[0]
-        self.assertIn(r"SafeInstallPath(ExpandConstant('{app}'))", prepare)
-        self.assertIn("PrepareInstallPath(WizardDirValue)", prepare)
-        self.assertLess(prepare.index("if not FixedInstallRoot"), prepare.index("PrepareInstallPath("))
-        self.assertIn("ExtractTemporaryFile('flower-path-check.exe')", prepare)
-        checker = source.split("function SafeInstallPath", 1)[1].split("function FixedInstallRoot", 1)[0]
+        self.assertIn("Root := ExpandConstant('{app}')", prepare)
+        self.assertIn("PrepareInstallPath(Root)", prepare)
+        self.assertIn("SafeInstallPath(Root)", prepare)
+        self.assertIn("ExtractTemporaryFile('flower-path-check.exe')", source)
+        checker = source.split("function SafeInstallPath", 1)[1].split("function PrepareInstallPath", 1)[0]
         self.assertLess(checker.index("GetSHA256OfFile"), checker.index("if Exec("))
         self.assertIn("check-install-path --path", checker)
-        fixed = source.split("function FixedInstallRoot", 1)[1].split("function PrepareInstallPath", 1)[0]
-        self.assertIn("CompareStringOrdinal", fixed)
-        self.assertIn("ExpandFileName", fixed)
-        self.assertIn(r"{commonpf64}\Flower", fixed)
         self.assertNotIn("check-user-install-path", source)
-        for gate in ["HasFlowerRegistration", "DirExists(PayloadDir)", "HasNativeRuntime"]:
+        for gate in ["HasFlowerRegistration", "InstallRootAvailable(Root)", "HasNativeRuntime"]:
             self.assertLess(prepare.index(gate), prepare.index("PrepareInstallPath("))
         self.assertLess(prepare.index("PrepareInstallPath("), prepare.index("SafeInstallPath("))
         creator = source.split("function PrepareInstallPath", 1)[1].split("function HasSubkeys", 1)[0]
@@ -104,7 +104,7 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn("Check: CanStartFlower", startup)
         self.assertIn("Check: CanStartFlower", run)
         gate = source.split("function CanStartFlower", 1)[1].split("function InitializeSetup", 1)[0]
-        for check in ["RegistrationFailed", "FixedInstallRoot", "SafeInstallPath",
+        for check in ["RegistrationFailed", "SafeInstallPath",
                       "TrustedPayload", "OwnedRegistrationComplete", "ExpectedSettingsHash"]:
             self.assertIn(check, gate)
         self.assertIn("RegistrationFailed := True", source.split("function InitializeSetup", 1)[1])
@@ -167,7 +167,8 @@ class InstallerSourceTests(unittest.TestCase):
         source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
         uninstall = source.split("function InitializeUninstall", 1)[1]
         self.assertNotIn("DllNotInUse", uninstall)
-        gates = ["if not FixedInstallRoot", "if UninstallSilent", "mbConfirmation",
+        self.assertIn("SafeInstallPath(ExpandConstant('{app}'))", uninstall)
+        gates = ["if UninstallSilent", "mbConfirmation",
                  "FileCopy(", "SafeInstallPath", "if not TrustedPayload",
                  "if not HasFlowerRegistration", "RegQueryStringValue",
                  "CanonicalFile", "if not Exec(PathChecker",

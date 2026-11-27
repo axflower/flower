@@ -11,6 +11,15 @@ const MIXED_DECODE_BUDGET: usize = 16384;
 // cannot win merely by accumulating independent unigram rewards. This is a
 // finite cost, never a lexicographic preference for fewer words.
 const RANKED_WORD_COST: i64 = 1024;
+// An initial supplies less evidence than a fully typed syllable. Apply the
+// extra cost consistently to both edges and standalone candidates; otherwise
+// a high-weight word such as di'er can reinterpret a typed de as d + e.
+const RANKED_ABBREVIATION_COST: i64 = 512;
+// A subtitle count attests a word, not every combination of it with its
+// neighbors. Charge the extra boundary so frequency cannot accumulate freely
+// across common but unrelated words. An exact word has no such boundary.
+const SPOKEN_BOUNDARY_COST: i64 = 2 * super::spoken_ranking::MAX_BONUS as i64;
+const SPOKEN_ABBREVIATION_COST: i64 = 384;
 
 pub(crate) fn lexical_score(weight: u32, characters: usize) -> i64 {
     let logarithm = 31 - weight.leading_zeros();
@@ -65,6 +74,19 @@ impl Choice {
     pub(crate) fn penalize_abbreviations(&mut self) {
         self.score -= self.abbreviated as i64 * 512;
         self.supplemental_score -= self.abbreviated as i64 * 512;
+    }
+
+    fn apply_ranked_base_score(&mut self, spoken: bool) {
+        let spoken_bonus = if spoken {
+            super::spoken_ranking::bonus(&self.candidate.text)
+        } else {
+            0
+        };
+        let abbreviation_cost =
+            RANKED_ABBREVIATION_COST + if spoken { SPOKEN_ABBREVIATION_COST } else { 0 };
+        self.score = self.supplemental_score + spoken_bonus
+            - RANKED_WORD_COST
+            - self.abbreviated as i64 * abbreviation_cost;
     }
 }
 
@@ -216,10 +238,11 @@ fn decode_ranked_lanes(
     {
         return Vec::new();
     }
+    let spoken = lexicon.uses_spoken_ranking();
     let mut output = lexicon.exact_choices(raw);
     if ranking.is_some() {
         for choice in &mut output {
-            choice.score = choice.supplemental_score - RANKED_WORD_COST;
+            choice.apply_ranked_base_score(spoken);
         }
     }
     if raw.len() == 1 {
@@ -232,7 +255,7 @@ fn decode_ranked_lanes(
                 .collect();
             if ranking.is_some() {
                 for choice in &mut choices {
-                    choice.score = choice.supplemental_score - RANKED_WORD_COST;
+                    choice.apply_ranked_base_score(spoken);
                 }
             }
             rank_choices(&mut choices, ranking);
@@ -245,7 +268,7 @@ fn decode_ranked_lanes(
         let mut initials = lexicon.single_initial_choices(raw);
         if ranking.is_some() {
             for choice in &mut initials {
-                choice.score = choice.supplemental_score - RANKED_WORD_COST;
+                choice.apply_ranked_base_score(spoken);
             }
         }
         output.extend(
@@ -299,6 +322,9 @@ fn decode_ranked_lanes(
         // counts. Sort before the per-end cap so less abbreviated mixed edges survive.
         edges.sort_by_key(|edge| edge.abbreviated);
         if let Some((snapshot, prefix)) = ranking {
+            for edge in &mut edges {
+                edge.apply_ranked_base_score(spoken);
+            }
             // Evaluate every enumerated edge against surviving path contexts
             // before the bounded per-end cap, not only after Top-K decoding.
             edges.sort_by_cached_key(|edge| {
@@ -317,7 +343,7 @@ fn decode_ranked_lanes(
                     })
                     .max()
                     .unwrap_or(0);
-                std::cmp::Reverse(edge.supplemental_score + bonus)
+                std::cmp::Reverse(edge.score + bonus)
             });
         }
         let mut per_end = std::collections::HashMap::new();
@@ -339,6 +365,11 @@ fn decode_ranked_lanes(
             let end = start + edge.consumed;
             let edge_events: Rc<[LearningEvent]> = edge.events.clone().into();
             for path in &paths {
+                let boundary_cost = if spoken && ranking.is_some() && path.words != 0 {
+                    SPOKEN_BOUNDARY_COST
+                } else {
+                    0
+                };
                 let bonus = ranking.map_or(0, |(snapshot, prefix)| {
                     choice_bonus(
                         &edge,
@@ -360,18 +391,12 @@ fn decode_ranked_lanes(
                         format!("{}'{}", path.reading, edge.candidate.comment)
                     },
                     events,
-                    score: path.score
+                    score: path.score + edge.score + bonus - boundary_cost,
+                    supplemental_score: path.supplemental_score
                         + if ranking.is_some() {
-                            edge.supplemental_score - RANKED_WORD_COST
+                            edge.score - boundary_cost
                         } else {
-                            edge.score
-                        }
-                        + bonus,
-                    supplemental_score: path.supplemental_score + edge.supplemental_score
-                        - if ranking.is_some() {
-                            RANKED_WORD_COST
-                        } else {
-                            0
+                            edge.supplemental_score
                         },
                     words: path.words + 1,
                     abbreviated: path.abbreviated + edge.abbreviated,
@@ -409,7 +434,7 @@ fn decode_ranked_lanes(
                         .filter(|s| s.len() > 1)
                         .count();
                     choice.penalize_abbreviations();
-                    choice.score = choice.supplemental_score - RANKED_WORD_COST;
+                    choice.apply_ranked_base_score(spoken);
                 }
                 choice
             })
@@ -420,7 +445,7 @@ fn decode_ranked_lanes(
             .into_iter()
             .map(|mut choice| {
                 if ranking.is_some() {
-                    choice.score = choice.supplemental_score - RANKED_WORD_COST;
+                    choice.apply_ranked_base_score(spoken);
                 }
                 choice
             })
@@ -441,9 +466,10 @@ fn decode_ranked_lanes(
         .collect();
     mixed.sort_by(|a, b| supplemental_cmp(a, b));
     composed.extend(mixed);
-    for path in composed {
-        if path.words > 1 && seen.insert((path.text.clone(), raw.len())) {
-            output.push(Choice {
+    for path in composed.into_iter().filter(|path| path.words > 1) {
+        let unique = seen.insert((path.text.clone(), raw.len()));
+        if unique || ranking.is_some() {
+            let composed = Choice {
                 candidate: Candidate::new(&path.text, &path.reading),
                 consumed: raw.len(),
                 events: path
@@ -460,7 +486,25 @@ fn decode_ranked_lanes(
                 },
                 supplemental_score: path.supplemental_score,
                 abbreviated: path.abbreviated,
-            });
+            };
+            if unique {
+                output.push(composed);
+            } else if let Some((snapshot, prefix)) = ranking {
+                // A low-confidence whole-word entry should not suppress a
+                // better-scoring decomposition of the same reading and text.
+                // Retain its original learning identity and use the stronger
+                // score once, without stacking the two paths' bonuses.
+                if let Some(existing) = output.iter_mut().find(|choice| {
+                    choice.candidate == composed.candidate
+                        && choice.consumed == composed.consumed
+                        && choice.abbreviated == composed.abbreviated
+                }) {
+                    let composed_score = composed.score + choice_bonus(&composed, snapshot, prefix);
+                    existing.score = existing
+                        .score
+                        .max(composed_score - choice_bonus(existing, snapshot, prefix));
+                }
+            }
         }
     }
     let mut partial: Vec<_> = lexicon
@@ -468,7 +512,7 @@ fn decode_ranked_lanes(
         .into_iter()
         .map(|mut choice| {
             if ranking.is_some() {
-                choice.score = choice.supplemental_score - RANKED_WORD_COST;
+                choice.apply_ranked_base_score(spoken);
             }
             choice
         })
